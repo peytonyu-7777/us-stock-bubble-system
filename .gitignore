@@ -1,0 +1,12 @@
+# caches / artifacts
+bubble_cache.parquet
+prices_cache.parquet
+report.html
+__pycache__/
+*.pyc
+.env
+.venv/
+venv/
+
+# streamlit
+.streamlit/secrets.toml

@@ -1,0 +1,17 @@
+# render.yaml — one-click deploy on Render.com (Free tier)
+# 1. Push this repo to GitHub.
+# 2. render.com -> New -> Blueprint -> connect the repo.
+# 3. Add the env var FRED_API_KEY (optional but recommended) in the dashboard.
+
+services:
+  - type: web
+    name: us-stock-bubble-monitor
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: free
+    healthCheckPath: /
+    envVars:
+      - key: FRED_API_KEY
+        sync: false          # set this manually in the Render dashboard (recommended)
+      - key: PYTHONUNBUFFERED
+        value: "1"
