@@ -9,8 +9,8 @@ python-dotenv>=1.0       # load FRED_API_KEY (etc.) from a local .env file
 yfinance>=0.2.40          # prices / momentum / QQQ-SPY  (Stooq fallback auto-used)
 pandas-datareader>=0.10   # FRED (requires FRED_API_KEY)
 pytrends>=4.9            # Google Trends (secondary F6 source)
-openpyxl>=3.1            # needed by pandas to read FINRA's .xlsx retail workbook
-# Stooq + AAII are fetched over plain HTTPS via `requests` (no package needed)
+openpyxl>=3.1            # needed by pandas to read FINRA's .xlsx retail workbook (F6 fallback)
+# Stooq prices + AAII are fetched over plain HTTPS via `requests` (no package needed)
 
 # Viz
 plotly>=5.18

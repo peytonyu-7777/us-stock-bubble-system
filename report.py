@@ -42,11 +42,11 @@ body{font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;margin
 h1{font-size:24px;margin:0 0 4px}
 .cap{color:#777;font-size:13px;margin-bottom:18px}
 .top{display:flex;gap:18px;flex-wrap:wrap;align-items:stretch}
-.box{background:#fff;border:1px solid #e5e7eb;border-radius:12px;padding:16px;flex:1;min-width:320px}
+.box{background:#fff;border:1px solid #e5e7eb;border-radius:12px;padding:16px;flex:1;min-width:260px}
 .status{font-size:20px;font-weight:700;margin:8px 0}
 .kv{font-size:13px;color:#555;line-height:1.7}
-.grid{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-top:6px}
-.card{background:#fafafa;border:1px solid #ddd;border-radius:10px;padding:12px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin-top:6px}
+.card{background:#fafafa;border:1px solid #ddd;border-radius:10px;padding:12px;text-align:center}
 .lbl{font-size:12px;color:#555}
 .val{font-size:30px;font-weight:700}
 .w{font-size:11px;color:#888}
@@ -55,6 +55,14 @@ h1{font-size:24px;margin:0 0 4px}
 .tbl th{background:#f0f2f5}
 h2{margin-top:28px;font-size:18px}
 .warn{background:#fff7ed;border:1px solid #fdba74;color:#9a3412;padding:10px 14px;border-radius:8px;margin:10px 0;font-size:13px}
+/* phones: shrink padding, stack the top row, let cards reflow */
+@media (max-width:640px){
+  .wrap{padding:14px}
+  .top{flex-direction:column}
+  .box{min-width:0}
+  .grid{grid-template-columns:repeat(auto-fit,minmax(135px,1fr))}
+  h1{font-size:20px}
+}
 """
 
 
@@ -87,7 +95,9 @@ def gauge_div(score: float) -> str:
                        showarrow=False, font={"size": 12, "color": "gray"})
     fig.update_layout(height=380, margin={"t": 50, "b": 30, "l": 30, "r": 30})
     # First plotly div carries the CDN script; later divs set include_plotlyjs=False.
-    return fig.to_html(full_html=False, include_plotlyjs="cdn")
+    # responsive:True makes the chart resize with the viewport (phone + desktop).
+    return fig.to_html(full_html=False, include_plotlyjs="cdn",
+                       config={"responsive": True})
 
 
 def history_div(scores: pd.Series, spx, ndx) -> str:
@@ -116,7 +126,8 @@ def history_div(scores: pd.Series, spx, ndx) -> str:
                       annotation_text="High-risk > 80", row=2, col=1)
     fig.update_layout(height=620, hovermode="x unified", showlegend=True,
                       margin={"t": 40, "b": 30, "l": 50, "r": 30})
-    return fig.to_html(full_html=False, include_plotlyjs=False)
+    return fig.to_html(full_html=False, include_plotlyjs=False,
+                       config={"responsive": True})
 
 
 def feature_cards_html(state: dict) -> str:

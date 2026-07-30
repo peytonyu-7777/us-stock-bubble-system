@@ -22,7 +22,29 @@ import streamlit as st
 
 import pipeline as pipe
 
-st.set_page_config(page_title="US Equity Bubble Risk", page_icon="📈", layout="wide")
+st.set_page_config(page_title="US Equity Bubble Risk", page_icon="📈",
+                   layout="wide", initial_sidebar_state="auto")
+
+# --- Responsive layout (mobile + desktop) ---------------------------------
+# Streamlit columns don't auto-wrap, so we (a) force a fluid main container,
+# (b) stack horizontal column blocks below ~720px, and (c) render the 8
+# feature cards as an auto-fit CSS grid that reflows from 8 -> 1 columns.
+st.markdown("""
+<style>
+.main .block-container{max-width:1200px;padding-top:1.2rem;padding-bottom:2rem}
+@media (max-width:720px){
+  .stHorizontalBlock{flex-direction:column !important}
+  .stHorizontalBlock>div{width:100% !important;min-width:0 !important}
+}
+.feat-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));
+  gap:10px;margin-top:6px}
+.feat-card{border:1px solid #e5e7eb;border-radius:10px;padding:12px;
+  background:#fff;text-align:center}
+.feat-lbl{font-size:12px;color:#555}
+.feat-val{font-size:30px;font-weight:700}
+.feat-w{font-size:11px;color:#888}
+</style>
+""", unsafe_allow_html=True)
 
 REF_2000 = 83.2   # historical reference points (approx, per Dalio-style framing)
 REF_2021 = 92.1
@@ -81,25 +103,23 @@ def gauge_fig(score: float) -> go.Figure:
 
 
 def feature_cards(features: dict):
-    cols = st.columns(4)
-    for i, (key, f) in enumerate(features.items()):
+    cells = ""
+    for key, f in features.items():
         sc = f["score"]
-        with cols[i % 4]:
-            if sc is None:
-                color, txt = "gray", "n/a"
-            else:
-                color = band_color(sc)
-                txt = f"{sc:.0f}"
-            st.markdown(
-                f"""<div style="border:1px solid #ddd;border-radius:10px;
-                padding:12px;margin:6px 0;background:#fafafa;">
-                <div style="font-size:12px;color:#555;">{f['label']}</div>
-                <div style="font-size:30px;font-weight:700;color:{color};">{txt}</div>
-                <div style="font-size:11px;color:#888;">weight {f['weight']:.2f}
-                · {'live' if f['available'] else 'no data'}</div>
-                </div>""",
-                unsafe_allow_html=True,
-            )
+        if sc is None:
+            color, txt = "gray", "n/a"
+        else:
+            color = band_color(sc)
+            txt = f"{sc:.0f}"
+        avail = "live" if f["available"] else "no data"
+        cells += (
+            f'<div class="feat-card">'
+            f'<div class="feat-lbl">{f["label"]}</div>'
+            f'<div class="feat-val" style="color:{color}">{txt}</div>'
+            f'<div class="feat-w">w {f["weight"]:.2f} · {avail}</div>'
+            f'</div>'
+        )
+    st.markdown(f'<div class="feat-grid">{cells}</div>', unsafe_allow_html=True)
 
 
 def history_fig(scores: pd.Series, spx, ndx) -> go.Figure:
@@ -144,7 +164,7 @@ def history_fig(scores: pd.Series, spx, ndx) -> go.Figure:
 def main():
     st.title("📈 US Equity Bubble Risk — Dalio-style Monitor")
     st.caption("8-feature percentile model · rolling 20-year window · "
-               "free/open data (FRED, yfinance/Stooq, FINRA & AAII)")
+               "free/open data (FRED incl. EMVMACROBUS, yfinance/Stooq)")
 
     refresh = st.sidebar.checkbox("Force refresh live data", value=False)
     if st.sidebar.button("Re-run scoring"):

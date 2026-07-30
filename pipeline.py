@@ -24,14 +24,18 @@ DESIGN PRINCIPLES
 ------------------------------------------------------------------------------
 FEATURE MAP  (weight in composite)
 ------------------------------------------------------------------------------
-F1  Valuation      (0.20)  CAPE (Shiller PE) + Buffett Indicator (Wilshire/GDP)
-F2  Momentum       (0.10)  S&P 500 6-month annualized return
-F3  Sentiment      (0.10)  VIX (inverted)  [+ CBOE put/call if available]
-F4  Leverage       (0.20)  Margin Debt / Market Cap  +  Credit Spread (BAA-Tsy)
-F5  Liquidity      (0.10)  M2 YoY growth  +  Fed balance-sheet YoY growth
-F6  Retail inflows (0.15)  FINRA Retail Volume Share (real, keyless)  [AAII bullish % fallback]
-F7  Policy stance  (0.05)  Real fed-funds rate (Fed Funds - CPI YoY), inverted
-F8  Tech froth     (0.10)  QQQ / SPY ratio, 52-week rolling percentile
+F1  Valuation      (0.20)  CAPE (Shiller PE) + Buffett Indicator (Wilshire/GDP)   [High = Risk]
+F2  Momentum       (0.10)  S&P 500 6-month annualized return                      [High = Risk]
+F3  Market Vol     (0.10)  VIX (INVERTED: low VIX = complacency = High Risk)
+F4  Leverage       (0.15)  Margin Debt / Mkt Cap  +  Credit Spread (BAA10Y, INVERTED: low spread = High Risk)
+F5  Liquidity      (0.10)  Fed balance-sheet YoY (WALCL)  [+ M2 YoY secondary]    [High = Risk]
+F6  Business Sent. (0.15)  FRED EMVMACROBUS (INVERTED: low index = High Risk)      [AAII/FINRA fallback]
+F7  Policy Stance  (0.05)  Real Fed Funds (FEDFUNDS - CPI YoY, INVERTED: low real rate = High Risk)
+F8  Tech Froth     (0.15)  QQQ / SPY ratio, 3-year (156-week) rolling percentile  [High = Risk]
+
+Weights sum to 1.00. Any feature that fails to load has its weight redistributed
+across the survivors (zero-crash renormalization), so the score always lands on
+0-100 even if only a subset of the 8 is available.
 """
 
 from __future__ import annotations
@@ -58,19 +62,20 @@ warnings.filterwarnings("ignore")
 FRED_API_KEY = os.getenv("FRED_API_KEY", "")  # optional; many series work w/o key
 CACHE_PATH = os.getenv("BUBBLE_CACHE", "bubble_cache.parquet")
 PRICES_CACHE = os.getenv("BUBBLE_PRICES_CACHE", "prices_cache.parquet")
-WINDOW_MONTHS = 240  # 20 years for the "trailing percentile" window
-WINDOW_TECH = 12     # 52-week window for the tech-froth feature (F8)
+WINDOW_MONTHS = 240       # 20 years for the "trailing percentile" window
+WINDOW_TECH_WEEKS = 156    # 3 years (156 weeks) for the tech-froth feature (F8)
+WINDOW_TECH_MONTHS = 36    # 3-year monthly fallback if weekly prices fail
 
 # Composite weights (must sum to 1.0)
 WEIGHTS = {
     "F1_valuation": 0.20,
     "F2_momentum": 0.10,
     "F3_sentiment": 0.10,
-    "F4_leverage": 0.20,
+    "F4_leverage": 0.15,
     "F5_liquidity": 0.10,
-    "F6_retail": 0.15,
+    "F6_business": 0.15,
     "F7_policy": 0.05,
-    "F8_tech": 0.10,
+    "F8_tech": 0.15,
 }
 
 FEATURE_LABELS = {
@@ -78,8 +83,8 @@ FEATURE_LABELS = {
     "F2_momentum": "Momentum (6m ann.)",
     "F3_sentiment": "Sentiment (VIX inv.)",
     "F4_leverage": "Leverage (Margin / Credit)",
-    "F5_liquidity": "Liquidity (M2 / Fed BS)",
-    "F6_retail": "Retail Volume Share (FINRA)",
+    "F5_liquidity": "Liquidity (Fed BS / M2)",
+    "F6_business": "Business Sentiment (EMVMACROBUS inv.)",
     "F7_policy": "Policy (Real Fed Funds)",
     "F8_tech": "Tech Froth (QQQ/SPY)",
 }
@@ -124,8 +129,8 @@ def _http_get(url: str, timeout: int = 20) -> Optional[str]:
         return None
 
 
-def _stooq_monthly(symbol: str, start: str = HISTORY_START) -> Optional[pd.Series]:
-    """Keyless, datacenter-friendly price source (stooq.com daily CSV)."""
+def _stooq_daily(symbol: str, start: str = HISTORY_START) -> Optional[pd.Series]:
+    """Keyless, datacenter-friendly DAILY price source (stooq.com CSV)."""
     txt = _http_get(f"https://stooq.com/q/d/l/?s={symbol}&i=d")
     if not txt:
         return None
@@ -135,12 +140,47 @@ def _stooq_monthly(symbol: str, start: str = HISTORY_START) -> Optional[pd.Serie
             return None
         df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
         df = df.dropna(subset=["Date"]).set_index("Date").sort_index()
-        s = df["Close"].dropna().resample("ME").last()
+        s = df["Close"].dropna()
         s = s[s.index >= pd.Timestamp(start)]
         return s if not s.empty else None
     except Exception as exc:
         print(f"[stooq] {symbol} failed: {exc}")
         return None
+
+
+def _stooq_monthly(symbol: str, start: str = HISTORY_START) -> Optional[pd.Series]:
+    """Month-end close from Stooq daily (used as Yahoo fallback)."""
+    d = _stooq_daily(symbol, start=start)
+    if d is None:
+        return None
+    s = d.resample("ME").last()
+    return s if not s.empty else None
+
+
+def _yf_weekly(ticker: str, start: str = HISTORY_START) -> Optional[pd.Series]:
+    """Weekly-close via yfinance, with a Stooq fallback.
+
+    Used for the F8 tech-froth feature so the 156-week rolling window really
+    spans ~3 years of weekly observations. Yahoo 429s from cloud IPs; Stooq is
+    keyless and server-friendly, so prices stay REAL on deploy when Yahoo is
+    blocked.
+    """
+    try:
+        import yfinance as yf
+        tk = yf.Ticker(ticker)
+        hist = tk.history(start=start, auto_adjust=True, actions=False, progress=False)
+        if hist is not None and not hist.empty:
+            s = hist["Close"].dropna().resample("W-FRI").last()
+            if not s.empty:
+                return s
+    except Exception as exc:  # pragma: no cover - network dependent
+        print(f"[yfinance-weekly] {ticker} failed: {exc}")
+    st = _STOOQ_MAP.get(ticker)
+    if st:
+        d = _stooq_daily(st, start=start)
+        if d is not None:
+            return d.resample("W-FRI").last().dropna()
+    return None
 
 
 def _yf_monthly(ticker: str, start: str = HISTORY_START) -> Optional[pd.Series]:
@@ -246,7 +286,7 @@ def _finra_retail_share(start: str = "2019-01-01") -> Optional[pd.Series]:
     for url in candidates:
         try:
             hdr = {"User-Agent": "Mozilla/5.0 (compatible; bubble-monitor/1.0)"}
-            r = requests.get(url, headers=hdr, timeout=25)
+            r = requests.get(url, headers=hdr, timeout=12)
             if r.status_code != 200 or not r.content:
                 continue
             raw = r.content
@@ -333,20 +373,26 @@ def _finra_retail_share(start: str = "2019-01-01") -> Optional[pd.Series]:
 # ---------------------------------------------------------------------------
 # Rolling percentile (no look-ahead)
 # ---------------------------------------------------------------------------
-def rolling_pct(series: pd.Series, window: int = WINDOW_MONTHS) -> pd.Series:
+def rolling_pct(series, window: int = WINDOW_MONTHS,
+                min_periods: int | None = None) -> pd.Series:
     """
-    Percentile rank (0-100) of each value within the trailing `window`
-    observations. A value equal to the max of its window -> 100, equal to the
-    min -> ~0. Pure backwards-looking; safe for historical re-computation.
+    Percentile rank (0-100) of each value within its TRAILING `window`
+    observations.
+
+    Vectorized via pandas rolling rank (C-level, ~100x faster than the naive
+    per-point loop). For each date the output is the percentile of the current
+    value among all values in the trailing window, so it is purely
+    backwards-looking (no look-ahead bias) and safe to re-compute for any
+    historical date.
+
+    `min_periods` keeps the first stretch (before a full window has
+    accumulated) as NaN rather than a noisy single-point percentile.
     """
-    a = series.to_numpy(dtype=float)
-    n = len(a)
-    out = np.full(n, np.nan)
-    for i in range(n):
-        lo = max(0, i - window + 1)
-        win = a[lo:i + 1]
-        out[i] = float((win <= a[i]).mean()) * 100.0
-    return pd.Series(out, index=series.index)
+    s = pd.Series(series, dtype="float64")
+    if min_periods is None:
+        min_periods = max(24, window // 4)
+    rp = s.rolling(window, min_periods=min_periods).rank(pct=True, method="average")
+    return rp * 100.0
 
 
 # ---------------------------------------------------------------------------
@@ -355,21 +401,19 @@ def rolling_pct(series: pd.Series, window: int = WINDOW_MONTHS) -> pd.Series:
 def compute_composite(feat_pct: pd.DataFrame, weights: dict = WEIGHTS) -> pd.Series:
     """
     Weighted blend of available feature percentiles at each date.
-    Missing features have their weight redistributed across the present ones,
-    so the output always lives on 0-100.
+
+    Fully vectorized: at every date the missing features have their weight
+    redistributed across the present ones, so the output always lives on 0-100
+    even when some F1-F8 features are NaN.
     """
     cols = list(weights.keys())
-    w = pd.Series(weights)
-    comp = pd.Series(index=feat_pct.index, dtype=float)
-    for d, row in feat_pct.iterrows():
-        avail = row[cols].dropna()
-        if avail.empty:
-            comp.at[d] = np.nan
-            continue
-        wa = w[avail.index]
-        wa = wa / wa.sum()
-        comp.at[d] = float((avail * wa).sum())
-    return comp
+    w = pd.Series(weights)[cols]
+    vals = feat_pct[cols]
+    avail = vals.notna()
+    # weighted sum of available percentiles / sum of available weights
+    numer = (vals * w).sum(axis=1)
+    denom = (avail * w).sum(axis=1)
+    return numer / denom
 
 
 def contribution_factor(score: float) -> float:
@@ -496,15 +540,19 @@ def build_features() -> Tuple[pd.DataFrame, dict]:
         meta["F3_sentiment"] = "N"
 
     # ---- F4 Leverage (margin/mktcap + credit spread) ---------------------
+    # Credit spread (BAA10Y) is INVERTED: a *compressed* spread (investors
+    # blindly chasing risk, ultra-loose credit) is a bubble signal, whereas a
+    # *wide* spread marks panic / liquidity stress (2008, 2020-03) and is the
+    # opposite of froth. So low spread -> high risk percentile (100 - pct).
     parts = []
     if margin is not None and wilshire is not None:
         margin_ratio = margin / wilshire  # both in $M -> ratio
         parts.append(rolling_pct(margin_ratio))
     if baa_tsy is not None:
-        parts.append(rolling_pct(baa_tsy))
+        parts.append(100.0 - rolling_pct(baa_tsy))   # inverted credit spread
     feat["F4_leverage"] = np.mean(parts, axis=0) if parts else np.nan
     meta["F4_leverage"] = f"Margin={'Y' if margin is not None and wilshire is not None else 'N'} " \
-                          f"Credit={'Y' if baa_tsy is not None else 'N'}"
+                          f"Credit(inv)={'Y' if baa_tsy is not None else 'N'}"
 
     # ---- F5 Liquidity (M2 YoY + Fed BS YoY) ------------------------------
     parts = []
@@ -518,25 +566,52 @@ def build_features() -> Tuple[pd.DataFrame, dict]:
     meta["F5_liquidity"] = f"M2={'Y' if m2 is not None else 'N'} " \
                            f"FedBS={'Y' if fed_bs is not None else 'N'}"
 
-    # ---- F6 Retail volume share (FINRA, real, keyless) -------------------
-    # High retail share of volume == retail euphoria / capitulation churn ==
-    # bubble risk, so the level is used directly (no inversion).
-    # FINRA data only reaches back to ~2019; before that F6 is NaN and its
-    # weight is renormalized away (the 2000/2008 signals come from F1-F5/F7/F8).
-    finra = _finra_retail_share()
-    if finra is not None and len(finra) >= 6:
-        feat["F6_retail"] = rolling_pct(finra)
-        meta["F6_retail"] = (f"FINRA Retail Volume Share "
-                             f"(real, {finra.index[0].date()}+)")
-    elif aaii is not None:
-        feat["F6_retail"] = rolling_pct(aaii)
-        meta["F6_retail"] = "AAII Bullish % (real fallback, 1987+)"
-    elif trends is not None:
-        feat["F6_retail"] = rolling_pct(trends)
-        meta["F6_retail"] = "Google Trends (real, 2015+)"
+    # ---- F6 Business sentiment (FRED EMVMACROBUS, INVERTED) --------------
+    # EMVMACROBUS = "Equity Market Volatility Tracker: Macroeconomic News &
+    # Outlook: Business Investment And Sentiment" (Baker/Bloom/Davis via FRED,
+    # monthly, 1985+). Per the spec, a LOW index = complacency / low perceived
+    # business risk = bubble-prone, so we INVERT: low -> high risk percentile.
+    # Because it is a FRED series (same source as F1/F3/F4/F5/F7), with a
+    # FRED_API_KEY it is as stable as every other macro feature — no scraper,
+    # no second key. Only if FRED is entirely unavailable do we fall back to the
+    # keyless FINRA/AAII/Trends blend so the feature never silently drops.
+    emv = _fred("EMVMACROBUS")
+    if emv is not None and emv.notna().sum() >= 12:
+        emv = align(emv)
+        feat["F6_business"] = 100.0 - rolling_pct(emv)   # inverted
+        meta["F6_business"] = "EMVMACROBUS (FRED, inv)"
     else:
-        feat["F6_retail"] = np.nan
-        meta["F6_retail"] = "N"
+        # ---- fallback: FINRA retail volume share + AAII bullish blend -----
+        # High retail participation / bullishness == euphoria == bubble risk;
+        # the level is used directly (no inversion). FINRA only reaches back to
+        # ~2019, so we BLEND with the AAII % Bullish survey (real, 1987+) for
+        # 2000-2019, and Google Trends (2015+) as last-resort filler. Each
+        # series is percentile-ranked in its OWN scale first (different units)
+        # then merged with combine_first, yielding one continuous F6.
+        finra = _finra_retail_share()
+        finra = align(finra)
+        f6_sources = []
+        if finra is not None and finra.notna().sum() >= 6:
+            f6_sources.append(("FINRA", finra))
+        if aaii is not None:
+            f6_sources.append(("AAII", aaii))
+        if trends is not None:
+            f6_sources.append(("Trends", trends))
+
+        if not f6_sources:
+            feat["F6_business"] = np.nan
+            meta["F6_business"] = "N"
+        else:
+            blended = None
+            for _name, s in f6_sources:
+                pc = rolling_pct(s)
+                blended = pc if blended is None else blended.combine_first(pc)
+            feat["F6_business"] = blended
+            finra_start = None
+            if finra is not None and finra.notna().any():
+                finra_start = finra.index[finra.notna()][0].date()
+            meta["F6_business"] = "blend " + "+".join(n for n, _ in f6_sources) + \
+                (f" (FINRA {finra_start}+)" if finra_start else "") + " (EMV fallback)"
 
     # ---- F7 Policy (real fed funds, inverted) ----------------------------
     if ffr is not None and cpi is not None:
@@ -548,15 +623,28 @@ def build_features() -> Tuple[pd.DataFrame, dict]:
         feat["F7_policy"] = np.nan
         meta["F7_policy"] = "N"
 
-    # ---- F8 Tech froth (QQQ/SPY, 52-week percentile) ---------------------
-    if qqq is not None and spy is not None:
+    # ---- F8 Tech froth (QQQ/SPY, 156-week rolling percentile) -----------
+    # 156 weeks (~3 years): tech bubbles build over 2-3 years, and a shorter
+    # window would mark the froth "cleared" during a long high-level
+    # consolidation. We compute the ratio on WEEKLY bars (so 156 observations
+    # really span ~3 years) then roll up to month-end for the composite. If
+    # weekly prices fail we fall back to a 36-month (≈3y) monthly window.
+    qqq_w = _yf_weekly("QQQ")
+    spy_w = _yf_weekly("SPY")
+    if qqq_w is not None and spy_w is not None:
+        ratio_w = (qqq_w / spy_w).dropna()
+        ratio_w = ratio_w[ratio_w.index >= pd.Timestamp(HISTORY_START)]
+        f8_weekly = rolling_pct(ratio_w, window=WINDOW_TECH_WEEKS)
+        feat["F8_tech"] = f8_weekly.resample("ME").last()
+        meta["F8_tech"] = "Y (156w weekly)"
+    elif qqq is not None and spy is not None:
         ratio = qqq / spy
-        feat["F8_tech"] = rolling_pct(ratio, window=WINDOW_TECH)
-        meta["F8_tech"] = "Y"
+        feat["F8_tech"] = rolling_pct(ratio, window=WINDOW_TECH_MONTHS)
+        meta["F8_tech"] = "Y (36m fallback)"
     elif qqq is not None and spx is not None:
         ratio = qqq / spx
-        feat["F8_tech"] = rolling_pct(ratio, window=WINDOW_TECH)
-        meta["F8_tech"] = "Y (vs SPX)"
+        feat["F8_tech"] = rolling_pct(ratio, window=WINDOW_TECH_MONTHS)
+        meta["F8_tech"] = "Y (36m vs SPX)"
     else:
         feat["F8_tech"] = np.nan
         meta["F8_tech"] = "N"
@@ -610,10 +698,19 @@ def get_monthly_scores(refresh: bool = False) -> Tuple[pd.Series, dict]:
     feat, fmeta = build_features()
     score = compute_composite(feat, WEIGHTS)
 
-    available = [k for k, v in fmeta.items() if not v.startswith("N")]
-    if len(available) >= 4:  # enough signal to be "live"
+    # ---- Live-feature accounting (zero-crash weight renormalization) ------
+    # Count features that actually contributed data (non-NaN anywhere), NOT the
+    # meta string prefix, so partial features (e.g. F4 "Margin=N Credit=Y")
+    # are scored correctly. The composite already redistributes the missing
+    # weight, so the score stays on 0-100 regardless of how many are live.
+    live_cols = [c for c in WEIGHTS if feat[c].notna().any()]
+    available_count = len(live_cols)
+    missing = [c for c in WEIGHTS if c not in live_cols]
+    print(f"[score] {available_count}/8 features live"
+          f"  (missing: {missing or '-'})")
+    if available_count >= 4:  # enough signal to be "live"
         meta = {"source": "live", "features": fmeta,
-                "available_count": len(available)}
+                "available_count": available_count}
         try:
             out = feat.copy()
             out["score"] = score
@@ -718,6 +815,10 @@ if __name__ == "__main__":
     s, m = get_monthly_scores(refresh=True)
     s = s.dropna()
     print(f"Source : {m.get('source')}")
+    print(f"Live   : {m.get('available_count')}/8 features")
+    if m.get("features"):
+        for k, v in m["features"].items():
+            print(f"  {k:14s} {v}")
     print(f"As of  : {s.index[-1].date()}  Score = {s.iloc[-1]:.1f}  "
           f"({status_of(s.iloc[-1])})")
     print("Recent 12 months:")
