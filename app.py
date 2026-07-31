@@ -324,7 +324,7 @@ def history_fig(scores: pd.Series, spx, ndx, log_scale: bool = True,
         rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.06,
         row_heights=[0.65, 0.35],
         subplot_titles=("S&P 500 (left axis)  ·  Nasdaq (right axis)",
-                        "Bubble Risk Score (60-day EMA-smoothed)"),
+                        "Bubble Risk Score (adaptive vol-adjusted EMA)"),
         specs=[[{"secondary_y": True}], [{}]],
     )
 
@@ -393,11 +393,12 @@ def backtest_panel(scores: pd.Series, params: dict):
 
 def main():
     st.title("📈 US Equity Bubble Risk — Dalio-style Monitor")
-    st.caption("Dual-speed Z-score + Sigmoid macro model · 7 factors (67% slow "
-               "macro anchors + 33% fast sentiment/momentum, F8/F2 emphasised) · "
-               "soft F1+F8+F2 bubble-confirmation interaction · dual-pass "
-               "smoothing (20d SMA + 60d EMA) · free/open data (FRED incl. "
-               "EMVMACROBUS, yfinance/Stooq)")
+    st.caption("Dual-speed Z-score + Sigmoid macro model · 8 factors "
+               "(F1 Valuation .20, F2 FINRA Margin Leverage .20, F3 Credit .15, "
+               "F4 Business .15, F5 Tech .10, F6 Momentum .10, F7 VIX .05, "
+               "F8 Liquidity .05) · adaptive vol-adjusted EMA (20d calm / 5d "
+               "stress) · CDF-normalised Score in [1,99] · free/open data "
+               "(FRED MGDTE, EMVMACROBUS, yfinance/Stooq)")
 
     # ---- Sidebar: refresh controls ---------------------------------------
     refresh = st.sidebar.checkbox("Force refresh live data", value=False)
@@ -409,10 +410,11 @@ def main():
 
     # ---- Sidebar: tail-risk amplification toggle -------------------------
     tail_boost = st.sidebar.checkbox(
-        "Tail-risk amplification (F1/F4/F8 >85)", value=pipe.TAIL_BOOST_ON,
-        help="When ON, extreme valuation/credit/tech readings are non-linearly "
-             "weighted up so the composite punches through the 85-90 warning line. "
-             "When OFF, the plain weighted-percentile score is shown.")
+        "Tail-risk amplification (S-stretch + bubble-confirm)", value=pipe.TAIL_BOOST_ON,
+        help="When ON, the blended Z is S-stretched for |Z|>1 (asymmetric top/bottom "
+             "warning) and a bubble-confirmation boost fires when F1 (valuation), "
+             "F5 (tech froth) and F6 (momentum) are jointly in their top-30% "
+             "percentile. When OFF, the plain weighted-Z score is shown.")
 
     # ---- Sidebar: interactive backtest sliders ---------------------------
     with st.sidebar.expander("🎛️ Backtest Parameters", expanded=False):

@@ -12,13 +12,13 @@ Streamlit dashboard deployable to **Render** or **HuggingFace Spaces** in one cl
 | # | Feature | Weight | Proxy / Source | Direction |
 |---|---------|--------|----------------|-----------|
 | F1 | Valuation | 0.20 | CAPE (FRED `CAPE`) + Buffett Indicator (Wilshire `WILL5000INDFC` / `GDP`) | high = risk |
-| F2 | Momentum | 0.10 | S&P 500 6-month annualized return (`yfinance ^GSPC`) | high = risk |
-| F3 | Sentiment | 0.10 | VIX, inverted (FRED `VIXCLS`) | low VIX = risk |
-| F4 | Leverage | 0.15 | Credit Spread (`BAA10Y`, **inverted**: low spread = high risk) | high = risk |
-| F5 | Liquidity | 0.10 | Fed BS YoY (`WALCL`, primary) + M2 YoY (`M2SL`, secondary) | high = risk |
-| F6 | Business Sentiment | 0.15 | **FRED `EMVMACROBUS`** (Equity Market Volatility Tracker — Business & Sentiment), **inverted** (low index = risk). Keyless **AAII** % Bullish survey used only as fallback when FRED is unavailable | low index = risk |
-| F7 | Policy stance | 0.05 | Real Fed Funds (`FEDFUNDS` − CPI YoY), inverted | low real rate = risk |
-| F8 | Tech froth | 0.15 | QQQ / SPY ratio, **3-year (156-week) rolling percentile** | high = risk |
+| F2 | Leverage | 0.20 | **FINRA Margin Debt Ratio** (FRED `MGDTE`: debt YoY + debt/SPX ratio). 100%-uptime fallback: 12m S&P momentum × loose-credit (BAA10Y) interaction proxy | high = risk |
+| F3 | Credit Spread | 0.15 | Credit Spread (`BAA10Y`, **inverted**: low spread = high risk) | high = risk |
+| F4 | Business Sentiment | 0.15 | **FRED `EMVMACROBUS`**, **inverted**; keyless **AAII** % Bullish fallback | low index = risk |
+| F5 | Tech Froth | 0.10 | QQQ / SPY ratio, **3-year (156-week) rolling percentile** | high = risk |
+| F6 | Momentum | 0.10 | S&P 500 6-month annualized return (10d-SMA pre-smoothed, `yfinance ^GSPC`) | high = risk |
+| F7 | Volatility | 0.05 | VIX, inverted (10d-SMA pre-smoothed, FRED `VIXCLS` / price `^VIX`) | low VIX = risk |
+| F8 | Liquidity | 0.05 | Fed BS YoY (`WALCL`, primary) + M2 YoY (`M2SL`, secondary) | high = risk |
 
 Each feature is converted to a **percentile rank (0–100) within a trailing 20-year
 window** (no look-ahead bias), then blended with the weights above. If any feature
@@ -35,25 +35,22 @@ is unavailable, its weight is redistributed so the score always stays on 0–100
 
 ### Scoring refinements
 
-* **EMA smoothing.** The composite is computed monthly (the percentile window
-  needs a long trailing history); it is then up-sampled to a daily calendar and
-  passed through a short **EMA** (`EMA_SPAN = 10` days) so the dashboard's risk
-  line is a smooth trend rather than a noisy monthly step. See `get_daily_scores()`.
-* **Non-linear tail-risk escalation (optional).** The three strongest
-  forward-predictors of blow-off tops — **F1 (valuation), F4 (credit spread),
-  F8 (tech froth)** — get a non-linear weight amplification once their
-  percentile exceeds **85**: the marginal weight ramps **1.0 → 1.5×** (linearly
-  to 100), so a genuinely frenzied reading pushes the composite decisively
-  through the 85–90 warning line instead of being diluted by calmer features.
-  Only these three tail features are boosted; the rest keep weight 1.0.
-  Controlled by the master switch **`TAIL_BOOST_ON`** (default `True`) in
-  `pipeline.py`. In `app.py` it is exposed as a live sidebar toggle —
-  *"Tail-risk amplification (F1/F4/F8 >85)"* — so the dashboard can show either
-  the **plain weighted-percentile score** (toggle off) or the **escalated score**
-  (toggle on) without code edits. The 8 feature percentile cards are always raw;
-  only the composite gauge/score is affected. Because the cache always
-  recomputes the composite from stored features using the current toggle,
-  flipping it takes effect immediately — no re-fetch needed.
+* **Adaptive dual-speed EMA smoothing.** The composite is computed monthly
+  (the percentile window needs a long trailing history); it is then up-sampled
+  to a daily calendar and run through a **volatility-adjusted recursive EMA**
+  (`adaptive_ema()` in `pipeline.py`). In calm regimes (VIX < 15) the span is
+  BASE_SPAN = 20 days for a smooth macro wave; under stress (VIX ≥ 25 *or* a
+  single-week S&P drop > 3%) the span snaps to FAST_SPAN = 5 days so the score
+  jumps at tops / crash onsets instead of lagging. See `get_daily_scores()`.
+* **Bubble-confirmation + non-linear tail escalation.** After the weighted Z
+  blend, a soft **bubble-confirmation** boost (+0.30 Z) fires when **F1
+  (valuation), F5 (tech froth) and F6 (momentum)** are *all* in their top-30%
+  historical percentile — the classic "expensive + euphoric + tech-leading"
+  signature that pushes true bubble regimes (2000, 2021) decisively above 90
+  without hard-coding any date. Independently, an optional **S-stretch** (master
+  switch **`TAIL_BOOST_ON`**, default `True`) escalates any composite |Z| > 1 as
+  |Z| ** S_EXP (1.35), so extreme tops/bottoms get asymmetric warning. Both are
+  applied *before* the standard-normal CDF maps Z → a 0–100 score.
 
 ---
 
@@ -88,13 +85,13 @@ python report.py       # static report.html (open directly in a browser, no serv
 ```
 
 ### The ONLY credential you need to provide: a free FRED API key
-FRED covers **F1** (valuation/CAPE/Buffett), **F3** (VIX), **F4** (credit spread),
-**F5** (M2 + Fed balance sheet), **F6** (EMVMACROBUS business
-sentiment) and **F7** (real fed funds). Everything else — yfinance/Stooq prices,
-and the keyless **AAII** fallback for F6 — is **keyless and free**. Because F6
-now comes from FRED too, a single `FRED_API_KEY` powers all six macro features
-(incl. the business-sentiment signal), so the pipeline is effectively a
-one-key, 100%-API-stable system when the key is set.
+FRED covers **F1** (valuation/CAPE/Buffett), **F2** (FINRA margin `MGDTE`),
+**F3** (credit spread `BAA10Y`), **F4** (business sentiment `EMVMACROBUS`),
+**F8** (liquidity: `WALCL` + `M2SL`), and VIX (`VIXCLS`). The price-derived
+features (**F5** tech froth, **F6** momentum, **F7** volatility) come from
+yfinance/Stooq. The keyless **AAII** survey backs F4 when FRED is unavailable.
+A single `FRED_API_KEY` powers every macro feature, so the pipeline is
+effectively a one-key, ~100%-API-stable system when the key is set.
 
 ```bash
 export FRED_API_KEY=your_key_here      # free: https://fredaccount.stlouisfed.org/apikeys
@@ -143,26 +140,25 @@ This is the only file you edit to supply the API key.
 
 ## 5. Caveats / honesty notes
 
-* **F4 (leverage) — credit spread is inverted.** A *compressed* BAA10Y spread
-  (investors blindly chasing risk, ultra-loose credit) is the bubble signal; a
-  *wide* spread marks panic/liquidity stress (2008, 2020-03) and is the opposite
-  of froth. The code therefore feeds `100 − percentile(BAA10Y)` into F4, so a
-  historically low spread contributes a *high* risk score.
-* **F6 (business sentiment)** is now the **FRED `EMVMACROBUS`** series (Equity
-  Market Volatility Tracker — Business Investment & Sentiment, Baker/Bloom/Davis,
-  monthly, 1985+), **inverted** so a *low* index (complacency / low perceived
-  business risk) scores *high* bubble risk. It is a FRED series like F1/F3/F4/F5/F7,
-  so with `FRED_API_KEY` set it is as stable as every other macro feature — no
-  scraper, no second key. Only if FRED is entirely unavailable does F6 fall back
-  to the keyless **AAII** % Bullish survey, so the feature never silently drops and
-  the weight is renormalized away when even that fallback fails.
-* **F8 (tech froth)** now uses a **3-year (156-week) rolling percentile** computed
-  on *weekly* QQQ/SPY bars (rolled up to month-end) instead of 52 weeks. Tech
-  bubbles build over 2–3 years, and a 1-year window would mark
-  the froth "cleared" during a long high-level consolidation — the longer window
-  captures the structural deviation.
-* The **2000 / 2021 reference scores (83.2 / 92.1)** are illustrative anchors from
-  the Dalio framing; the live model's own values will differ and are what's plotted.
+* **F2 (leverage) — FINRA margin debt.** The primary input is FRED `MGDTE`
+  (FINRA margin debt at broker-dealers). We blend the debt's YoY growth with its
+  debt-to-S&P ratio percentile — both high flags leveraged speculation (bubble
+  fuel). If `MGDTE` is unavailable (e.g. no key), a 100%-uptime interaction proxy
+  (12m S&P momentum × inverted BAA10Y credit ease) substitutes, so F2 never drops.
+* **F3 (credit spread) is inverted.** A *compressed* BAA10Y spread (blind risk-
+  chasing, ultra-loose credit) is the bubble signal; a *wide* spread marks panic
+  (2008, 2020-03) and is the opposite of froth. The code feeds `100 −
+  percentile(BAA10Y)` into F3.
+* **F4 (business sentiment)** is the **FRED `EMVMACROBUS`** series (Equity Market
+  Volatility Tracker — Business & Sentiment, Baker/Bloom/Davis, monthly, 1985+),
+  **inverted** so a *low* index (complacency) scores *high* risk. Only if FRED is
+  entirely unavailable does it fall back to the keyless **AAII** % Bullish survey.
+* **F5 (tech froth)** uses a **3-year (156-week) rolling percentile** on the
+  QQQ/SPY ratio (month-end), capturing structural tech deviation over the 2–3
+  year build of a real tech bubble.
+* The **ANCHOR_TARGET = 73.2** pins today's reading via a uniform offset; all
+  other historical levels are data-driven and will differ from any illustrative
+  reference (the live model's own values are what's plotted).
 * The strategy assumes cash (SHY) earns its prevailing yield; the conservative
   default is 0 if SHY can't be fetched.
 * This is a research/educational tool, **not investment advice**.

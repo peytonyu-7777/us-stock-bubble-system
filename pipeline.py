@@ -135,22 +135,24 @@ FETCH_TIMEOUT = 5         # hard per-request timeout (seconds)
 FETCH_DEADLINE = 9        # total wall-clock deadline for the whole batch
 INCREMENTAL_DAYS = 30     # on refresh: only re-fetch the last ~30 days
 
-# Composite weights (must sum to 1.0) — dual-speed: 70% slow macro anchors
-# (F1/F4/F6/F8) lock the long-cycle extremes; 30% fast sentiment/momentum
-# (F2/F3/F5) capture the market's current temperature. F7 (policy) merged into
-# F5 and dropped (weight 0) to cut micro jitter.
+# Composite weights (must sum to 1.0) — the 8-factor balanced matrix per spec:
+#   F1 Valuation  (0.20) CAPE / Buffett           — slow macro anchor
+#   F2 Leverage   (0.20) FINRA Margin Debt Ratio  — NEW leverage-warning anchor
+#   F3 Credit     (0.15) BAA10Y spread (inverted) — credit expansion
+#   F4 Business   (0.15) EMVMACROBUS (inverted)   — complacency
+#   F5 Tech Froth (0.10) QQQ/SPY 3y relative      — structural deviation
+#   F6 Momentum   (0.10) S&P 500 6m ann. (10d-SMA)— trend
+#   F7 Volatility (0.05) VIX (inverted, 10d-SMA)  — short-term complacency
+#   F8 Liquidity  (0.05) Fed WALCL YoY (+ M2 YoY) — central-bank liquidity
 WEIGHTS = {
-    # "Soft-fit" weighting: tilt slightly toward the forward-looking froth
-    # factors (F8 tech + F2 momentum) so the composite tracks the reference
-    # bubble-index shape (moderate 2007, strong 2018/2020/2021 peak, firm 2026)
-    # without hard-coding any historical date.
-    "F1_valuation": 0.22,   # structural valuation anchor (CAPE / Buffett)
-    "F2_momentum": 0.13,    # 6m momentum (20d-SMA pre-smoothed)
-    "F3_sentiment": 0.05,   # VIX (20d-SMA pre-smoothed, low weight)
-    "F4_leverage": 0.22,    # credit spread (BAA10Y, inverted)
-    "F5_liquidity": 0.05,   # Fed balance sheet YoY (+ M2 YoY secondary)
-    "F6_business": 0.13,    # EMVMACROBUS (inverted)
-    "F8_tech": 0.20,        # QQQ/SPY 3y rolling percentile
+    "F1_valuation": 0.20,   # structural valuation anchor (CAPE / Buffett)
+    "F2_leverage": 0.20,    # FINRA margin debt ratio (NEW leverage warning)
+    "F3_credit": 0.15,      # credit spread (BAA10Y, inverted)
+    "F4_business": 0.15,    # EMVMACROBUS (inverted)
+    "F5_tech": 0.10,        # QQQ/SPY 3y rolling percentile
+    "F6_momentum": 0.10,    # 6m momentum (10d-SMA pre-smoothed)
+    "F7_volatility": 0.05,  # VIX (inverted, 10d-SMA pre-smoothed)
+    "F8_liquidity": 0.05,   # Fed balance sheet YoY (+ M2 YoY secondary)
 }
 
 # Non-linear tail escalation (the "forward-looking" S-stretch of the BCA-style
@@ -170,12 +172,20 @@ S_THRESH = 1.0              # |Z| above which the stretch engages
 # like the reference chart) while S_EXP still pushes true bubble tops above 90.
 Z_GAIN = 2.1
 
-# EMA span (in DAYS) applied to the up-sampled daily score — the SECOND layer
-# of the dual-pass denoise filter (the first layer is the 20d SMA pre-smoothing
-# of VIX / momentum in compute_features_from_raw). A 60-day EMA keeps the
-# reference-chart macro wave smooth while still responding to major regime
-# changes (2020 crash, 2022 unwind, 2023-2026 rebound).
-EMA_SPAN = 60
+# Adaptive dual-speed smoothing (replaces the old fixed 45/60-day EMA).
+# The up-sampled daily score is run through a RECURSIVE EMA whose per-day span
+# depends on the volatility regime:
+#   * calm   (VIX < VIX_CALM)              -> BASE_SPAN  (smooth, sine-like wave)
+#   * stress (VIX >= VIX_STRESS OR weekly S&P drop > DROP_THRESH) -> FAST_SPAN
+#     so the score SNAPS upward at tops / crash onsets instead of lagging.
+#   * in-between (VIX_CALM <= VIX < VIX_STRESS) -> linearly interpolated span.
+# This unlocks the over-smoothed 45/60d filter while preserving a clean macro
+# wave in quiet periods.
+BASE_SPAN = 20
+FAST_SPAN = 5
+VIX_CALM = 15.0
+VIX_STRESS = 25.0
+DROP_THRESH = -0.03      # >= 3% single-week S&P 500 drop -> stress regime
 
 # Bubble-confirmation interaction: when valuation (F1), tech froth (F8) and
 # momentum (F2) are ALL in their upper 30% of the historical distribution,
@@ -204,12 +214,13 @@ MIN_VALID_WEIGHT = 0.70
 
 FEATURE_LABELS = {
     "F1_valuation": "Valuation (CAPE / Buffett)",
-    "F2_momentum": "Momentum (6m ann.)",
-    "F3_sentiment": "Sentiment (VIX inv.)",
-    "F4_leverage": "Leverage (Credit Spread inv.)",
-    "F5_liquidity": "Liquidity (Fed BS / M2)",
-    "F6_business": "Business Sentiment (EMVMACROBUS inv.)",
-    "F8_tech": "Tech Froth (QQQ/SPY, 3y)",
+    "F2_leverage": "Leverage (FINRA Margin Debt)",
+    "F3_credit": "Credit Spread (BAA10Y inv.)",
+    "F4_business": "Business Sentiment (EMVMACROBUS inv.)",
+    "F5_tech": "Tech Froth (QQQ/SPY, 3y)",
+    "F6_momentum": "Momentum (6m ann.)",
+    "F7_volatility": "Volatility (VIX inv.)",
+    "F8_liquidity": "Liquidity (Fed BS / M2)",
 }
 
 HISTORY_START = "1990-01-01"   # long history so the 20y window is "full" by 2010
@@ -227,6 +238,7 @@ RAW_SPECS = {
     "m2":       ("fred", "M2SL"),
     "walcl":    ("fred", "WALCL"),
     "emv":      ("fred", "EMVMACROBUS"),
+    "mgdte":    ("fred", "MGDTE"),      # FINRA margin debt (broker-dealers), monthly
     "cpi":      ("fred", "CPIAUCSL"),
     "ffr":      ("fred", "FEDFUNDS"),
     "sp500div": ("fred", "SP500DIV"),   # tertiary F1 valuation fallback
@@ -637,11 +649,11 @@ def compute_composite(feat_pct: pd.DataFrame, weights: dict = WEIGHTS,
         z_raw = zw / valid_w
 
     # 2b. bubble-confirmation interaction (soft, data-driven escalation):
-    #     when F1 valuation, F8 tech froth and F2 momentum are all in the top
+    #     when F1 valuation, F5 tech froth and F6 momentum are all in the top
     #     30% of their historical distribution, the regime looks like a classic
     #     bubble and we nudge the composite Z up. This naturally amplifies
     #     2000/2021 vs 2007/2018 without any hard-coded date alignment.
-    confirm_cols = ["F1_valuation", "F8_tech", "F2_momentum"]
+    confirm_cols = ["F1_valuation", "F5_tech", "F6_momentum"]
     if all(c in feat_pct.columns for c in confirm_cols):
         confirm = (feat_pct[confirm_cols] >= BUBBLE_CONFIRM_THRESH).all(axis=1)
         z_raw = z_raw + confirm.astype(float) * BUBBLE_CONFIRM_BOOST
@@ -665,20 +677,24 @@ def compute_composite(feat_pct: pd.DataFrame, weights: dict = WEIGHTS,
     else:
         stretched = zg
 
-    # 5. CDF -> 0-100. The standard-normal CDF is naturally bounded in (0, 1),
-    #    so NO np.clip is needed (and none is applied — the wave keeps its full,
-    #    smooth dynamic range instead of being flattened against a ceiling).
+    # 5. CDF -> (0, 100). The standard-normal CDF is mathematically bounded in
+    #    (0, 1), so the raw score can NEVER be negative or exceed 100. A single
+    #    hard clip to [1.0, 99.0] is applied as a belt-and-braces guarantee that
+    #    the anchor offset below can never breach the 0/100 bounds.
     score = pd.Series(_standard_normal_cdf(stretched), index=z_gain.index)
     score = score * 100.0
 
     # Deterministic anchor calibration: pin the LATEST *valid* reading to
-    # ANCHOR_TARGET via a uniform additive offset. This shifts the entire curve
-    # by a constant, so today renders exactly at 73.2 while every other date keeps
-    # its natural, data-driven relative position (no flattening, no clipping).
+    # ANCHOR_TARGET via a uniform additive offset, THEN clip to [1, 99]. The
+    # clip is applied AFTER the offset so the shift never produces an
+    # out-of-range value, and only the extreme tails are touched — the macro
+    # wave shape is preserved because CDF values away from 0/100 sit far inside
+    # the clip band. Guarantees the strict Score in [1.0, 99.0] contract.
     last = score.dropna().index[-1] if score.notna().any() else None
     if last is not None:
         offset = ANCHOR_TARGET - score.loc[last]
         score = score + offset
+    score = score.clip(1.0, 99.0)
     return score
 
 
@@ -799,7 +815,18 @@ def fetch_all_raw(incremental: bool) -> Tuple[pd.DataFrame, dict]:
 # Feature construction from the (cached) raw frame
 # ---------------------------------------------------------------------------
 def compute_features_from_raw(raw: pd.DataFrame) -> Tuple[pd.DataFrame, dict]:
-    """Turn the raw monthly frame into the 8 risk-percentile features."""
+    """Turn the raw monthly frame into the 8 risk-percentile features.
+
+    Factor matrix (weights live in WEIGHTS):
+      F1 Valuation    CAPE / Buffett            — slow macro anchor
+      F2 Leverage     FINRA Margin Debt Ratio   — NEW leverage-warning anchor
+      F3 Credit       BAA10Y spread (inverted)  — credit expansion
+      F4 Business     EMVMACROBUS (inverted)    — complacency
+      F5 Tech Froth   QQQ/SPY 3y relative       — structural deviation
+      F6 Momentum     S&P 500 6m ann. (10d-SMA) — trend
+      F7 Volatility   VIX (inverted, 10d-SMA)   — short-term complacency
+      F8 Liquidity    Fed WALCL YoY (+ M2 YoY)  — central-bank liquidity
+    """
     meta: dict = {}
     idx = raw.index
 
@@ -817,6 +844,7 @@ def compute_features_from_raw(raw: pd.DataFrame) -> Tuple[pd.DataFrame, dict]:
     emv = g("emv")
     cpi, ffr = g("cpi"), g("ffr")
     spx, spy, qqq = g("spx"), g("spy"), g("qqq")
+    mgdte = g("mgdte")
 
     feat = pd.DataFrame(index=idx)
 
@@ -876,96 +904,136 @@ def compute_features_from_raw(raw: pd.DataFrame) -> Tuple[pd.DataFrame, dict]:
             feat["F1_valuation"] = np.nan
             meta["F1_valuation"] = "N"
 
-    # ---- F2 Momentum (6m annualized, 20-day SMA pre-smoothed) -----------
-    # FIRST-pass denoise: take the 20-trading-day SMA of DAILY S&P 500, then
+    # ---- F2 Leverage (FINRA Margin Debt Ratio) [NEW] ---------------------
+    # Risk direction: a fast-growing margin-debt balance AND a high
+    # debt-to-market ratio both flag leveraged speculation (bubble fuel). The
+    # two historical percentiles are blended into one leverage score.
+    # PRIMARY = FRED MGDTE (FINRA margin debt, monthly). FALLBACK (100% uptime
+    # guarantee) = an interaction proxy of 12m S&P momentum + loose credit
+    # (inverted BAA10Y): rising prices on easy credit historically ride on
+    # expanding margin use, so the proxy tracks the same leverage regime.
+    mg_primary = None
+    if mgdte is not None and mgdte.notna().any():
+        mg = mgdte.interpolate().ffill().bfill()
+        mg_yoy = mg.pct_change(12) * 100.0
+        if spx is not None and spx.notna().any():
+            mg_ratio = (mg / spx).replace([np.inf, -np.inf], np.nan)
+            mg_ratio = mg_ratio.interpolate().ffill().bfill()
+            pct_ratio = rolling_pct(mg_ratio)
+        else:
+            pct_ratio = None
+        pct_yoy = rolling_pct(mg_yoy)
+        comps = [c for c in (pct_yoy, pct_ratio) if c is not None]
+        mg_primary = np.nanmean(comps, axis=0) if comps else None
+        meta["F2_leverage"] = "FINRA MGDTE (YoY + debt/SPX)"
+    else:
+        meta["F2_leverage"] = "proxy"
+
+    # Fallback proxy (always computable from spx + baa10y)
+    mg_fallback = None
+    if (spx is not None and spx.notna().any()
+            and baa10y is not None and baa10y.notna().any()):
+        spx_ret12 = spx.pct_change(12) * 100.0
+        credit_ease = 100.0 - rolling_pct(baa10y)   # loose credit = high ease
+        r1 = rolling_pct(spx_ret12)
+        mg_fallback = r1 * 0.6 + credit_ease * 0.4
+        meta["F2_leverage"] += " + SPX12m/BAA proxy"
+
+    if mg_primary is not None:
+        feat["F2_leverage"] = mg_primary
+        if mg_fallback is not None:
+            feat["F2_leverage"] = feat["F2_leverage"].combine_first(mg_fallback)
+    elif mg_fallback is not None:
+        feat["F2_leverage"] = mg_fallback
+    else:
+        feat["F2_leverage"] = np.nan
+        meta["F2_leverage"] = "N"
+
+    # ---- F6 Momentum (6m annualized, 10-day SMA pre-smoothed) -----------
+    # FIRST-pass denoise: take the 10-trading-day SMA of DAILY S&P 500, then
     # resample to month-end and compute the 6-month annualized return. This
     # strips intra-month whipsaw before it ever reaches the percentile.
-    f2_src = None
+    f6_src = None
     if "spx" in hf and hf["spx"].notna().any():
-        spx_sma = hf["spx"].rolling(20).mean().dropna()
+        spx_sma = hf["spx"].rolling(10).mean().dropna()
         spx_m = spx_sma.resample("ME").last().dropna()
         if len(spx_m) >= 6:
             mom6 = (spx_m / spx_m.shift(6)) ** (12.0 / 6.0) - 1.0
-            f2_src = rolling_pct(mom6)
-            meta["F2_momentum"] = "SPX 20d-SMA -> 6m ann."
-    if f2_src is None and spx is not None and spx.notna().any():
+            f6_src = rolling_pct(mom6)
+            meta["F6_momentum"] = "SPX 10d-SMA -> 6m ann."
+    if f6_src is None and spx is not None and spx.notna().any():
         mom6 = (spx / spx.shift(6)) ** (12.0 / 6.0) - 1.0
-        f2_src = rolling_pct(mom6)
-        meta["F2_momentum"] = "SPX monthly (SMA fallback)"
-    feat["F2_momentum"] = f2_src if f2_src is not None else np.nan
-    if meta.get("F2_momentum") is None:
-        meta["F2_momentum"] = "N"
+        f6_src = rolling_pct(mom6)
+        meta["F6_momentum"] = "SPX monthly (SMA fallback)"
+    feat["F6_momentum"] = f6_src if f6_src is not None else np.nan
+    if meta.get("F6_momentum") is None:
+        meta["F6_momentum"] = "N"
 
-    # ---- F3 Sentiment (VIX inverted, 20-day SMA pre-smoothed) ------------
-    # Denoise VIX with a 20-trading-day SMA before inverting into a risk
+    # ---- F7 Volatility (VIX inverted, 10-day SMA pre-smoothed) -----------
+    # Denoise VIX with a 10-trading-day SMA before inverting into a risk
     # percentile, so a single vol spike doesn't paint a false "all-clear".
-    f3_src = None
+    f7_src = None
     if "vix" in hf and hf["vix"].notna().any():
-        vix_sma = hf["vix"].rolling(20).mean().dropna()
+        vix_sma = hf["vix"].rolling(10).mean().dropna()
         vix_m = vix_sma.resample("ME").last().dropna()
         if not vix_m.empty:
-            f3_src = 100.0 - rolling_pct(vix_m)
-            meta["F3_sentiment"] = "VIX 20d-SMA (inv)"
-    if f3_src is None:
+            f7_src = 100.0 - rolling_pct(vix_m)
+            meta["F7_volatility"] = "VIX 10d-SMA (inv)"
+    if f7_src is None:
         v = vix if (vix is not None and vix.notna().any()) else vixcls
         if v is not None and v.notna().any():
-            f3_src = 100.0 - rolling_pct(v)
-            meta["F3_sentiment"] = "VIX/VIXCLS monthly (inv)"
-    feat["F3_sentiment"] = f3_src if f3_src is not None else np.nan
-    if meta.get("F3_sentiment") is None:
-        meta["F3_sentiment"] = "N"
+            f7_src = 100.0 - rolling_pct(v)
+            meta["F7_volatility"] = "VIX/VIXCLS monthly (inv)"
+    feat["F7_volatility"] = f7_src if f7_src is not None else np.nan
+    if meta.get("F7_volatility") is None:
+        meta["F7_volatility"] = "N"
 
-    # ---- F4 Leverage (credit spread INVERTED) ----------------------------
+    # ---- F3 Credit (credit spread INVERTED) -----------------------------
     # A compressed spread (blind risk-chasing, ultra-loose credit) is a bubble
     # signal; a wide spread marks panic (2008, 2020-03) — the opposite of froth.
     if baa10y is not None and baa10y.notna().any():
-        feat["F4_leverage"] = 100.0 - rolling_pct(baa10y)
-        meta["F4_leverage"] = "Credit(inv)=Y"
+        feat["F3_credit"] = 100.0 - rolling_pct(baa10y)
+        meta["F3_credit"] = "Credit(inv)=Y"
     else:
-        feat["F4_leverage"] = np.nan
-        meta["F4_leverage"] = "N"
+        feat["F3_credit"] = np.nan
+        meta["F3_credit"] = "N"
 
-    # ---- F5 Liquidity (M2 YoY + Fed BS YoY) ------------------------------
+    # ---- F8 Liquidity (M2 YoY + Fed BS YoY) ------------------------------
     parts = []
     if m2 is not None and m2.notna().any():
         parts.append(rolling_pct(m2.pct_change(12) * 100.0))
     if walcl is not None and walcl.notna().any():
         parts.append(rolling_pct(walcl.pct_change(12) * 100.0))
-    feat["F5_liquidity"] = np.nanmean(parts, axis=0) if parts else np.nan
-    meta["F5_liquidity"] = (f"M2={'Y' if m2 is not None and m2.notna().any() else 'N'} "
+    feat["F8_liquidity"] = np.nanmean(parts, axis=0) if parts else np.nan
+    meta["F8_liquidity"] = (f"M2={'Y' if m2 is not None and m2.notna().any() else 'N'} "
                             f"FedBS={'Y' if walcl is not None and walcl.notna().any() else 'N'}")
 
-    # ---- F6 Business sentiment (FRED EMVMACROBUS, INVERTED) --------------
+    # ---- F4 Business sentiment (FRED EMVMACROBUS, INVERTED) --------------
     # Low index = complacency = bubble-prone -> invert. FRED series, so with a
     # FRED_API_KEY it is as stable as every other macro feature. Only if it is
     # entirely missing do we fall back to the keyless AAII bullish survey.
     if emv is not None and emv.notna().sum() >= 12:
-        feat["F6_business"] = 100.0 - rolling_pct(emv)
-        meta["F6_business"] = "EMVMACROBUS (FRED, inv)"
+        feat["F4_business"] = 100.0 - rolling_pct(emv)
+        meta["F4_business"] = "EMVMACROBUS (FRED, inv)"
     else:
         aaii = _aaii_sentiment()
         if aaii is not None and aaii.notna().sum() >= 6:
             # High bullish (complacency) = risk -> positive percentile.
-            feat["F6_business"] = rolling_pct(aaii)
-            meta["F6_business"] = "AAII bullish (EMV fallback)"
+            feat["F4_business"] = rolling_pct(aaii)
+            meta["F4_business"] = "AAII bullish (EMV fallback)"
         else:
-            feat["F6_business"] = np.nan
-            meta["F6_business"] = "N"
+            feat["F4_business"] = np.nan
+            meta["F4_business"] = "N"
 
-    # ---- F7 Policy (real fed funds) — MERGED INTO F5, dropped (weight 0) -
-    # The real-rate factor added micro jitter without improving the macro wave,
-    # so per spec it is folded into the liquidity bucket (F5) and no longer
-    # carries its own weight. Kept here only as a documented no-op for clarity.
-
-    # ---- F8 Tech froth (QQQ/SPY, 3-year (~156-week) rolling percentile) -
+    # ---- F5 Tech froth (QQQ/SPY, 3-year (~156-week) rolling percentile) -
     if (qqq is not None and spy is not None
             and qqq.notna().any() and spy.notna().any()):
         ratio = qqq / spy
-        feat["F8_tech"] = rolling_pct(ratio, window=WINDOW_TECH_MONTHS)
-        meta["F8_tech"] = "Y"
+        feat["F5_tech"] = rolling_pct(ratio, window=WINDOW_TECH_MONTHS)
+        meta["F5_tech"] = "Y"
     else:
-        feat["F8_tech"] = np.nan
-        meta["F8_tech"] = "N"
+        feat["F5_tech"] = np.nan
+        meta["F5_tech"] = "N"
 
     return feat, meta
 
@@ -1008,8 +1076,8 @@ def _synthetic_scores(start: str = LIVE_START) -> pd.Series:
              + peak("2025-01-01", 6, 9))
     rng = np.random.RandomState(7)
     s = base + bumps + rng.normal(0, 2.0, len(idx))
-    # Deliberately NOT clipped: the synthetic series is bounded by construction
-    # (max ~46+26+18+noise ≈ 92) and the real pipeline never uses np.clip either.
+    # Bounded by construction (max ~46+26+18+noise ≈ 92); the live pipeline
+    # still applies a hard clip(1, 99) as a belt-and-braces boundary guarantee.
     return pd.Series(s, index=idx)
 
 
@@ -1086,15 +1154,66 @@ def get_monthly_scores(refresh: bool = False,
                    "features": meta_features}
 
 
+def adaptive_ema(score: pd.Series, vix: pd.Series = None,
+                 spx: pd.Series = None) -> pd.Series:
+    """Volatility-adjusted recursive EMA (adaptive dual-speed smoothing).
+
+    The per-day smoothing span is chosen from the volatility regime:
+      * calm   (VIX < VIX_CALM)                       -> BASE_SPAN (smooth wave)
+      * stress (VIX >= VIX_STRESS OR weekly drop>3%)  -> FAST_SPAN (snap up)
+      * in-between                              -> linear interpolation of span
+    A hand-rolled recursive EMA (NOT pandas ewm) is required because the
+    smoothing factor changes every day. Stress regimes make the score snap
+    upward at tops / crash onsets; calm regimes keep a clean macro wave.
+    Falls back to a constant BASE_SPAN EMA when vol signals are unavailable.
+    """
+    if score is None or len(score) == 0:
+        return score
+    idx = score.index
+
+    # regime stress fraction 0 (calm) .. 1 (stress)
+    if vix is not None and len(vix) > 0:
+        v = vix.reindex(idx, method="ffill")
+        frac = (v - VIX_CALM) / (VIX_STRESS - VIX_CALM)
+        frac = frac.fillna(0.0).clip(0.0, 1.0)
+    else:
+        frac = pd.Series(0.0, index=idx)
+    if spx is not None and len(spx) > 0:
+        s = spx.reindex(idx, method="ffill")
+        wk_drop = s.pct_change(5)              # ~1-week S&P return
+        stress_drop = (wk_drop <= DROP_THRESH).astype(float)
+        frac = np.maximum(frac, stress_drop)
+
+    # span: frac=0 -> BASE_SPAN, frac=1 -> FAST_SPAN; alpha = 2/(span+1)
+    span = BASE_SPAN + (FAST_SPAN - BASE_SPAN) * frac
+    alpha = 2.0 / (span + 1.0)
+
+    vals = score.to_numpy(dtype=float)
+    out = np.empty_like(vals)
+    prev = np.nan
+    for i in range(len(vals)):
+        x = vals[i]
+        a = float(alpha.iloc[i]) if hasattr(alpha, "iloc") else float(alpha[i])
+        if np.isnan(x):
+            out[i] = prev
+            continue
+        if np.isnan(prev):
+            prev = x
+        else:
+            prev = a * x + (1.0 - a) * prev
+        out[i] = prev
+    return pd.Series(out, index=idx)
+
+
 def get_daily_scores(refresh: bool = False,
                       tail_boost: Optional[bool] = None) -> pd.Series:
-    """Daily, EMA-smoothed Bubble Risk Score for charting.
+    """Daily, adaptive-EMA-smoothed Bubble Risk Score for charting.
 
     The composite is computed MONTHLY (the percentile normalization needs a
     long trailing window). We up-sample it onto a daily calendar — forward
-    filling the most recent month-end reading to every day — and then apply a
-    short EMA (``EMA_SPAN`` days) to suppress day-to-day noise, yielding a
-    smooth trend line for the dashboard chart.
+    filling the most recent month-end reading to every day — then run it
+    through a VOL-ADJUSTED adaptive EMA (BASE_SPAN calm / FAST_SPAN stress)
+    so the curve snaps at tops / crashes yet stays smooth in quiet periods.
 
     Returns an empty Series if no monthly scores are available.
     """
@@ -1105,7 +1224,12 @@ def get_daily_scores(refresh: bool = False,
     end = pd.Timestamp.today().normalize()
     daily_idx = pd.date_range(monthly.index.min(), end, freq="D")
     daily = monthly.reindex(daily_idx, method="ffill")
-    daily = daily.ewm(span=EMA_SPAN, adjust=False).mean()
+
+    # load the daily vol-regime signals (VIX level + S&P weekly drop)
+    hf = _get_hf_daily()
+    vix_d = hf.get("vix") if hf else None
+    spx_d = hf.get("spx") if hf else None
+    daily = adaptive_ema(daily, vix=vix_d, spx=spx_d)
     return daily.dropna()
 
 
