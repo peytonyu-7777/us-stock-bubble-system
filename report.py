@@ -135,11 +135,11 @@ def feature_cards_html(state: dict) -> str:
     for key, f in state["features"].items():
         sc = f["score"]
         if sc is None:
-            color, txt = "gray", "n/a"
+            color, txt, avail = "gray", "Pending", "pending"
         else:
             color = band_color(sc)
             txt = f"{sc:.0f}"
-        avail = "live" if f["available"] else "no data"
+            avail = "live"
         cells += (
             f'<div class="card">'
             f'<div class="lbl">{_html.escape(f["label"])}</div>'
@@ -190,7 +190,8 @@ def main():
     args = ap.parse_args()
 
     scores, meta = pipe.get_monthly_scores(refresh=args.refresh)
-    state = pipe.get_latest_state(refresh=args.refresh)
+    # get_latest_state reads the cache just written above (no second fetch).
+    state = pipe.get_latest_state(refresh=False)
     spx = pipe.get_price_series("^GSPC", start=pipe.LIVE_START)
     ndx = pipe.get_price_series("^IXIC", start=pipe.LIVE_START)
     res = bt.main(refresh=args.refresh)
@@ -199,6 +200,7 @@ def main():
     asof = state["as_of"]
     asof_str = pd.Timestamp(asof).date() if asof else "n/a"
     src = meta.get("source", "unknown")
+    src_label = {"live": "Real-time", "cache": "Cached", "synthetic": "Synthetic"}
 
     warn = (
         '<div class="warn">⚠️ Live data unavailable — showing a deterministic '
@@ -221,7 +223,7 @@ def main():
     <div class="status">{_html.escape(state['status'])}</div>
     <div class="kv"><b>Score:</b> {score:.1f} / 100 (as of {asof_str})</div>
     <div class="kv"><b>DCA rule:</b> 0–40: 2.0× · 40–60: 1.5× · 60–80: 1.0× · 80–90: 0.5× · 90–100: 0×</div>
-    <div class="kv"><b>Data source:</b> {src} · features live: {meta.get('available_count','?')}/8</div>
+    <div class="kv"><b>Data source:</b> {src_label.get(src, src)} · features live: {meta.get('available_count','?')}/8</div>
   </div>
 </div>
 <h2>Eight Risk Features (current percentile)</h2>

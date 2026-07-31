@@ -7,10 +7,13 @@ python-dotenv>=1.0       # load FRED_API_KEY (etc.) from a local .env file
 
 # Data sources (all FREE / keyless except FRED)
 yfinance>=0.2.40          # prices / momentum / QQQ-SPY  (Stooq fallback auto-used)
-pandas-datareader>=0.10   # FRED (requires FRED_API_KEY)
-pytrends>=4.9            # Google Trends (secondary F6 source)
-openpyxl>=3.1            # needed by pandas to read FINRA's .xlsx retail workbook (F6 fallback)
-# Stooq prices + AAII are fetched over plain HTTPS via `requests` (no package needed)
+pandas_datareader>=0.10   # FRED fallback fetcher (bounded by an internal timeout)
+#   FRED primary path is the direct CSV endpoint over `requests` (no key needed).
+#   Stooq + AAII also use `requests`. Every fetch is concurrent
+#   (ThreadPoolExecutor max_workers=8) with a 5s per-request timeout.
+
+# Parquet cache (pyarrow is the on-disk engine for the incremental cache)
+pyarrow>=14.0
 
 # Viz
 plotly>=5.18

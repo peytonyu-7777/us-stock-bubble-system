@@ -14,9 +14,9 @@ Streamlit dashboard deployable to **Render** or **HuggingFace Spaces** in one cl
 | F1 | Valuation | 0.20 | CAPE (FRED `CAPE`) + Buffett Indicator (Wilshire `WILL5000INDFC` / `GDP`) | high = risk |
 | F2 | Momentum | 0.10 | S&P 500 6-month annualized return (`yfinance ^GSPC`) | high = risk |
 | F3 | Sentiment | 0.10 | VIX, inverted (FRED `VIXCLS`) | low VIX = risk |
-| F4 | Leverage | 0.15 | Margin Debt / Mkt Cap (`MARGINSL`) + Credit Spread (`BAA10Y`, **inverted**) | high = risk |
+| F4 | Leverage | 0.15 | Credit Spread (`BAA10Y`, **inverted**: low spread = high risk) | high = risk |
 | F5 | Liquidity | 0.10 | Fed BS YoY (`WALCL`, primary) + M2 YoY (`M2SL`, secondary) | high = risk |
-| F6 | Business Sentiment | 0.15 | **FRED `EMVMACROBUS`** (Equity Market Volatility Tracker — Business & Sentiment), **inverted** (low index = risk). Keyless FINRA/AAII/Trends blend used only as fallback when FRED is unavailable | low index = risk |
+| F6 | Business Sentiment | 0.15 | **FRED `EMVMACROBUS`** (Equity Market Volatility Tracker — Business & Sentiment), **inverted** (low index = risk). Keyless **AAII** % Bullish survey used only as fallback when FRED is unavailable | low index = risk |
 | F7 | Policy stance | 0.05 | Real Fed Funds (`FEDFUNDS` − CPI YoY), inverted | low real rate = risk |
 | F8 | Tech froth | 0.15 | QQQ / SPY ratio, **3-year (156-week) rolling percentile** | high = risk |
 
@@ -39,7 +39,7 @@ is unavailable, its weight is redistributed so the score always stays on 0–100
 
 | File | Purpose |
 |------|---------|
-| `pipeline.py` | Data fetchers + rolling-percentile scoring + cache + synthetic fallback. Public API: `get_monthly_scores()`, `get_latest_state()`. |
+| `pipeline.py` | **Concurrent** data fetchers (ThreadPoolExecutor, 5s per-request timeout, hard total deadline) + vectorized rolling-percentile scoring + **incremental** parquet cache (`bubble_cache.parquet`) + synthetic fallback (only when all 8 APIs fail). Public API: `get_monthly_scores()`, `get_latest_state()`. |
 | `backtest.py` | Buy-&-Hold vs Bubble-DCA (2000→today), **weekly rebalancing by default** (`--freq M` for monthly). Prints CAGR, Max DD, Sharpe, Calmar + drawdown comparison for 2000/2008/2021. |
 | `app.py` | Streamlit dashboard: gauge, 8 feature cards, S&P/Nasdaq + score history with >80 zone shaded. **Mobile-responsive** (feature cards reflow, columns stack on phones). |
 | `requirements.txt`, `Dockerfile`, `render.yaml` | Zero-cost deploy config. |
@@ -53,7 +53,7 @@ python -m venv .venv && source .venv/bin/activate   # or .venv\Scripts\activate 
 pip install -r requirements.txt
 
 cp .env.example .env   # then edit .env and paste your free FRED_API_KEY
-python pipeline.py     # score history -> bubble_cache.parquet
+python pipeline.py     # score history -> bubble_cache.parquet (full fetch first run)
 python backtest.py          # weekly rebalance strategy comparison (default)
 python backtest.py --freq M   # monthly rebalance instead
 python backtest.py --refresh  # force re-fetch score history
@@ -62,10 +62,10 @@ python report.py       # static report.html (open directly in a browser, no serv
 ```
 
 ### The ONLY credential you need to provide: a free FRED API key
-FRED covers **F1** (valuation/CAPE/Buffett), **F3** (VIX), **F4** (margin debt +
-credit spread), **F5** (M2 + Fed balance sheet), **F6** (EMVMACROBUS business
+FRED covers **F1** (valuation/CAPE/Buffett), **F3** (VIX), **F4** (credit spread),
+**F5** (M2 + Fed balance sheet), **F6** (EMVMACROBUS business
 sentiment) and **F7** (real fed funds). Everything else — yfinance/Stooq prices,
-and the FINRA/AAII/Trends fallback for F6 — is **keyless and free**. Because F6
+and the keyless **AAII** fallback for F6 — is **keyless and free**. Because F6
 now comes from FRED too, a single `FRED_API_KEY` powers all six macro features
 (incl. the business-sentiment signal), so the pipeline is effectively a
 one-key, 100%-API-stable system when the key is set.
@@ -91,13 +91,13 @@ This is the only file you edit to supply the API key.
 3. In the service settings add the env var **`FRED_API_KEY`** (recommended).
    **Set it as BOTH a runtime AND a build environment variable** (Render lets you
    toggle "Build" vs "Runtime" for each env var). The `Dockerfile` pre-fetches the
-   score + price history **at build time** and bakes `bubble_cache.parquet` +
-   `prices_cache.parquet` into the image, so the first request is instant (no slow
-   cold-start fetch, health check won't time out). Baking it as a *build* var is
-   what lets **F6 (EMVMACROBUS)** and the other FRED features land in the image —
-   otherwise the runtime key alone can't refresh the baked cache.
+   score + price history **at build time** and bakes `bubble_cache.parquet`
+   into the image, so the first request is instant (no slow cold-start fetch,
+   health check won't time out). Baking it as a *build* var is what lets **F6
+   (EMVMACROBUS)** and the other FRED features land in the image — otherwise the
+   runtime key alone can't refresh the baked cache.
    If you only set it as a runtime var (no build var), F6 will still render using
-   the real keyless FINRA/AAII fallback — just not the EMVMACROBUS series.
+   the real keyless AAII fallback — just not the EMVMACROBUS series.
 
 > Free web tier: the service sleeps after ~15 min idle and takes ~30 s to spin
 > back up. If a zero-sleep free option is preferred, use **HuggingFace Spaces**.
@@ -108,9 +108,10 @@ This is the only file you edit to supply the API key.
 2. Upload `app.py`, `pipeline.py`, `backtest.py`, `requirements.txt`, `Dockerfile`.
 3. (Optional) add `FRED_API_KEY` under Settings → Variables.
 
-> Both platforms allow outbound HTTPS. On Render the caches are baked at build;
-> on HF the app fetches live on first load and writes `bubble_cache.parquet` /
-> `prices_cache.parquet` to the Space's persistent storage afterwards.
+> Both platforms allow outbound HTTPS. On Render the cache is baked at build;
+> on HF the app fetches live on first load and writes `bubble_cache.parquet`
+> to the Space's persistent storage afterwards. Refresh only re-fetches the last
+> ~30 days (incremental), so even a cold HF load is fast.
 
 ---
 
@@ -127,9 +128,8 @@ This is the only file you edit to supply the API key.
   business risk) scores *high* bubble risk. It is a FRED series like F1/F3/F4/F5/F7,
   so with `FRED_API_KEY` set it is as stable as every other macro feature — no
   scraper, no second key. Only if FRED is entirely unavailable does F6 fall back
-  to the keyless **FINRA** retail-volume-share + **AAII** % Bullish blend (with
-  Google Trends as last-resort filler), so the feature never silently drops and
-  the weight is renormalized away when all fallbacks fail.
+  to the keyless **AAII** % Bullish survey, so the feature never silently drops and
+  the weight is renormalized away when even that fallback fails.
 * **F8 (tech froth)** now uses a **3-year (156-week) rolling percentile** computed
   on *weekly* QQQ/SPY bars (rolled up to month-end) instead of 52 weeks. Tech
   bubbles build over 2–3 years, and a 1-year window would mark

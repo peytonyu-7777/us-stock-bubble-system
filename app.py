@@ -40,6 +40,7 @@ st.markdown("""
   gap:10px;margin-top:6px}
 .feat-card{border:1px solid #e5e7eb;border-radius:10px;padding:12px;
   background:#fff;text-align:center}
+.feat-card.missing{opacity:.55;background:#f9fafb;border-style:dashed}
 .feat-lbl{font-size:12px;color:#555}
 .feat-val{font-size:30px;font-weight:700}
 .feat-w{font-size:11px;color:#888}
@@ -58,12 +59,12 @@ BANDS = [  # (lo, hi, color, label)
 ]
 
 
-@st.cache_data(ttl=3600, show_spinner="Fetching market data…")
+@st.cache_data(ttl=3600)
 def load_scores(refresh: bool):
     return pipe.get_monthly_scores(refresh=refresh)
 
 
-@st.cache_data(ttl=3600, show_spinner="Loading price history…")
+@st.cache_data(ttl=3600)
 def load_prices():
     spx = pipe.get_price_series("^GSPC", start=pipe.LIVE_START)
     ndx = pipe.get_price_series("^IXIC", start=pipe.LIVE_START)
@@ -107,13 +108,13 @@ def feature_cards(features: dict):
     for key, f in features.items():
         sc = f["score"]
         if sc is None:
-            color, txt = "gray", "n/a"
+            color, txt, cls, avail = "gray", "Pending", " missing", "pending"
         else:
             color = band_color(sc)
             txt = f"{sc:.0f}"
-        avail = "live" if f["available"] else "no data"
+            cls, avail = "", "live"
         cells += (
-            f'<div class="feat-card">'
+            f'<div class="feat-card{cls}">'
             f'<div class="feat-lbl">{f["label"]}</div>'
             f'<div class="feat-val" style="color:{color}">{txt}</div>'
             f'<div class="feat-w">w {f["weight"]:.2f} · {avail}</div>'
@@ -171,14 +172,20 @@ def main():
         st.cache_data.clear()
         refresh = True
 
-    scores, meta = load_scores(refresh=refresh)
-    state = pipe.get_latest_state(refresh=refresh)
+    # Single network pass: load_scores fetches (concurrent, incremental cache)
+    # and writes the unified cache; get_latest_state then reads that cache so
+    # the dashboard never triggers a second fetch.
+    with st.spinner("正在并发拉取最新宏观数据中，预计耗时 3 秒..."):
+        scores, meta = load_scores(refresh=refresh)
+        state = pipe.get_latest_state(refresh=False)
 
-    if meta.get("source") == "synthetic":
+    src = meta.get("source", "unknown")
+    src_label = {"live": "Real-time", "cache": "Cached", "synthetic": "Synthetic"}
+    if src == "synthetic":
         st.warning("⚠️ Live data unavailable — showing a **deterministic synthetic** "
                    "series for layout/demo only. Set `FRED_API_KEY` and uncheck the "
                    "cache to fetch real data.")
-    elif meta.get("source") == "cache":
+    elif src == "cache":
         st.info("ℹ️ Showing cached data (set refresh to pull live).")
 
     # ---- Top gauge -------------------------------------------------------
@@ -192,8 +199,8 @@ def main():
         st.markdown("**DCA rule (monthly):**")
         st.markdown("- 0–40 : 2.0×  - 40–60 : 1.5×  - 60–80 : 1.0×  "
                     "- 80–90 : 0.5×  - 90–100 : 0× (de-risk 20% → cash)")
-        st.markdown(f"**Data source:** `{meta.get('source')}` · "
-                    f"features live: `{meta.get('available_count','?')}/8`")
+        st.markdown(f"**Data source:** `{src_label.get(src, src)}` · "
+                    f"Real-time coverage: `{meta.get('available_count','?')}/8 live`")
 
     # ---- Feature cards ---------------------------------------------------
     st.subheader("Eight Risk Features (current percentile)")

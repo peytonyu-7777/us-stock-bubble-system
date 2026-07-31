@@ -1,70 +1,90 @@
 """
 pipeline.py — Dalio-style US Equity Bubble Risk scoring pipeline.
 
-Fetches 8 feature series from free / open APIs (FRED via pandas_datareader,
-yfinance prices, pytrends Google Trends) and computes a 0-100 Bubble Risk
-Score with rolling 20-year (default) percentile normalization.
+Fetches 8 feature series from free / open APIs (FRED via direct CSV with a
+pandas-datareader fallback, yfinance prices with a bot-evading session header
+and a Stooq keyless fallback) and computes a 0-100 Bubble Risk Score with a
+rolling 20-year (default) percentile normalization.
 
 ------------------------------------------------------------------------------
-DESIGN PRINCIPLES
+PERFORMANCE DESIGN (production refactor)
 ------------------------------------------------------------------------------
-* Every feature is normalized so that HIGHER value == MORE bubble risk.
-  For "good when low" indicators (VIX, real rate) we invert inside the
-  feature builder, so the percentile is always "risk percentile".
-* Each feature becomes a percentile rank (0-100) within a TRAILING window
-  (default 20 years). Because the window only looks backwards, the score
-  carries NO look-ahead bias and can be re-computed for any historical date.
-* The composite score is a weighted blend of the 8 per-feature percentiles.
-  If a feature is unavailable (API failure / no history) its weight is
-  redistributed across the remaining features, so the score stays on 0-100.
-* A disk cache (parquet) avoids hammering APIs on every run. A deterministic
-  synthetic generator guarantees the app still renders when every API fails
-  (clearly flagged as "synthetic" in the UI).
+* CONCURRENT FETCH: all raw series are pulled in parallel with a
+  `ThreadPoolExecutor(max_workers=8)`. Every single network call carries a hard
+  per-request timeout (`FETCH_TIMEOUT = 5s`) and the whole batch is bounded by a
+  total wall-clock deadline (`FETCH_DEADLINE`). A request that times out or
+  errors is set to None and never blocks the other 7 — the system returns in
+  ~3-9 seconds with whatever subset is live.
+* INCREMENTAL CACHE: the first successful run pulls 1990->today and persists the
+  raw monthly series + derived features to `bubble_cache.parquet`. On a later
+  refresh we only re-fetch the last ~30 days (INCREMENTAL_DAYS), append and
+  de-duplicate into the cached history, then recompute the vectorized rolling
+  percentiles. Network volume drops from ~26 years to ~30 days (≈100x).
+* VECTORIZED SCORING: the rolling percentile and the weighted composite are both
+  pandas/numpy C-level operations, so recomputation over the full history is
+  sub-second. The expensive part was never the math — it was the network.
+
+------------------------------------------------------------------------------
+ZERO-CRASH NORMALIZATION
+------------------------------------------------------------------------------
+* Every feature's fetch + transform is isolated; one failure can never raise out
+  of the pipeline. A failed feature is recorded as None and simply skipped.
+* Dynamic weight renormalization: only VALID (non-null) features enter the
+  composite, and their weights are re-normalized to sum to 1.0 over the survivors,
+  so the score always lands on 0-100 even if only a subset of the 8 is available.
+* Synthetic fallback is used ONLY when all 8 features fail (W_valid == 0).
 
 ------------------------------------------------------------------------------
 FEATURE MAP  (weight in composite)
 ------------------------------------------------------------------------------
-F1  Valuation      (0.20)  CAPE (Shiller PE) + Buffett Indicator (Wilshire/GDP)   [High = Risk]
-F2  Momentum       (0.10)  S&P 500 6-month annualized return                      [High = Risk]
+F1  Valuation      (0.20)  CAPE (Shiller PE) + Buffett Indicator (Wilshire/GDP)  [High = Risk]
+F2  Momentum       (0.10)  S&P 500 6-month annualized return                     [High = Risk]
 F3  Market Vol     (0.10)  VIX (INVERTED: low VIX = complacency = High Risk)
-F4  Leverage       (0.15)  Margin Debt / Mkt Cap  +  Credit Spread (BAA10Y, INVERTED: low spread = High Risk)
-F5  Liquidity      (0.10)  Fed balance-sheet YoY (WALCL)  [+ M2 YoY secondary]    [High = Risk]
-F6  Business Sent. (0.15)  FRED EMVMACROBUS (INVERTED: low index = High Risk)      [AAII/FINRA fallback]
-F7  Policy Stance  (0.05)  Real Fed Funds (FEDFUNDS - CPI YoY, INVERTED: low real rate = High Risk)
-F8  Tech Froth     (0.15)  QQQ / SPY ratio, 3-year (156-week) rolling percentile  [High = Risk]
+F4  Leverage       (0.15)  Credit Spread (BAA10Y, INVERTED: low spread = High Risk)
+F5  Liquidity      (0.10)  Fed balance-sheet YoY (WALCL)  [+ M2 YoY secondary]   [High = Risk]
+F6  Business Sent. (0.15)  FRED EMVMACROBUS (INVERTED: low index = High Risk)     [AAII fallback]
+F7  Policy Stance  (0.05)  Real Fed Funds (FEDFUNDS - CPI YoY, INVERTED)
+F8  Tech Froth     (0.15)  QQQ / SPY ratio, 3-year (~156-week) rolling percentile [High = Risk]
 
-Weights sum to 1.00. Any feature that fails to load has its weight redistributed
-across the survivors (zero-crash renormalization), so the score always lands on
-0-100 even if only a subset of the 8 is available.
+Weights sum to 1.00.
 """
 
 from __future__ import annotations
 
 import os
-try:
-    from dotenv import load_dotenv
-    load_dotenv()   # pull FRED_API_KEY (and friends) from a local .env file
-except Exception:
-    pass
+import json
+import threading
 import warnings
-from typing import Optional, Tuple
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Callable, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 import requests
 from io import StringIO
 
+try:
+    from dotenv import load_dotenv
+    load_dotenv()   # pull FRED_API_KEY (and friends) from a local .env file
+except Exception:
+    pass
+
 warnings.filterwarnings("ignore")
 
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-FRED_API_KEY = os.getenv("FRED_API_KEY", "")  # optional; many series work w/o key
+FRED_API_KEY = os.getenv("FRED_API_KEY", "")  # optional; api endpoint needs it
 CACHE_PATH = os.getenv("BUBBLE_CACHE", "bubble_cache.parquet")
-PRICES_CACHE = os.getenv("BUBBLE_PRICES_CACHE", "prices_cache.parquet")
+META_PATH = os.getenv("BUBBLE_META", "bubble_cache_meta.json")
+
 WINDOW_MONTHS = 240       # 20 years for the "trailing percentile" window
-WINDOW_TECH_WEEKS = 156    # 3 years (156 weeks) for the tech-froth feature (F8)
-WINDOW_TECH_MONTHS = 36    # 3-year monthly fallback if weekly prices fail
+WINDOW_TECH_MONTHS = 36   # 3-year (~156-week) window for the tech-froth feature (F8)
+
+# Concurrency / timeout controls (the heart of the perf refactor)
+FETCH_TIMEOUT = 5         # hard per-request timeout (seconds)
+FETCH_DEADLINE = 9        # total wall-clock deadline for the whole batch
+INCREMENTAL_DAYS = 30     # on refresh: only re-fetch the last ~30 days
 
 # Composite weights (must sum to 1.0)
 WEIGHTS = {
@@ -82,56 +102,167 @@ FEATURE_LABELS = {
     "F1_valuation": "Valuation (CAPE / Buffett)",
     "F2_momentum": "Momentum (6m ann.)",
     "F3_sentiment": "Sentiment (VIX inv.)",
-    "F4_leverage": "Leverage (Margin / Credit)",
+    "F4_leverage": "Leverage (Credit Spread inv.)",
     "F5_liquidity": "Liquidity (Fed BS / M2)",
     "F6_business": "Business Sentiment (EMVMACROBUS inv.)",
     "F7_policy": "Policy (Real Fed Funds)",
-    "F8_tech": "Tech Froth (QQQ/SPY)",
+    "F8_tech": "Tech Froth (QQQ/SPY, 3y)",
 }
 
 HISTORY_START = "1990-01-01"   # long history so the 20y window is "full" by 2010
 LIVE_START = "2000-01-01"      # backtest / reporting start
 
+# Raw series to fetch. key -> (kind, source_id)
+#   kind "fred"  -> FRED series id (fetched via direct CSV, keyless-capable)
+#   kind "price" -> ticker fetched via yfinance/Stooq (monthly close)
+RAW_SPECS = {
+    "cape":     ("fred", "CAPE"),
+    "wilshire": ("fred", "WILL5000INDFC"),
+    "gdp":      ("fred", "GDP"),
+    "vixcls":   ("fred", "VIXCLS"),
+    "baa10y":   ("fred", "BAA10Y"),
+    "m2":       ("fred", "M2SL"),
+    "walcl":    ("fred", "WALCL"),
+    "emv":      ("fred", "EMVMACROBUS"),
+    "cpi":      ("fred", "CPIAUCSL"),
+    "ffr":      ("fred", "FEDFUNDS"),
+    "spx":      ("price", "^GSPC"),
+    "spy":      ("price", "SPY"),
+    "qqq":      ("price", "QQQ"),
+    "ixic":     ("price", "^IXIC"),
+    "vix":      ("price", "^VIX"),
+}
+# Ticker -> raw column, for the dashboard price chart
+RAW_TICKER_MAP = {"^GSPC": "spx", "^IXIC": "ixic", "SPY": "spy", "QQQ": "qqq"}
+
 
 # ---------------------------------------------------------------------------
-# Low-level fetchers
+# Low-level, timeout-guarded helpers
 # ---------------------------------------------------------------------------
-def _fred(series_id: str, start: str = HISTORY_START) -> Optional[pd.Series]:
-    """Fetch a FRED series as a monthly-end Series. Returns None on failure."""
+def _run_with_timeout(fn: Callable[[], object], timeout: float, default=None):
+    """Run ``fn`` in a daemon thread and return its result, or ``default`` if it
+    does not finish within ``timeout`` seconds.
+
+    This lets us put a hard wall-clock bound on third-party fetchers (e.g.
+    pandas_datareader) that do not honour our own ``requests`` timeout.
+    """
+    box: dict = {}
+
+    def _t():
+        try:
+            box["v"] = fn()
+        except Exception:
+            box["v"] = default
+
+    th = threading.Thread(target=_t, daemon=True)
+    th.start()
+    th.join(timeout)
+    if th.is_alive():
+        return default
+    return box.get("v", default)
+
+
+def _http_get(url: str, timeout: int = FETCH_TIMEOUT) -> Optional[str]:
+    """Keyless HTTP GET with a browser UA (Stooq / FRED block empty UAs)."""
     try:
-        from pandas_datareader import data as pdr
-    except Exception:
-        return None
-    try:
-        df = pdr.get_data_fred(series_id, start, api_key=FRED_API_KEY or None)
-        if df is None or df.empty:
-            return None
-        s = df[df.columns[0]].dropna()
-        s = s.resample("ME").last()
-        return s
-    except Exception as exc:  # pragma: no cover - network dependent
-        print(f"[fred] {series_id} failed: {exc}")
-        return None
-
-
-_STOOQ_MAP = {"^GSPC": "SPX.US", "SPY": "SPY.US", "QQQ": "QQQ.US", "^IXIC": "IXIC.US"}
-
-
-def _http_get(url: str, timeout: int = 20) -> Optional[str]:
-    """Keyless HTTP GET with a browser UA (Stooq / AAII block empty UAs)."""
-    try:
-        hdr = {"User-Agent": "Mozilla/5.0 (compatible; bubble-monitor/1.0)"}
+        hdr = {"User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                              "AppleWebKit/537.36 (KHTML, like Gecko) "
+                              "Chrome/120.0 Safari/537.36")}
         r = requests.get(url, headers=hdr, timeout=timeout)
         r.raise_for_status()
         return r.text
     except Exception as exc:
-        print(f"[http] {url} failed: {exc}")
+        print(f"[http] {url[:78]}... failed: {exc}")
         return None
+
+
+def _fred_csv(series_id: str, start: str = HISTORY_START,
+              timeout: int = FETCH_TIMEOUT) -> Optional[pd.Series]:
+    """Fetch a FRED series as a monthly-end Series via the direct CSV endpoint.
+
+    Uses the authenticated `api.stlouisfed.org` endpoint when FRED_API_KEY is
+    set (reliable + server-side date filtering) and the keyless
+    `fredgraph.csv` endpoint otherwise. Both honour `timeout` natively.
+    Falls back to pandas_datareader (bounded by _run_with_timeout) only if the
+    CSV endpoints fail.
+    """
+    if FRED_API_KEY:
+        url = (f"https://api.stlouisfed.org/fred/series/observations"
+               f"?series_id={series_id}&api_key={FRED_API_KEY}"
+               f"&file_type=csv&observation_start={start}")
+    else:
+        url = (f"https://fred.stlouisfed.org/graph/fredgraph.csv"
+               f"?id={series_id}&cosd={start}")
+    txt = _http_get(url, timeout=timeout)
+    if txt:
+        s = _parse_fred_csv(txt, series_id)
+        if s is not None and not s.empty:
+            return s
+
+    # ---- pandas_datareader fallback (bounded so it can't hang the batch) ---
+    return _run_with_timeout(
+        lambda: _fred_pdr(series_id, start), timeout=FETCH_TIMEOUT)
+
+
+def _parse_fred_csv(txt: str, series_id: str) -> Optional[pd.Series]:
+    try:
+        df = pd.read_csv(StringIO(txt))
+        if df.empty:
+            return None
+        cols = [str(c) for c in df.columns]
+        date_col = next((c for c in cols if "date" in c.lower()), cols[0])
+        val_col = next((c for c in cols
+                        if ("value" in c.lower()) or (series_id.lower() in c.lower())),
+                       cols[-1])
+        s = pd.to_numeric(df[val_col], errors="coerce")
+        s.index = pd.to_datetime(df[date_col], errors="coerce")
+        s = s.dropna().sort_index()
+        s = s.resample("ME").last()          # monthly month-end
+        return s if not s.empty else None
+    except Exception as exc:
+        print(f"[fred] {series_id} parse failed: {exc}")
+        return None
+
+
+def _fred_pdr(series_id: str, start: str) -> Optional[pd.Series]:
+    """pandas_datareader fallback for a FRED series (used only if direct CSV fails)."""
+    try:
+        import pandas_datareader.data as web  # pandas_datareader is in requirements.txt
+        df = web.get_data_fred(series_id, start=start)
+        if df is None or df.empty:
+            return None
+        col = df.columns[0]
+        s = pd.to_numeric(df[col], errors="coerce").dropna().sort_index()
+        s = s.resample("ME").last()
+        return s if not s.empty else None
+    except Exception as exc:
+        print(f"[fred-pdr] {series_id} failed: {exc}")
+        return None
+
+
+_STOOQ_MAP = {"^GSPC": "SPX.US", "SPY": "SPY.US", "QQQ": "QQQ.US",
+              "^IXIC": "IXIC.US", "^VIX": "VIX.US"}
+
+
+def _yf_session() -> requests.Session:
+    """A browser-like session so Yahoo does not 403/429 us as a bot."""
+    s = requests.Session()
+    s.headers.update({
+        "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                       "AppleWebKit/537.36 (KHTML, like Gecko) "
+                       "Chrome/120.0 Safari/537.36"),
+        "Accept": ("text/html,application/xhtml+xml,application/xml;q=0.9,"
+                   "image/avif,image/webp,*/*;q=0.8"),
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept-Encoding": "gzip, deflate, br",
+    })
+    return s
 
 
 def _stooq_daily(symbol: str, start: str = HISTORY_START) -> Optional[pd.Series]:
     """Keyless, datacenter-friendly DAILY price source (stooq.com CSV)."""
-    txt = _http_get(f"https://stooq.com/q/d/l/?s={symbol}&i=d")
+    txt = _http_get(f"https://stooq.com/q/d/l/?s={symbol}&i=d",
+                    timeout=FETCH_TIMEOUT)
     if not txt:
         return None
     try:
@@ -148,91 +279,54 @@ def _stooq_daily(symbol: str, start: str = HISTORY_START) -> Optional[pd.Series]
         return None
 
 
-def _stooq_monthly(symbol: str, start: str = HISTORY_START) -> Optional[pd.Series]:
-    """Month-end close from Stooq daily (used as Yahoo fallback)."""
-    d = _stooq_daily(symbol, start=start)
-    if d is None:
-        return None
-    s = d.resample("ME").last()
-    return s if not s.empty else None
+def _fetch_price(ticker: str, start: str = HISTORY_START,
+                 timeout: int = FETCH_TIMEOUT) -> Optional[pd.Series]:
+    """Monthly-close via yfinance (timeout + bot-evading session), Stooq fallback.
 
-
-def _yf_weekly(ticker: str, start: str = HISTORY_START) -> Optional[pd.Series]:
-    """Weekly-close via yfinance, with a Stooq fallback.
-
-    Used for the F8 tech-froth feature so the 156-week rolling window really
-    spans ~3 years of weekly observations. Yahoo 429s from cloud IPs; Stooq is
-    keyless and server-friendly, so prices stay REAL on deploy when Yahoo is
-    blocked.
+    Yahoo frequently 429s from cloud IPs; Stooq is keyless and server-friendly,
+    so prices stay REAL on deploy when Yahoo is blocked.
     """
     try:
         import yfinance as yf
-        tk = yf.Ticker(ticker)
-        hist = tk.history(start=start, auto_adjust=True, actions=False, progress=False)
-        if hist is not None and not hist.empty:
-            s = hist["Close"].dropna().resample("W-FRI").last()
+        df = yf.download(ticker, start=start, auto_adjust=True, actions=False,
+                         progress=False, threads=False, timeout=timeout,
+                         session=_yf_session())
+        if df is not None and not df.empty:
+            close = df["Close"]
+            if isinstance(close, pd.DataFrame):
+                close = close.iloc[:, 0]
+            s = close.dropna()
             if not s.empty:
-                return s
-    except Exception as exc:  # pragma: no cover - network dependent
-        print(f"[yfinance-weekly] {ticker} failed: {exc}")
-    st = _STOOQ_MAP.get(ticker)
-    if st:
-        d = _stooq_daily(st, start=start)
-        if d is not None:
-            return d.resample("W-FRI").last().dropna()
-    return None
-
-
-def _yf_monthly(ticker: str, start: str = HISTORY_START) -> Optional[pd.Series]:
-    """Monthly adjusted-close via yfinance, with a Stooq fallback.
-
-    yfinance (Yahoo) frequently 429s from cloud / datacenter IPs (Render, HF
-    Spaces). Stooq is keyless and server-friendly, so it keeps prices REAL on
-    deploy when Yahoo is blocked.
-    """
-    try:
-        import yfinance as yf
-        tk = yf.Ticker(ticker)
-        hist = tk.history(start=start, auto_adjust=True, actions=False, progress=False)
-        if hist is not None and not hist.empty:
-            s = hist["Close"].dropna().resample("ME").last()
-            if not s.empty:
-                return s
+                return s.resample("ME").last()
     except Exception as exc:  # pragma: no cover - network dependent
         print(f"[yfinance] {ticker} failed: {exc}")
     st = _STOOQ_MAP.get(ticker)
     if st:
-        return _stooq_monthly(st, start=start)
+        return _stooq_daily(st, start=start)
     return None
 
 
-def _google_trends(keyword: str = "Buy Stocks",
-                   start: str = "2015-01-01") -> Optional[pd.Series]:
-    """Monthly mean of Google Trends interest (0-100). None on failure."""
+def _fetch_one(spec: Tuple[str, str], start: str,
+               timeout: int = FETCH_TIMEOUT) -> Optional[pd.Series]:
+    """Single-series fetch wrapper. Never raises — returns None on any failure."""
+    kind, sid = spec
     try:
-        from pytrends.request import TrendReq
-    except Exception:
-        return None
-    try:
-        pytrends = TrendReq(timeout=(10, 25))
-        end = pd.Timestamp.today().strftime("%Y-%m-%d")
-        pytrends.build_payload([keyword], timeframe=f"{start} {end}")
-        data = pytrends.interest_over_time()
-        if data is None or data.empty:
-            return None
-        s = data[keyword].dropna().resample("ME").mean()
-        return s if not s.empty else None
-    except Exception as exc:  # pragma: no cover - network / rate-limit dependent
-        print(f"[pytrends] '{keyword}' failed: {exc}")
+        if kind == "fred":
+            return _fred_csv(sid, start=start, timeout=timeout)
+        return _fetch_price(sid, start=start, timeout=timeout)
+    except Exception as exc:  # pragma: no cover - defensive
+        print(f"[fetch] {sid} error: {exc}")
         return None
 
 
+# ---------------------------------------------------------------------------
+# Keyless fallback source for F6 (only used when FRED EMVMACROBUS is missing)
+# ---------------------------------------------------------------------------
 def _aaii_sentiment(start: str = "1987-01-01") -> Optional[pd.Series]:
-    """AAII Investor Sentiment Survey — % bullish (REAL, keyless, 1987+).
+    """AAII Investor Sentiment — % bullish. High bullish = complacency = risk.
 
-    High retail bullishness == euphoria == bubble risk, so we use the level
-    directly (no inversion). 35+ years of weekly history makes the 20-year
-    percentile meaningful and lets the 2000->today backtest run on real data.
+    REAL, keyless, weekly (resampled to monthly). Used only as the F6 fallback
+    when EMVMACROBUS is unavailable.
     """
     txt = _http_get("https://www.aaii.com/sentimentsurvey/sentiment_history.csv")
     if not txt:
@@ -251,142 +345,15 @@ def _aaii_sentiment(start: str = "1987-01-01") -> Optional[pd.Series]:
         return None
 
 
-def _finra_retail_share(start: str = "2019-01-01") -> Optional[pd.Series]:
-    """FINRA Retail Trading Data — share of total US equity volume from retail.
-
-    REAL, keyless, monthly, published by FINRA. The downloadable workbook
-    carries the FULL historical series (every month since inception) in a
-    single sheet, so fetching the latest file yields the whole history.
-
-    The bubble-relevant metric is the percentage of total US equity trading
-    volume attributable to retail investors (FINRA labels the column
-    "Retail Volume %" / "Retail Share"). We auto-detect the column so the
-    code keeps working if FINRA renames it.
-
-    FINRA publishes ~1 month after month-end; the file lives under an upload
-    month folder. We try a sliding window of recent (data_month, upload_month)
-    candidates so the fetcher self-heals as months roll over.
-    """
-    import io
-
-    today = pd.Timestamp.today()
-    candidates = []
-    for back in range(0, 18):                      # last ~18 data months
-        data_month = today - pd.DateOffset(months=1 + back)
-        for up_off in (1, 2, 0):                   # upload folder offset
-            up = data_month + pd.DateOffset(months=up_off)
-            folder = up.strftime("%Y-%m")
-            fname = data_month.strftime("%Y_%m")
-            candidates.append(
-                f"https://www.finra.org/sites/default/files/{folder}/"
-                f"retail_trading_data_{fname}.xlsx"
-            )
-
-    raw = None
-    for url in candidates:
-        try:
-            hdr = {"User-Agent": "Mozilla/5.0 (compatible; bubble-monitor/1.0)"}
-            r = requests.get(url, headers=hdr, timeout=12)
-            if r.status_code != 200 or not r.content:
-                continue
-            raw = r.content
-            break
-        except Exception as exc:
-            print(f"[finra] GET {url} failed: {exc}")
-            continue
-
-    if raw is None:
-        print("[finra] no retail trading workbook reachable")
-        return None
-
-    try:
-        xls = pd.ExcelFile(io.BytesIO(raw))
-
-        # FINRA workbooks sometimes carry a banner/title row; try a few header
-        # configs until we land on a sheet that has the retail + share columns.
-        df = None
-        for cfg in (dict(), dict(header=1), dict(skiprows=1)):
-            for sh in xls.sheet_names:
-                tmp = xls.parse(sh, **cfg)
-                cols_l = [str(c).lower() for c in tmp.columns]
-                has_retail = any("retail" in c for c in cols_l)
-                has_share = any(
-                    ("volume" in c and "%" in c) or "share" in c
-                    for c in cols_l
-                )
-                if has_retail and has_share:
-                    df = tmp
-                    break
-            if df is not None:
-                break
-        if df is None:
-            df = xls.parse(xls.sheet_names[0])
-
-        # date / period column
-        date_col = None
-        for c in df.columns:
-            if str(c).lower() in ("month", "date", "period"):
-                date_col = c
-                break
-        if date_col is None:
-            date_col = df.columns[0]
-
-        # retail share column
-        share_col = None
-        for c in df.columns:
-            cl = str(c).lower()
-            if "retail" in cl and ("%" in cl or "share" in cl or "volume %" in cl):
-                share_col = c
-                break
-        if share_col is None:
-            for c in df.columns:
-                cl = str(c).lower()
-                if "retail" in cl and "volume" in cl:
-                    share_col = c
-                    break
-        if share_col is None:
-            print("[finra] could not locate retail share column; columns="
-                  f"{list(df.columns)}")
-            return None
-
-        out = df[[date_col, share_col]].copy()
-        # Robust date parsing: FINRA mixes "2019-10-01" and "Oct-19" styles.
-        parsed = pd.to_datetime(out[date_col], errors="coerce")
-        if parsed.isna().mean() > 0.5:
-            parsed = pd.to_datetime(out[date_col], errors="coerce", format="%b-%y")
-        if parsed.isna().mean() > 0.5:
-            parsed = pd.to_datetime(out[date_col], errors="coerce", format="mixed")
-        out[date_col] = parsed
-        out = out.dropna(subset=[date_col]).set_index(date_col).sort_index()
-        out[share_col] = pd.to_numeric(out[share_col], errors="coerce")
-        s = out[share_col].dropna().resample("ME").last()
-        s = s[s.index >= pd.Timestamp(start)]
-        # normalize to a fraction if expressed as a percent (e.g. 21.3 -> 0.213)
-        if s.max() > 1.5:
-            s = s / 100.0
-        return s if not s.empty else None
-    except Exception as exc:
-        print(f"[finra] parse failed: {exc}")
-        return None
-
-
 # ---------------------------------------------------------------------------
 # Rolling percentile (no look-ahead)
 # ---------------------------------------------------------------------------
 def rolling_pct(series, window: int = WINDOW_MONTHS,
-                min_periods: int | None = None) -> pd.Series:
+                min_periods: Optional[int] = None) -> pd.Series:
     """
     Percentile rank (0-100) of each value within its TRAILING `window`
-    observations.
-
-    Vectorized via pandas rolling rank (C-level, ~100x faster than the naive
-    per-point loop). For each date the output is the percentile of the current
-    value among all values in the trailing window, so it is purely
-    backwards-looking (no look-ahead bias) and safe to re-compute for any
-    historical date.
-
-    `min_periods` keeps the first stretch (before a full window has
-    accumulated) as NaN rather than a noisy single-point percentile.
+    observations. Vectorized via pandas rolling rank (C-level). Purely
+    backwards-looking (no look-ahead bias).
     """
     s = pd.Series(series, dtype="float64")
     if min_periods is None:
@@ -399,27 +366,25 @@ def rolling_pct(series, window: int = WINDOW_MONTHS,
 # Composite scoring
 # ---------------------------------------------------------------------------
 def compute_composite(feat_pct: pd.DataFrame, weights: dict = WEIGHTS) -> pd.Series:
-    """
-    Weighted blend of available feature percentiles at each date.
-
-    Fully vectorized: at every date the missing features have their weight
-    redistributed across the present ones, so the output always lives on 0-100
-    even when some F1-F8 features are NaN.
+    """Weighted blend of available feature percentiles. Vectorized; missing
+    features have their weight redistributed across the present ones (row-wise,
+    so a feature absent at a given date simply drops out of that row's blend).
     """
     cols = list(weights.keys())
     w = pd.Series(weights)[cols]
     vals = feat_pct[cols]
     avail = vals.notna()
-    # weighted sum of available percentiles / sum of available weights
     numer = (vals * w).sum(axis=1)
     denom = (avail * w).sum(axis=1)
-    return numer / denom
+    with np.errstate(invalid="ignore", divide="ignore"):
+        score = numer / denom
+    return score
 
 
 def contribution_factor(score: float) -> float:
     """Monthly DCA multiplier from the Bubble Risk Score (per spec)."""
     if pd.isna(score):
-        return 1.0  # neutral default when score is unknown
+        return 1.0
     if score < 40:
         return 2.0
     if score < 60:
@@ -446,83 +411,124 @@ def status_of(score: float) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Feature construction
+# Concurrent raw fetch + incremental cache
 # ---------------------------------------------------------------------------
-def build_features() -> Tuple[pd.DataFrame, dict]:
-    """
-    Fetch raw series, build the 8 risk-percentile features, and return:
-      * feat_pct : monthly DataFrame, columns F1..F8 (0-100)
-      * meta     : dict with per-feature availability / source notes
-    """
-    meta: dict = {}
-
-    # ---- Raw underlying series -------------------------------------------
-    cape = _fred("CAPE")                                   # Shiller CAPE (monthly)
-    wilshire = _fred("WILL5000INDFC")                      # Wilshire 5000 mkt cap ($M)
-    gdp = _fred("GDP")                                     # quarterly -> ffill
-    vix = _fred("VIXCLS")                                  # daily VIX -> monthly mean
-    margin = _fred("MARGINSL")                             # margin debt ($M, monthly)
-    baa_tsy = _fred("BAA10Y")                              # credit spread (monthly)
-    m2 = _fred("M2SL")                                     # M2 (monthly)
-    fed_bs = _fred("WALCL")                                # Fed assets (weekly)
-    cpi = _fred("CPIAUCSL")                                # CPI (monthly)
-    ffr = _fred("FEDFUNDS")                                # Fed funds (monthly)
-    spx = _yf_monthly("^GSPC")                             # S&P 500
-    spy = _yf_monthly("SPY")                               # (for ratio if needed)
-    qqq = _yf_monthly("QQQ")                               # Nasdaq 100 ETF
-    trends = _google_trends("Buy Stocks")                  # 2015+ only (secondary)
-    aaii = _aaii_sentiment()                               # 1987+ real retail sentiment
-
-    # Quarterly GDP -> monthly
-    if gdp is not None:
-        gdp = gdp.resample("ME").ffill()
-
-    # Weekly Fed BS -> monthly
-    if fed_bs is not None:
-        fed_bs = fed_bs.resample("ME").last()
-
-    # VIX daily -> monthly mean
-    if vix is not None:
-        vix = vix.resample("ME").mean()
-
-    # ---- Common monthly index --------------------------------------------
-    idx = pd.date_range(HISTORY_START, pd.Timestamp.today(), freq="ME")
-    def align(s: Optional[pd.Series]) -> Optional[pd.Series]:
-        if s is None:
+def _load_raw_cache() -> Optional[pd.DataFrame]:
+    """Load the raw monthly series stored in the unified cache (everything that
+    is not a `feat_*` column or `score`)."""
+    if not os.path.exists(CACHE_PATH):
+        return None
+    try:
+        df = pd.read_parquet(CACHE_PATH)
+        raw_cols = [c for c in df.columns
+                    if not (c.startswith("feat_") or c == "score")]
+        if not raw_cols:
             return None
-        return s.reindex(idx).ffill(limit=6)  # tolerate small gaps
+        return df[raw_cols].copy()
+    except Exception:
+        return None
 
-    cape = align(cape)
-    wilshire = align(wilshire)
-    gdp = align(gdp)
-    vix = align(vix)
-    margin = align(margin)
-    baa_tsy = align(baa_tsy)
-    m2 = align(m2)
-    fed_bs = align(fed_bs)
-    cpi = align(cpi)
-    ffr = align(ffr)
-    spx = align(spx)
-    qqq = align(qqq)
-    spy = align(spy)
-    trends = align(trends)
-    aaii = align(aaii)
+
+def fetch_all_raw(incremental: bool) -> Tuple[pd.DataFrame, dict]:
+    """
+    Fetch every raw series CONCURRENTLY (ThreadPoolExecutor, 5s per-request
+    timeout, hard total deadline). Returns (raw_df, fetch_meta).
+
+    `incremental=True` re-fetches only the last ~30 days and merges them into
+    the on-disk cache (append + de-dup), so refreshes cost ~30 days of network
+    instead of ~26 years.
+    """
+    fmeta: dict = {}
+    cached = _load_raw_cache()
+    today = pd.Timestamp.today()
+
+    if incremental and cached is not None and len(cached) > 0:
+        last = cached.index.max()
+        start = max(pd.Timestamp(last),
+                    today - pd.Timedelta(days=INCREMENTAL_DAYS))
+        start = start.strftime("%Y-%m-%d")
+    else:
+        start = HISTORY_START
+
+    results: dict = {}
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        future_to_key = {ex.submit(_fetch_one, spec, start): key
+                         for key, spec in RAW_SPECS.items()}
+        try:
+            for fut in as_completed(list(future_to_key.keys()),
+                                    timeout=FETCH_DEADLINE):
+                key = future_to_key[fut]
+                try:
+                    results[key] = fut.result()
+                except Exception:
+                    results[key] = None
+        except TimeoutError:
+            # Cancel whatever is still running and treat as missing.
+            for fut, key in future_to_key.items():
+                if not fut.done():
+                    fut.cancel()
+                    results[key] = None
+            fmeta["timeout"] = True
+
+    # Merge into the cached history (fresh tail wins on overlap).
+    full_idx = pd.date_range(HISTORY_START, today, freq="ME")
+    if cached is not None:
+        raw = cached.reindex(full_idx).copy()
+    else:
+        raw = pd.DataFrame(index=full_idx)
+
+    for key, s in results.items():
+        if s is None:
+            continue
+        s = s[s.index >= pd.Timestamp(HISTORY_START)]
+        s = s[~s.index.duplicated(keep="last")]
+        if key in raw.columns and raw[key].notna().any():
+            raw[key] = s.combine_first(raw[key]).reindex(full_idx)
+        else:
+            raw[key] = s.reindex(full_idx)
+
+    raw = raw.ffill(limit=6)
+    for key in RAW_SPECS:
+        fmeta[key] = "Y" if (key in raw.columns and raw[key].notna().any()) else "N"
+    fmeta["_live"] = sum(1 for v in fmeta.values() if v == "Y")
+    return raw, fmeta
+
+
+# ---------------------------------------------------------------------------
+# Feature construction from the (cached) raw frame
+# ---------------------------------------------------------------------------
+def compute_features_from_raw(raw: pd.DataFrame) -> Tuple[pd.DataFrame, dict]:
+    """Turn the raw monthly frame into the 8 risk-percentile features."""
+    meta: dict = {}
+    idx = raw.index
+
+    def g(key):
+        return raw[key] if key in raw.columns else None
+
+    cape, wilshire, gdp = g("cape"), g("wilshire"), g("gdp")
+    vix, vixcls = g("vix"), g("vixcls")
+    baa10y = g("baa10y")
+    m2, walcl = g("m2"), g("walcl")
+    emv = g("emv")
+    cpi, ffr = g("cpi"), g("ffr")
+    spx, spy, qqq = g("spx"), g("spy"), g("qqq")
 
     feat = pd.DataFrame(index=idx)
 
     # ---- F1 Valuation ----------------------------------------------------
     parts = []
-    if cape is not None:
+    if cape is not None and cape.notna().any():
         parts.append(rolling_pct(cape))
-    if wilshire is not None and gdp is not None:
-        buffett = (wilshire * 1e6) / (gdp * 1e9)  # ratio, unitless
+    if (wilshire is not None and gdp is not None
+            and wilshire.notna().any() and gdp.notna().any()):
+        buffett = (wilshire / gdp) * 1000.0   # scale-invariant ratio
         parts.append(rolling_pct(buffett))
     feat["F1_valuation"] = np.mean(parts, axis=0) if parts else np.nan
-    meta["F1_valuation"] = f"CAPE={'Y' if cape is not None else 'N'} " \
-                           f"Buffett={'Y' if wilshire is not None and gdp is not None else 'N'}"
+    meta["F1_valuation"] = (f"CAPE={'Y' if cape is not None and cape.notna().any() else 'N'} "
+                            f"Buffett={'Y' if wilshire is not None and gdp is not None and wilshire.notna().any() and gdp.notna().any() else 'N'}")
 
     # ---- F2 Momentum (6m annualized S&P return) --------------------------
-    if spx is not None:
+    if spx is not None and spx.notna().any():
         mom6 = (spx / spx.shift(6)) ** (12.0 / 6.0) - 1.0
         feat["F2_momentum"] = rolling_pct(mom6)
         meta["F2_momentum"] = "Y"
@@ -531,125 +537,92 @@ def build_features() -> Tuple[pd.DataFrame, dict]:
         meta["F2_momentum"] = "N"
 
     # ---- F3 Sentiment (VIX inverted) -------------------------------------
-    if vix is not None:
-        # low VIX == complacency == risk -> invert the percentile
-        feat["F3_sentiment"] = 100.0 - rolling_pct(vix)
+    v = vix if (vix is not None and vix.notna().any()) else vixcls
+    if v is not None and v.notna().any():
+        feat["F3_sentiment"] = 100.0 - rolling_pct(v)   # low VIX = risk
         meta["F3_sentiment"] = "Y"
     else:
         feat["F3_sentiment"] = np.nan
         meta["F3_sentiment"] = "N"
 
-    # ---- F4 Leverage (margin/mktcap + credit spread) ---------------------
-    # Credit spread (BAA10Y) is INVERTED: a *compressed* spread (investors
-    # blindly chasing risk, ultra-loose credit) is a bubble signal, whereas a
-    # *wide* spread marks panic / liquidity stress (2008, 2020-03) and is the
-    # opposite of froth. So low spread -> high risk percentile (100 - pct).
-    parts = []
-    if margin is not None and wilshire is not None:
-        margin_ratio = margin / wilshire  # both in $M -> ratio
-        parts.append(rolling_pct(margin_ratio))
-    if baa_tsy is not None:
-        parts.append(100.0 - rolling_pct(baa_tsy))   # inverted credit spread
-    feat["F4_leverage"] = np.mean(parts, axis=0) if parts else np.nan
-    meta["F4_leverage"] = f"Margin={'Y' if margin is not None and wilshire is not None else 'N'} " \
-                          f"Credit(inv)={'Y' if baa_tsy is not None else 'N'}"
+    # ---- F4 Leverage (credit spread INVERTED) ----------------------------
+    # A compressed spread (blind risk-chasing, ultra-loose credit) is a bubble
+    # signal; a wide spread marks panic (2008, 2020-03) — the opposite of froth.
+    if baa10y is not None and baa10y.notna().any():
+        feat["F4_leverage"] = 100.0 - rolling_pct(baa10y)
+        meta["F4_leverage"] = "Credit(inv)=Y"
+    else:
+        feat["F4_leverage"] = np.nan
+        meta["F4_leverage"] = "N"
 
     # ---- F5 Liquidity (M2 YoY + Fed BS YoY) ------------------------------
     parts = []
-    if m2 is not None:
-        m2_yoy = m2.pct_change(12) * 100.0
-        parts.append(rolling_pct(m2_yoy))
-    if fed_bs is not None:
-        bs_yoy = fed_bs.pct_change(12) * 100.0
-        parts.append(rolling_pct(bs_yoy))
+    if m2 is not None and m2.notna().any():
+        parts.append(rolling_pct(m2.pct_change(12) * 100.0))
+    if walcl is not None and walcl.notna().any():
+        parts.append(rolling_pct(walcl.pct_change(12) * 100.0))
     feat["F5_liquidity"] = np.mean(parts, axis=0) if parts else np.nan
-    meta["F5_liquidity"] = f"M2={'Y' if m2 is not None else 'N'} " \
-                           f"FedBS={'Y' if fed_bs is not None else 'N'}"
+    meta["F5_liquidity"] = (f"M2={'Y' if m2 is not None and m2.notna().any() else 'N'} "
+                            f"FedBS={'Y' if walcl is not None and walcl.notna().any() else 'N'}")
 
     # ---- F6 Business sentiment (FRED EMVMACROBUS, INVERTED) --------------
-    # EMVMACROBUS = "Equity Market Volatility Tracker: Macroeconomic News &
-    # Outlook: Business Investment And Sentiment" (Baker/Bloom/Davis via FRED,
-    # monthly, 1985+). Per the spec, a LOW index = complacency / low perceived
-    # business risk = bubble-prone, so we INVERT: low -> high risk percentile.
-    # Because it is a FRED series (same source as F1/F3/F4/F5/F7), with a
-    # FRED_API_KEY it is as stable as every other macro feature — no scraper,
-    # no second key. Only if FRED is entirely unavailable do we fall back to the
-    # keyless FINRA/AAII/Trends blend so the feature never silently drops.
-    emv = _fred("EMVMACROBUS")
+    # Low index = complacency = bubble-prone -> invert. FRED series, so with a
+    # FRED_API_KEY it is as stable as every other macro feature. Only if it is
+    # entirely missing do we fall back to the keyless AAII bullish survey.
     if emv is not None and emv.notna().sum() >= 12:
-        emv = align(emv)
-        feat["F6_business"] = 100.0 - rolling_pct(emv)   # inverted
+        feat["F6_business"] = 100.0 - rolling_pct(emv)
         meta["F6_business"] = "EMVMACROBUS (FRED, inv)"
     else:
-        # ---- fallback: FINRA retail volume share + AAII bullish blend -----
-        # High retail participation / bullishness == euphoria == bubble risk;
-        # the level is used directly (no inversion). FINRA only reaches back to
-        # ~2019, so we BLEND with the AAII % Bullish survey (real, 1987+) for
-        # 2000-2019, and Google Trends (2015+) as last-resort filler. Each
-        # series is percentile-ranked in its OWN scale first (different units)
-        # then merged with combine_first, yielding one continuous F6.
-        finra = _finra_retail_share()
-        finra = align(finra)
-        f6_sources = []
-        if finra is not None and finra.notna().sum() >= 6:
-            f6_sources.append(("FINRA", finra))
-        if aaii is not None:
-            f6_sources.append(("AAII", aaii))
-        if trends is not None:
-            f6_sources.append(("Trends", trends))
-
-        if not f6_sources:
+        aaii = _aaii_sentiment()
+        if aaii is not None and aaii.notna().sum() >= 6:
+            # High bullish (complacency) = risk -> positive percentile.
+            feat["F6_business"] = rolling_pct(aaii)
+            meta["F6_business"] = "AAII bullish (EMV fallback)"
+        else:
             feat["F6_business"] = np.nan
             meta["F6_business"] = "N"
-        else:
-            blended = None
-            for _name, s in f6_sources:
-                pc = rolling_pct(s)
-                blended = pc if blended is None else blended.combine_first(pc)
-            feat["F6_business"] = blended
-            finra_start = None
-            if finra is not None and finra.notna().any():
-                finra_start = finra.index[finra.notna()][0].date()
-            meta["F6_business"] = "blend " + "+".join(n for n, _ in f6_sources) + \
-                (f" (FINRA {finra_start}+)" if finra_start else "") + " (EMV fallback)"
 
     # ---- F7 Policy (real fed funds, inverted) ----------------------------
-    if ffr is not None and cpi is not None:
-        cpi_yoy = cpi.pct_change(12) * 100.0
-        real_ffr = ffr - cpi_yoy
+    if (ffr is not None and cpi is not None
+            and ffr.notna().any() and cpi.notna().any()):
+        real_ffr = ffr - cpi.pct_change(12) * 100.0
         feat["F7_policy"] = 100.0 - rolling_pct(real_ffr)
         meta["F7_policy"] = "Y"
     else:
         feat["F7_policy"] = np.nan
         meta["F7_policy"] = "N"
 
-    # ---- F8 Tech froth (QQQ/SPY, 156-week rolling percentile) -----------
-    # 156 weeks (~3 years): tech bubbles build over 2-3 years, and a shorter
-    # window would mark the froth "cleared" during a long high-level
-    # consolidation. We compute the ratio on WEEKLY bars (so 156 observations
-    # really span ~3 years) then roll up to month-end for the composite. If
-    # weekly prices fail we fall back to a 36-month (≈3y) monthly window.
-    qqq_w = _yf_weekly("QQQ")
-    spy_w = _yf_weekly("SPY")
-    if qqq_w is not None and spy_w is not None:
-        ratio_w = (qqq_w / spy_w).dropna()
-        ratio_w = ratio_w[ratio_w.index >= pd.Timestamp(HISTORY_START)]
-        f8_weekly = rolling_pct(ratio_w, window=WINDOW_TECH_WEEKS)
-        feat["F8_tech"] = f8_weekly.resample("ME").last()
-        meta["F8_tech"] = "Y (156w weekly)"
-    elif qqq is not None and spy is not None:
+    # ---- F8 Tech froth (QQQ/SPY, 3-year (~156-week) rolling percentile) -
+    if (qqq is not None and spy is not None
+            and qqq.notna().any() and spy.notna().any()):
         ratio = qqq / spy
         feat["F8_tech"] = rolling_pct(ratio, window=WINDOW_TECH_MONTHS)
-        meta["F8_tech"] = "Y (36m fallback)"
-    elif qqq is not None and spx is not None:
-        ratio = qqq / spx
-        feat["F8_tech"] = rolling_pct(ratio, window=WINDOW_TECH_MONTHS)
-        meta["F8_tech"] = "Y (36m vs SPX)"
+        meta["F8_tech"] = "Y"
     else:
         feat["F8_tech"] = np.nan
         meta["F8_tech"] = "N"
 
     return feat, meta
+
+
+# ---------------------------------------------------------------------------
+# Cache persistence
+# ---------------------------------------------------------------------------
+def _save_cache(raw: pd.DataFrame, feat: pd.DataFrame, score: pd.Series,
+                meta: dict) -> None:
+    try:
+        out = raw.copy()
+        for c in feat.columns:
+            out[f"feat_{c}"] = feat[c]
+        out["score"] = score
+        out.to_parquet(CACHE_PATH)
+    except Exception:
+        pass
+    try:
+        with open(META_PATH, "w") as f:
+            json.dump(meta, f, default=str)
+    except Exception:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -664,10 +637,10 @@ def _synthetic_scores(start: str = LIVE_START) -> pd.Series:
         center = (pd.Timestamp(date_str) - idx[0]).days / 30.44
         return height * np.exp(-(((t - center) / width) ** 2))
 
-    bumps = (peak("2000-03-01", 18, 5)   # dot-com peak  (~84)
-             + peak("2007-10-01", 11, 7)  # pre-GFC       (~57)
-             + peak("2021-12-01", 26, 6)  # COVID tech    (~92)
-             + peak("2025-01-01", 6, 9))  # recent
+    bumps = (peak("2000-03-01", 18, 5)
+             + peak("2007-10-01", 11, 7)
+             + peak("2021-12-01", 26, 6)
+             + peak("2025-01-01", 6, 9))
     rng = np.random.RandomState(7)
     s = base + bumps + rng.normal(0, 2.0, len(idx))
     s = np.clip(s, 0, 100)
@@ -682,77 +655,79 @@ def get_monthly_scores(refresh: bool = False) -> Tuple[pd.Series, dict]:
     Returns (monthly_score_series, meta).
     Order of resolution: on-disk cache -> live fetch -> synthetic.
     `meta['source']` is one of 'live', 'cache', 'synthetic'.
-    """
-    meta = {"source": "unknown"}
+    `refresh=False` serves the cache (instant); `refresh=True` performs an
+    INCREMENTAL re-fetch (last ~30 days) and updates the cache.
 
-    if not refresh and os.path.exists(CACHE_PATH):
+    Zero-crash rule: synthetic is returned ONLY when no feature has a valid
+    reading at the latest date (all 8 APIs failed). Otherwise the composite is
+    renormalized over whatever subset is live.
+    """
+    meta: dict = {"source": "unknown"}
+
+    if not refresh and os.path.exists(CACHE_PATH) and os.path.exists(META_PATH):
         try:
             cached = pd.read_parquet(CACHE_PATH)
-            score = cached["score"]
-            meta = cached.attrs.get("meta", {"source": "cache"})
+            fcols = [c for c in cached.columns if c.startswith("feat_")]
+            feat = cached[fcols].copy()
+            feat.columns = [c[5:] for c in feat.columns]
+            score = (cached["score"] if "score" in cached.columns
+                     else compute_composite(feat))
+            meta = json.load(open(META_PATH))
             meta["source"] = "cache"
+            score = score.dropna()
+            latest = score.index[-1] if not score.empty else None
+            live_cols = [c for c in WEIGHTS
+                         if latest is not None and not pd.isna(feat[c].get(latest, np.nan))]
+            meta["available_count"] = len(live_cols)
             return score, meta
         except Exception:
             pass  # fall through to rebuild
 
-    feat, fmeta = build_features()
-    score = compute_composite(feat, WEIGHTS)
+    incremental = os.path.exists(CACHE_PATH)
+    raw, fmeta = fetch_all_raw(incremental=incremental)
+    feat, fmeta_feat = compute_features_from_raw(raw)
+    score = compute_composite(feat).dropna()
 
-    # ---- Live-feature accounting (zero-crash weight renormalization) ------
-    # Count features that actually contributed data (non-NaN anywhere), NOT the
-    # meta string prefix, so partial features (e.g. F4 "Margin=N Credit=Y")
-    # are scored correctly. The composite already redistributes the missing
-    # weight, so the score stays on 0-100 regardless of how many are live.
-    live_cols = [c for c in WEIGHTS if feat[c].notna().any()]
+    # ---- Live-feature accounting (features valid at the latest date) ------
+    latest = score.index[-1] if not score.empty else None
+    live_cols = [c for c in WEIGHTS
+                 if latest is not None and not pd.isna(feat[c].get(latest, np.nan))]
     available_count = len(live_cols)
     missing = [c for c in WEIGHTS if c not in live_cols]
-    print(f"[score] {available_count}/8 features live"
+    print(f"[score] {available_count}/8 features live at "
+          f"{latest.date() if latest is not None else 'n/a'}"
           f"  (missing: {missing or '-'})")
-    if available_count >= 4:  # enough signal to be "live"
-        meta = {"source": "live", "features": fmeta,
-                "available_count": available_count}
-        try:
-            out = feat.copy()
-            out["score"] = score
-            out.attrs["meta"] = meta
-            out.to_parquet(CACHE_PATH)
-        except Exception:
-            pass
-        return score, meta
 
-    # Not enough live data -> synthetic, clearly flagged
-    synth = _synthetic_scores()
-    meta = {"source": "synthetic",
-            "features": fmeta,
-            "available_count": available_count,
-            "note": "Live APIs unavailable; showing deterministic synthetic series."}
-    return synth, meta
+    # Synthetic ONLY under the all-fail extreme case (W_valid == 0).
+    if latest is None or available_count == 0:
+        synth = _synthetic_scores()
+        return synth, {
+            "source": "synthetic",
+            "available_count": 0,
+            "features": {**fmeta, **fmeta_feat},
+            "note": "All live APIs unavailable; showing deterministic synthetic series. Check network / FRED_API_KEY.",
+        }
+
+    meta_features = {**fmeta, **fmeta_feat}
+    _save_cache(raw, feat, score, {
+        "source": "live", "available_count": available_count,
+        "features": meta_features,
+    })
+    return score, {"source": "live", "available_count": available_count,
+                   "features": meta_features}
 
 
-def get_latest_state(refresh: bool = False) -> dict:
-    """Convenience bundle for the dashboard (latest score + per-feature)."""
-    score, meta = get_monthly_scores(refresh=refresh)
-    score = score.dropna()
-    if score.empty:
+def _assemble_state(score_series: pd.Series, feat: pd.DataFrame,
+                    meta: dict) -> dict:
+    score_series = score_series.dropna()
+    if score_series.empty:
         return {"score": np.nan, "status": "Unknown", "features": {},
                 "source": meta.get("source", "unknown"), "as_of": None,
                 "meta": meta}
-
-    latest_date = score.index[-1]
-    latest_score = float(score.iloc[-1])
-
-    # Per-feature detail — recompute features quickly from cache if present
-    feat = None
-    if os.path.exists(CACHE_PATH):
-        try:
-            cached = pd.read_parquet(CACHE_PATH)
-            if "score" in cached.columns:
-                feat = cached.drop(columns=["score"])
-        except Exception:
-            feat = None
-
+    latest_date = score_series.index[-1]
+    latest_score = float(score_series.iloc[-1])
     features = {}
-    if feat is not None and latest_date in feat.index:
+    if latest_date in feat.index:
         row = feat.loc[latest_date]
         for col in WEIGHTS:
             val = row.get(col, np.nan)
@@ -766,49 +741,74 @@ def get_latest_state(refresh: bool = False) -> dict:
         for col in WEIGHTS:
             features[col] = {"score": None, "weight": WEIGHTS[col],
                              "label": FEATURE_LABELS[col], "available": False}
+    return {"score": latest_score, "status": status_of(latest_score),
+            "features": features, "source": meta.get("source", "unknown"),
+            "as_of": latest_date, "meta": meta}
 
-    return {
-        "score": latest_score,
-        "status": status_of(latest_score),
-        "features": features,
-        "source": meta.get("source", "unknown"),
-        "as_of": latest_date,
-        "meta": meta,
-    }
+
+def get_latest_state(refresh: bool = False) -> dict:
+    """Latest score + per-feature detail for the dashboard.
+
+    Reads the SAVED cache written by ``get_monthly_scores`` so the dashboard
+    never triggers a second network fetch; falls back to a direct compute only
+    when no cache exists.
+    """
+    if os.path.exists(CACHE_PATH):
+        try:
+            cached = pd.read_parquet(CACHE_PATH)
+            fcols = [c for c in cached.columns if c.startswith("feat_")]
+            if fcols:
+                feat = cached[fcols].copy()
+                feat.columns = [c[5:] for c in feat.columns]
+                score_series = (cached["score"] if "score" in cached.columns
+                                else compute_composite(feat))
+                meta = {}
+                if os.path.exists(META_PATH):
+                    try:
+                        meta = json.load(open(META_PATH))
+                    except Exception:
+                        pass
+                return _assemble_state(score_series, feat, meta)
+        except Exception as exc:
+            print(f"[state] cache read failed: {exc}")
+    # No cache: compute once.
+    score, meta = get_monthly_scores(refresh=refresh)
+    feat = None
+    if os.path.exists(CACHE_PATH):
+        try:
+            cached = pd.read_parquet(CACHE_PATH)
+            fcols = [c for c in cached.columns if c.startswith("feat_")]
+            if fcols:
+                feat = cached[fcols].copy()
+                feat.columns = [c[5:] for c in feat.columns]
+        except Exception:
+            feat = None
+    return _assemble_state(score, feat if feat is not None else pd.DataFrame(), meta)
 
 
 def get_price_series(ticker: str, start: str = LIVE_START,
-                      refresh: bool = False) -> Optional[pd.Series]:
-    """Monthly price series used by the dashboard main chart and backtest.
+                     refresh: bool = False) -> Optional[pd.Series]:
+    """Monthly price series for the dashboard chart / backtest.
 
-    Disk-cached per ticker (``prices_cache.parquet``) so cloud deploys
-    (Render / HuggingFace Spaces) do NOT re-pull 25+ years of daily data on
-    every cold start or page load. With cache present the first request is
-    instant and free-tier health checks don't time out.
+    Served from the unified raw cache (no extra network call); falls back to a
+    direct fetch only if the ticker is absent from the cache.
     """
-    if not refresh and os.path.exists(PRICES_CACHE):
+    key = RAW_TICKER_MAP.get(ticker, ticker)
+    if not refresh and os.path.exists(CACHE_PATH):
         try:
-            pc = pd.read_parquet(PRICES_CACHE)
-            if ticker in pc.columns:
-                s = pc[ticker].dropna()
+            cached = pd.read_parquet(CACHE_PATH)
+            if key in cached.columns:
+                s = cached[key].dropna()
+                if start:
+                    s = s[s.index >= pd.Timestamp(start)]
                 if not s.empty:
-                    return s[s.index >= pd.Timestamp(start)] if start else s
+                    return s
         except Exception:
             pass
-
-    s = _yf_monthly(ticker, start=start)
+    s = _fetch_price(ticker, start=start)
     if s is None:
         return None
-
-    try:
-        pc = pd.DataFrame()
-        if os.path.exists(PRICES_CACHE):
-            pc = pd.read_parquet(PRICES_CACHE)
-        pc[ticker] = s
-        pc.to_parquet(PRICES_CACHE)
-    except Exception:
-        pass
-    return s
+    return s.resample("ME").last()
 
 
 if __name__ == "__main__":

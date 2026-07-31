@@ -1,5 +1,6 @@
 # caches / artifacts
 bubble_cache.parquet
+bubble_cache_meta.json
 prices_cache.parquet
 report.html
 __pycache__/
