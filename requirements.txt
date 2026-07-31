@@ -18,3 +18,8 @@ pyarrow>=14.0
 
 # Viz
 plotly>=5.18
+
+# Statistics — exact standard-normal CDF for the Z-score -> 0-100 mapping
+# (pipeline.py imports this as scipy.stats.norm.cdf; a no-scipy erf fallback
+# keeps the app running even if the install is skipped).
+scipy>=1.10

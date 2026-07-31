@@ -153,13 +153,28 @@ def feature_cards_html(state: dict) -> str:
 def backtest_html(res: dict) -> str:
     mb = res["benchmark"]
     ms = res["strategy"]
+
+    def _money(x):
+        return "—" if x is None else f"${x:,.0f}"
+    def _pct(x):
+        return "—" if x is None else f"{x*100:.1f}%"
+
+    # HONEST framing replaces the old naive "Cumulative"/"CAGR" (end/start
+    # equity ratio), which conflated DCA contributions with investment growth.
     rows = [
-        ("Cumulative", f"{mb['cum_return']*100:.1f}%", f"{ms['cum_return']*100:.1f}%"),
-        ("CAGR", f"{mb['cagr']*100:.1f}%", f"{ms['cagr']*100:.1f}%"),
-        ("Max Drawdown", f"{mb['max_drawdown']*100:.1f}%", f"{ms['max_drawdown']*100:.1f}%"),
-        ("Sharpe", f"{mb['sharpe']:.2f}", f"{ms['sharpe']:.2f}"),
-        ("Calmar", f"{mb['calmar']:.2f}", f"{ms['calmar']:.2f}"),
-        ("Ending Value", f"${mb['end_value']:,.0f}", f"${ms['end_value']:,.0f}"),
+        ("Total Invested", _money(mb.get("total_invested")),
+         _money(ms.get("total_invested"))),
+        ("Final Value", _money(mb.get("final_value")),
+         _money(ms.get("final_value"))),
+        ("Total Gain ($)",
+         _money((mb.get("final_value") or 0) - (mb.get("total_invested") or 0)),
+         _money((ms.get("final_value") or 0) - (ms.get("total_invested") or 0))),
+        ("Money-Weighted Return (IRR)", _pct(mb.get("mwr")),
+         _pct(ms.get("mwr"))),
+        ("Max Drawdown", _pct(mb.get("max_drawdown")),
+         _pct(ms.get("max_drawdown"))),
+        ("Sharpe Ratio", f"{mb.get('sharpe', 0):.2f}",
+         f"{ms.get('sharpe', 0):.2f}"),
     ]
     body = "".join(
         f"<tr><td>{n}</td><td>{b}</td><td>{s}</td></tr>" for n, b, s in rows

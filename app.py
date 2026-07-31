@@ -86,13 +86,32 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-BANDS = [  # (lo, hi, color, label) — clean, strictly non-overlapping palette
-    (0, 40, "#10b981", "Low / Cooling"),
-    (40, 60, "#3b82f6", "Normal"),
-    (60, 80, "#f59e0b", "Watch"),
-    (80, 90, "#ef4444", "Elevated"),
-    (90, 100, "#991b1b", "Bubble Warning"),
-]
+from pipeline import RISK_BANDS as BANDS  # V2 risk-level bands (0-40 .. 90-100)
+from pipeline import MODULE_WEIGHTS       # 5-module weights for the radar/labels
+
+
+def band_color(score: float) -> str:
+    if pd.isna(score):
+        return "gray"
+    for lo, hi, c, _ in BANDS:
+        if lo <= score < hi:
+            return c
+    return "#991b1b"
+
+
+def status_action(score: float):
+    """Return (badge_text, badge_color, note) for the Status Card (V2 bands)."""
+    if pd.isna(score):
+        return ("UNKNOWN", "#64748b", "No data")
+    if score < 40:
+        return ("CHEAP / FEAR", "#1a9850", "Below-median risk — market fear")
+    if score < 60:
+        return ("NORMAL", "#2166ac", "Balanced — no excess")
+    if score < 75:
+        return ("EXPENSIVE", "#f4a01c", "Elevated valuation building")
+    if score < 90:
+        return ("BUBBLE RISK", "#e4572e", "Risk accumulation — trim exposure")
+    return ("EXTREME BUBBLE", "#c1121f", "De-risk / defensive")
 
 
 @st.cache_data(ttl=3600)
@@ -117,30 +136,6 @@ def load_spy():
     return pipe.get_price_series("SPY", start=pipe.LIVE_START)
 
 
-def band_color(score: float) -> str:
-    if pd.isna(score):
-        return "gray"
-    for lo, hi, c, _ in BANDS:
-        if lo <= score < hi:
-            return c
-    return "darkred"
-
-
-def status_action(score: float):
-    """Return (badge_text, badge_color, note) for the Status Card."""
-    if pd.isna(score):
-        return ("UNKNOWN", "#64748b", "No data")
-    if score < 40:
-        return ("LOW · 2.0× DCA", "#1a9850", "Cooling — lean in")
-    if score < 60:
-        return ("NORMAL · 1.5× DCA", "#2166ac", "Steady accumulation")
-    if score < 80:
-        return ("WATCH · 1.0× DCA", "#f4a01c", "Monitor closely")
-    if score < 90:
-        return ("ELEVATED · 0.5× DCA", "#e4572e", "Reduced exposure")
-    return ("BUBBLE WARNING · 0× DCA", "#c1121f", "De-risk to cash")
-
-
 def gauge_fig(score: float) -> go.Figure:
     """CNN Fear & Greed style semicircular gauge.
 
@@ -161,13 +156,13 @@ def gauge_fig(score: float) -> go.Figure:
     R_out, R_in = 1.0, 0.70     # outer / inner arc radii
     R_needle = 0.55             # needle length (< R_in -> tip inside the band)
 
-    # --- 5-step colour bands (new, strictly non-overlapping palette) --------
+    # --- 5-step color bands aligned with the V2 risk-level bands -----------
     STEPS = [
-        (0, 20, "#059669", "Extreme Fear / Overweight"),
-        (20, 40, "#10b981", "Underweight / Add"),
-        (40, 60, "#64748b", "Neutral"),
-        (60, 80, "#f59e0b", "Overheat / Halve"),
-        (80, 100, "#dc2626", "Bubble / De-risk"),
+        (0, 40, "#10b981", "Cheap / Fear"),
+        (40, 60, "#3b82f6", "Normal"),
+        (60, 75, "#f59e0b", "Expensive"),
+        (75, 90, "#ef4444", "Bubble Risk"),
+        (90, 100, "#991b1b", "Extreme Bubble"),
     ]
 
     fig = go.Figure()
@@ -245,48 +240,107 @@ def status_card(state: dict, meta: dict, src_label: str, tail_boost: bool = True
     score = state["score"]
     action, color, note = status_action(score)
     avail = meta.get("available_count", "?")
-    feats = state.get("features", {})
-    elevated = [f["label"].split(" (")[0]
-                for f in feats.values()
-                if f.get("score") is not None and f["score"] >= 80]
-    elev_html = (f'<div class="status-elev">⚠ Elevated (&ge;80): '
-                 f'{", ".join(elevated)}</div>') if elevated else ""
-    boost_state = ("ON · non-linear escalation" if tail_boost
-                   else "OFF · raw weighted score")
+    modules = state.get("modules", {}) or {}
+    hist_pct = state.get("hist_pct", np.nan)
+    # Top contributing modules (for the "Compared with history" callout)
+    mod_rank = sorted(((m, v) for m, v in modules.items() if v is not None),
+                     key=lambda x: x[1], reverse=True)
+    mod_html = " · ".join(
+        f"{m.capitalize()} {v:.0f}" for m, v in mod_rank[:3])
+    hist_txt = (f"Higher than {hist_pct:.0f}% of history"
+                if pd.notna(hist_pct) else "n/a")
     asof = (pd.Timestamp(state["as_of"]).date() if state.get("as_of") else "n/a")
     st.markdown(f"""
     <div class="status-card">
-      <div class="status-head">Current Strategy Action</div>
+      <div class="status-head">Current Bubble Risk Index</div>
       <div class="badge" style="background:{color}">{action}</div>
       <div class="status-score">Score <b>{score:.1f}</b> / 100 &nbsp;·&nbsp; as of {asof}</div>
       <div class="status-note">{note}</div>
-      <div class="status-cov">Data source: {src_label} &nbsp;·&nbsp; Live coverage: {avail}/8</div>
-      <div class="status-cov">Tail amplification: <b>{boost_state}</b></div>
-      {elev_html}
+      <div class="status-cov">Risk accumulation indicator — not a crash forecast</div>
+      <div class="status-cov">Data: {src_label} &nbsp;·&nbsp; coverage {avail}/8 &nbsp;·&nbsp; {hist_txt}</div>
+      <div class="status-cov">Top modules: {mod_html or 'n/a'}</div>
     </div>
     """, unsafe_allow_html=True)
 
 
-def feature_cards(features: dict):
+MODULE_LABELS = {
+    "valuation": "Valuation",
+    "sentiment": "Sentiment",
+    "leverage": "Leverage",
+    "structure": "Structure",
+    "macro": "Macro",
+}
+
+
+def radar_fig(modules: dict) -> go.Figure:
+    """5-axis radar of the module risk scores (0-100 each)."""
+    cats = [MODULE_LABELS[m] for m in MODULE_WEIGHTS]
+    vals = [modules.get(m, 0.0) or 0.0 for m in MODULE_WEIGHTS]
+    fig = go.Figure()
+    fig.add_trace(go.Scatterpolar(
+        r=vals + [vals[0]], theta=cats + [cats[0]], fill="toself",
+        fillcolor="rgba(193,18,31,0.18)", line=dict(color="#c1121f", width=2),
+        marker=dict(size=6, color="#c1121f"),
+        hovertemplate="%{theta}: %{r:.0f}<extra></extra>"))
+    fig.update_layout(
+        polar=dict(radialaxis=dict(range=[0, 100], tickfont=dict(size=10),
+                                    gridcolor="#e2e8f0"),
+                    angularaxis=dict(tickfont=dict(size=12, color="#0f172a"))),
+        height=360, margin=dict(t=30, b=20, l=40, r=40),
+        paper_bgcolor="white", showlegend=False)
+    return fig
+
+
+def module_cards(modules: dict):
+    """Five module score cards (weight-bearing) below the radar."""
     cells = ""
-    for key, f in features.items():
-        sc = f["score"]
+    for m in MODULE_WEIGHTS:
+        sc = modules.get(m)
         if sc is None:
-            border, color, txt, cls = "#d1d5db", "gray", "Pending", " missing"
+            border, color, txt, cls = "#d1d5db", "gray", "—", " missing"
         else:
             color = band_color(sc)
             border = color
             txt = f"{sc:.0f}"
-            cls = " alert" if sc >= 80 else ""
+            cls = " alert" if sc >= 75 else ""
         cells += (
             f'<div class="feat-card{cls}" style="border-color:{border}">'
-            f'<div class="feat-lbl">{f["label"]}</div>'
+            f'<div class="feat-lbl">{MODULE_LABELS[m]}</div>'
             f'<div class="feat-val" style="color:{color}">{txt}</div>'
-            f'<div class="feat-w">w {f["weight"]:.2f} · '
-            f'{"live" if sc is not None else "pending"}</div>'
+            f'<div class="feat-w">w {MODULE_WEIGHTS[m]:.2f} · risk score</div>'
             f'</div>'
         )
     st.markdown(f'<div class="feat-grid">{cells}</div>', unsafe_allow_html=True)
+
+
+def drivers_panel(state: dict):
+    """Explain what moved the index vs last month (module deltas)."""
+    drivers = state.get("drivers", []) or []
+    score = state.get("score", np.nan)
+    if not drivers:
+        st.info("Module detail updates monthly; no month-over-month change yet.")
+        return
+    rows = "".join(
+        f'<tr><td style="padding:4px 10px"><b>{MODULE_LABELS.get(d["module"], d["module"])}</b></td>'
+        f'<td style="padding:4px 10px;text-align:right;color:'
+        f'{"#c1121f" if d["delta"] > 0 else "#1a9850"}">'
+        f'{"+" if d["delta"] >= 0 else ""}{d["delta"]:.1f}</td>'
+        f'<td style="padding:4px 10px;text-align:right;color:#64748b">w {d["weight"]:.2f}</td></tr>'
+        for d in drivers[:5])
+    st.markdown(f"""
+    <div class="status-card" style="margin-top:10px">
+      <div class="status-head">Monthly Drivers (vs prior month)</div>
+      <table style="width:100%;font-size:13px;color:#0f172a">
+        <tr><th style="text-align:left;padding:2px 10px">Module</th>
+        <th style="text-align:right;padding:2px 10px">Δ</th>
+        <th style="text-align:right;padding:2px 10px">weight</th></tr>
+        {rows}
+      </table>
+      <div class="status-note" style="margin-top:6px">Index measures risk
+      accumulation — not a crash forecast. A rising score means price is
+      diverging further from fundamentals / leverage &amp; euphoria are building.</div>
+    </div>
+    """, unsafe_allow_html=True)
 
 
 def history_fig(scores: pd.Series, spx, ndx, log_scale: bool = True,
@@ -324,7 +378,7 @@ def history_fig(scores: pd.Series, spx, ndx, log_scale: bool = True,
         rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.06,
         row_heights=[0.65, 0.35],
         subplot_titles=("S&P 500 (left axis)  ·  Nasdaq (right axis)",
-                        "Bubble Risk Score (adaptive vol-adjusted EMA)"),
+                        "Bubble Risk Index (stability-filtered)"),
         specs=[[{"secondary_y": True}], [{}]],
     )
 
@@ -342,20 +396,24 @@ def history_fig(scores: pd.Series, spx, ndx, log_scale: bool = True,
     fig.update_yaxes(title_text="Nasdaq", type=ytype, row=1, col=1,
                      secondary_y=True)
 
-    # Row 2: smoothed score with risk-zone background shading
+    # Row 2: smoothed score with V2 risk-zone background shading
     if not sc.empty:
-        fig.add_trace(go.Scatter(x=sc.index, y=sc.values, name="Bubble Score",
+        fig.add_trace(go.Scatter(x=sc.index, y=sc.values, name="Bubble Index",
                                  line={"color": "#c1121f", "width": 2},
                                  fill="tozeroy", fillcolor="rgba(193,18,31,0.06)"),
                       row=2, col=1)
-        fig.add_hrect(y0=0, y1=40, fillcolor="rgba(26,152,80,0.08)", line_width=0,
+        fig.add_hrect(y0=0, y1=40, fillcolor="rgba(16,185,129,0.10)", line_width=0,
                       row=2, col=1)
-        fig.add_hrect(y0=40, y1=80, fillcolor="rgba(244,160,28,0.07)", line_width=0,
+        fig.add_hrect(y0=40, y1=60, fillcolor="rgba(59,130,246,0.08)", line_width=0,
                       row=2, col=1)
-        fig.add_hrect(y0=80, y1=100, fillcolor="rgba(193,18,31,0.12)", line_width=0,
+        fig.add_hrect(y0=60, y1=75, fillcolor="rgba(245,158,11,0.10)", line_width=0,
                       row=2, col=1)
-        fig.add_hline(y=80, line_dash="dash", line_color="#c1121f",
-                      annotation_text="High-risk > 80",
+        fig.add_hrect(y0=75, y1=90, fillcolor="rgba(239,68,68,0.10)", line_width=0,
+                      row=2, col=1)
+        fig.add_hrect(y0=90, y1=100, fillcolor="rgba(153,27,27,0.14)", line_width=0,
+                      row=2, col=1)
+        fig.add_hline(y=75, line_dash="dash", line_color="#ef4444",
+                      annotation_text="Bubble Risk > 75",
                       annotation_position="top left", row=2, col=1)
 
     fig.update_layout(height=660, hovermode="x unified", showlegend=True,
@@ -372,11 +430,13 @@ def history_fig(scores: pd.Series, spx, ndx, log_scale: bool = True,
 def backtest_panel(scores: pd.Series, params: dict):
     """Interactive Bubble-DCA vs Buy&Hold backtest. Delegates to the crash-proof
     engine in backtest.py (run_backtest returns (metrics_df, chart_fig) or None).
+    Metrics are HONEST for a DCA (money-weighted return / total invested /
+    final value / max drawdown) — never a naive end/start equity ratio.
     """
-    st.subheader("📊 Strategy Historical Backtest (2000 - Present)")
-    st.caption("Benchmark: fixed ${:,} / mo into SPY (buy & hold). "
-               "Strategy: Bubble Risk-Adjusted DCA with de-risk. "
-               "Tune the sliders — the table & curve recompute live."
+    st.subheader("📊 Strategy Backtest — Bubble-Risk DCA vs Buy & Hold (2000-Present)")
+    st.caption("Benchmark: fixed ${:,}/mo into SPY (buy & hold). Strategy: scales "
+               "the same contrib. by the Bubble Index band and de-risks to cash when "
+               "the index is extreme. Tune the sliders — table & curve recompute live."
                .format(int(params["base_monthly"])))
 
     spy = load_spy()
@@ -391,14 +451,77 @@ def backtest_panel(scores: pd.Series, params: dict):
     st.plotly_chart(chart_fig, use_container_width=True)
 
 
+def historical_comparison(scores: pd.Series, state: dict):
+    """Overlay the live index history with the canonical bubble episodes and a
+    'Compared with historical bubbles' summary table."""
+    st.subheader("🕰️ Compared with Historical Bubbles")
+    bm = pipe.historical_benchmarks(scores)
+    today = state.get("score", np.nan)
+    hist_pct = state.get("hist_pct", np.nan)
+
+    # summary line
+    if pd.notna(today) and pd.notna(hist_pct):
+        peak2000 = bm.get("dotcom_2000", {}).get("score", np.nan)
+        vs = (f"Current {today:.0f} is higher than {hist_pct:.0f}% of history"
+              + (f" and below the 2000 dot-com peak ({peak2000:.0f})."
+                 if pd.notna(peak2000) else "."))
+        st.markdown(f"<div class='status-note' style='margin-bottom:8px'>{vs}</div>",
+                    unsafe_allow_html=True)
+
+    # table: episode | date | score
+    rows = "".join(
+        f'<tr><td style="padding:4px 10px">{label}</td>'
+        f'<td style="padding:4px 10px;text-align:right">{d["date"]}</td>'
+        f'<td style="padding:4px 10px;text-align:right;font-weight:700">{d["score"]:.0f}</td></tr>'
+        for label, d in [("Dot-com 2000", bm.get("dotcom_2000", {})),
+                         ("GFC 2007", bm.get("gfc_2007", {})),
+                         ("COVID pre-2020", bm.get("covid_pre", {})),
+                         ("2021 liquidity", bm.get("bubble_2021", {})),
+                         ("Current", {"date": pd.Timestamp(state.get("as_of")).strftime("%Y-%m")
+                                      if state.get("as_of") else "—",
+                                      "score": today})]
+        if d)
+    st.markdown(f"""
+    <div class="status-card" style="margin-bottom:10px">
+      <div class="status-head">Index at canonical episodes</div>
+      <table style="width:100%;font-size:13px;color:#0f172a">
+        <tr><th style="text-align:left;padding:2px 10px">Episode</th>
+        <th style="text-align:right;padding:2px 10px">Date</th>
+        <th style="text-align:right;padding:2px 10px">Score</th></tr>
+        {rows}
+      </table>
+    </div>
+    """, unsafe_allow_html=True)
+
+    # overlay chart: live history + horizontal reference lines at episode peaks
+    fig = go.Figure()
+    s = scores.dropna()
+    if not s.empty:
+        fig.add_trace(go.Scatter(x=s.index, y=s.values, name="Bubble Index",
+                                 line={"color": "#c1121f", "width": 2},
+                                 fill="tozeroy", fillcolor="rgba(193,18,31,0.06)"))
+        for label, d in bm.items():
+            fig.add_hline(y=d["score"], line_dash="dot", line_color="#94a3b8",
+                          annotation_text=f"{label} ≈ {d['score']:.0f}",
+                          annotation_position="right")
+        # V2 risk bands as background
+        fig.add_hrect(y0=75, y1=100, fillcolor="rgba(239,68,68,0.08)", line_width=0)
+        fig.add_hrect(y0=60, y1=75, fillcolor="rgba(245,158,11,0.07)", line_width=0)
+    fig.update_layout(height=380, hovermode="x unified",
+                      yaxis_title="Bubble Index", yaxis_range=[0, 100],
+                      margin={"t": 20, "b": 30, "l": 55, "r": 55},
+                      legend=dict(orientation="h", y=1.08, x=0),
+                      plot_bgcolor="white", paper_bgcolor="white")
+    st.plotly_chart(fig, use_container_width=True)
+
+
 def main():
-    st.title("📈 US Equity Bubble Risk — Dalio-style Monitor")
-    st.caption("Dual-speed Z-score + Sigmoid macro model · 8 factors "
-               "(F1 Valuation .20, F2 FINRA Margin Leverage .20, F3 Credit .15, "
-               "F4 Business .15, F5 Tech .10, F6 Momentum .10, F7 VIX .05, "
-               "F8 Liquidity .05) · adaptive vol-adjusted EMA (20d calm / 5d "
-               "stress) · CDF-normalised Score in [1,99] · free/open data "
-               "(FRED MGDTE, EMVMACROBUS, yfinance/Stooq)")
+    st.title("📈 US Equity Bubble Risk Index — V2")
+    st.caption("Professional 5-module macro framework · Valuation 30% · Sentiment 20% "
+               "· Leverage 20% · Structure 15% · Macro 15% · every indicator is a "
+               "trailing-historical PERCENTILE (0-100) · weighted blend → historical "
+               "affine calibration (dot-com peak ≈ 97, GFC trough ≈ 12) → stability "
+               "filter (EMA + ≤1.5 pt/day clamp) · free/open data (FRED, yfinance/Stooq)")
 
     # ---- Sidebar: refresh controls ---------------------------------------
     refresh = st.sidebar.checkbox("Force refresh live data", value=False)
@@ -408,22 +531,20 @@ def main():
 
     log_scale = st.sidebar.checkbox("Log price scale", value=True)
 
-    # ---- Sidebar: tail-risk amplification toggle -------------------------
+    # ---- Sidebar: valuation acceleration toggle -------------------------
     tail_boost = st.sidebar.checkbox(
-        "Tail-risk amplification (S-stretch + bubble-confirm)", value=pipe.TAIL_BOOST_ON,
-        help="When ON, the blended Z is S-stretched for |Z|>1 (asymmetric top/bottom "
-             "warning) and a bubble-confirmation boost fires when F1 (valuation), "
-             "F5 (tech froth) and F6 (momentum) are jointly in their top-30% "
-             "percentile. When OFF, the plain weighted-Z score is shown.")
+        "Valuation acceleration curve", value=pipe.TAIL_BOOST_ON,
+        help="When ON, the Valuation module uses the non-linear froth-acceleration "
+             "curve (percentile 80-95 escalates convexly). When OFF, plain percentile.")
 
     # ---- Sidebar: interactive backtest sliders ---------------------------
     with st.sidebar.expander("🎛️ Backtest Parameters", expanded=False):
         base_monthly = st.number_input("Base Monthly DCA ($)", min_value=0,
                                        max_value=10000, value=1000, step=100)
         low_mult = st.slider("Low-Risk Multiplier (Score < 40)", 1.0, 3.0, 2.0, 0.1)
-        high_mult = st.slider("High-Risk Multiplier (80 ≤ Score < thr)",
+        high_mult = st.slider("High-Risk Multiplier (60 ≤ Score < thr)",
                               0.0, 1.0, 0.5, 0.05)
-        derisk_threshold = st.slider("De-Risk Threshold Score", 80, 95, 90, 1)
+        derisk_threshold = st.slider("De-Risk Threshold Score", 75, 95, 90, 1)
         derisk_cash = st.slider("De-Risk Cash Allocation", 0.0, 0.5, 0.20, 0.05)
         cash_yield = st.number_input("Cash Yield (Annualized %)", min_value=0.0,
                                      max_value=10.0, value=4.0, step=0.5)
@@ -454,9 +575,17 @@ def main():
     with c2:
         status_card(state, meta, src_label, tail_boost)
 
-    # ---- Feature cards ---------------------------------------------------
-    st.subheader("Eight Risk Features (current percentile)")
-    feature_cards(state["features"])
+    # ---- Module radar + module cards -------------------------------------
+    st.subheader("Five Risk Modules (current)")
+    rc1, rc2 = st.columns([1, 1.25])
+    with rc1:
+        st.plotly_chart(radar_fig(state.get("modules", {})), use_container_width=True)
+    with rc2:
+        module_cards(state.get("modules", {}))
+        drivers_panel(state)
+
+    # ---- Historical comparison ------------------------------------------
+    historical_comparison(scores, state)
 
     # ---- History (dual-axis, linked zoom) --------------------------------
     st.subheader("Historical Trend")

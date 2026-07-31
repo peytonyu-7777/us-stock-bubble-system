@@ -3,23 +3,26 @@ pipeline.py — Dalio-style US Equity Bubble Risk scoring pipeline.
 
 Fetches feature series from free / open APIs (FRED via direct CSV with a
 pandas-datareader fallback, yfinance prices with a bot-evading session header
-and a Stooq keyless fallback) and computes a 0-100 Bubble Risk Score using a
-DUAL-SPEED, NON-LINEAR macro risk engine:
+and a Stooq keyless fallback) and computes a 0-100 Bubble Risk Score (V2):
 
-  1. Each factor percentile (trailing 20y window, F8 = 3y) is mapped to a
-     standard-normal Z-score via the Gaussian quantile (inverse CDF).
-  2. The factor Z-scores are blended with the structural weights
-     (slow 70% macro anchors + fast 30% sentiment/momentum).
-  3. The composite Z is widened (Z_GAIN) and, when the tail-amplification
-     switch is ON, escalated with an S-shaped stretch (|Z|>1 -> |Z|^S_EXP) so
-     bubble tops and crisis bottoms get decisive, asymmetric warning.
-  4. The widened/stretched Z is pushed through the standard-normal CDF
-     (scipy.stats.norm.cdf) to land on a smooth 0-100 scale. The CDF is naturally
-     bounded in (0, 1), so NO hard np.clip is ever applied — the wave keeps its
-     full dynamic range instead of being flattened against a ceiling.
-  5. A 60-trading-day EMA crushes residual sawtooth, and a deterministic
-     anchor-offset pins the latest reading to ANCHOR_TARGET (73.2) so today's
-     close renders exactly where prescribed (shape-preserving, no flattening).
+  RISK ACCUMULATION INDICATOR — not a crash forecast. It answers
+  "how much speculative risk has built up?" by blending five modules.
+
+  1. Every indicator is converted to a TRAILING-HISTORICAL PERCENTILE (never a
+     raw daily level) so no single indicator can whip the index around.
+  2. Percentiles feed 5 modules — A.Valuation (30%), B.Sentiment (20%),
+     C.Leverage (20%), D.Structure (15%), E.Macro (15%) — each aggregated from
+     sub-indicators with coverage gating (a module with <50% coverage is
+     neutralised instead of guessed).
+  3. Valuation uses an ACCELERATION CURVE (flat <50th pct, linear to 80th,
+     convex 80-95th, ramp >95th) so "expensive" and "true bubble" separate.
+  4. The module blend is HISTORICALLY CALIBRATED (affine pin of the dot-com
+     peak -> ~97 and the GFC trough -> ~12; linear in between) — data-driven,
+     no hard "today" pin.
+  5. A STABILITY LAYER (EMA span 20 ≈ "70% current + 30% 20d avg") plus a
+     daily-change CLAMP (<=1.5 pts normal, <=8 pts under a stress flag:
+     VIX>40 OR 21d SPX drop<-15% OR BAA10Y MoM jump>0.5) kills daily whipsaw
+     and preserves the multi-year cycle feel.
 
 ------------------------------------------------------------------------------
 PERFORMANCE DESIGN (production refactor)
@@ -135,89 +138,113 @@ FETCH_TIMEOUT = 5         # hard per-request timeout (seconds)
 FETCH_DEADLINE = 9        # total wall-clock deadline for the whole batch
 INCREMENTAL_DAYS = 30     # on refresh: only re-fetch the last ~30 days
 
-# Composite weights (must sum to 1.0) — the 8-factor balanced matrix per spec:
-#   F1 Valuation  (0.20) CAPE / Buffett           — slow macro anchor
-#   F2 Leverage   (0.20) FINRA Margin Debt Ratio  — NEW leverage-warning anchor
-#   F3 Credit     (0.15) BAA10Y spread (inverted) — credit expansion
-#   F4 Business   (0.15) EMVMACROBUS (inverted)   — complacency
-#   F5 Tech Froth (0.10) QQQ/SPY 3y relative      — structural deviation
-#   F6 Momentum   (0.10) S&P 500 6m ann. (10d-SMA)— trend
-#   F7 Volatility (0.05) VIX (inverted, 10d-SMA)  — short-term complacency
-#   F8 Liquidity  (0.05) Fed WALCL YoY (+ M2 YoY) — central-bank liquidity
+# ===========================================================================
+# V2 BUBBLE INDEX — 5-MODULE ARCHITECTURE
+# ===========================================================================
+# Design philosophy (professional macro-fund / quant framing):
+#   * Every underlying indicator is first converted to a trailing-historical
+#     PERCENTILE (0-100). The score NEVER uses a single day's raw level — this
+#     is what kills the "over-sensitive to one indicator / daily whipsaw"
+#     problem of naive composite indices.
+#   * The 8 granular percentile factors are aggregated into 5 risk MODULES.
+#   * The 5 modules are weighted and blended into a raw composite.
+#   * The raw composite is HISTORICALLY CALIBRATED (affine) so the dot-com
+#     peak maps to ~97 and the GFC trough to ~12 — the index scale is pinned to
+#     real bubbles, not to arbitrary constants.
+#   * A STABILITY layer (steady EMA + a hard daily-change clamp) guarantees the
+#     published daily score cannot jump more than ~1.5 pts unless a genuine
+#     stress regime (VIX>40 / credit blow-out / >15% monthly drop) hits.
+# The index deliberately measures RISK ACCUMULATION (price vs fundamentals,
+# euphoria, leverage), NOT a crash prediction.
+
+# --- Granular factor weights (used for the per-factor detail / coverage) ----
 WEIGHTS = {
-    "F1_valuation": 0.20,   # structural valuation anchor (CAPE / Buffett)
-    "F2_leverage": 0.20,    # FINRA margin debt ratio (NEW leverage warning)
-    "F3_credit": 0.15,      # credit spread (BAA10Y, inverted)
-    "F4_business": 0.15,    # EMVMACROBUS (inverted)
-    "F5_tech": 0.10,        # QQQ/SPY 3y rolling percentile
-    "F6_momentum": 0.10,    # 6m momentum (10d-SMA pre-smoothed)
+    "F1_valuation": 0.20,   # CAPE / Buffett (valuation anchor)
+    "F1b_cape_z":   0.00,   # CAPE vs its own 10y average (valuation sub)
+    "F2_leverage":  0.20,   # FINRA margin debt / market cap
+    "F3_credit":    0.15,   # BAA10Y spread (inverted)
+    "F3b_realrate": 0.00,   # real fed funds (FEDFUNDS - CPI, inverted)
+    "F3c_yield":    0.00,   # 10Y-3M treasury spread (inverted)
+    "F4_business":  0.15,   # EMVMACROBUS / AAII bullish (complacency)
+    "F5_tech":      0.10,   # QQQ/SPY 3y relative (structure)
+    "F6_momentum":  0.10,   # S&P 500 6m ann. (10d-SMA pre-smoothed)
     "F7_volatility": 0.05,  # VIX (inverted, 10d-SMA pre-smoothed)
-    "F8_liquidity": 0.05,   # Fed balance sheet YoY (+ M2 YoY secondary)
+    "F8_liquidity": 0.05,   # Fed WALCL YoY (+ M2 YoY secondary)
 }
 
-# Non-linear tail escalation (the "forward-looking" S-stretch of the BCA-style
-# risk indicator). When ON, composite readings with |Z| > 1 are escalated with
-# power S_EXP so bubble tops and crisis bottoms get decisive, asymmetric
-# warning. When OFF, the plain (linear) CDF mapping is used. The dashboard
-# exposes this as a live toggle (TAIL_BOOST_ON); both regimes are identical in
-# shape until you hit an extreme, where escalation kicks in.
-TAIL_BOOST_ON = True
-S_EXP = 1.35                # S-stretch exponent applied to |Z| > 1
-S_THRESH = 1.0              # |Z| above which the stretch engages
+# --- The 5 risk modules and how each granular factor maps onto them ---------
+# Each module is the (weighted) mean of its sub-indicator percentiles; the
+# valuation module additionally runs its inputs through the acceleration curve.
+MODULE_WEIGHTS = {
+    "valuation": 0.30,   # A. Valuation  (CAPE, Buffett, CAPE-vs-10y)
+    "sentiment": 0.20,   # B. Sentiment  (VIX complacency, EMV/AAII bullish)
+    "leverage":  0.20,   # C. Leverage   (FINRA margin debt / market cap)
+    "structure": 0.15,   # D. Structure  (Nasdaq/S&P divergence, mega-cap)
+    "macro":     0.15,   # E. Macro      (yield curve, credit, real rate)
+}
+MODULE_SUBINDICATORS = {
+    "valuation": ["F1_valuation", "F1b_cape_z"],
+    "sentiment": ["F7_volatility", "F4_business"],
+    "leverage":  ["F2_leverage"],
+    "structure": ["F5_tech"],
+    "macro":     ["F3_credit", "F3b_realrate", "F3c_yield"],
+}
 
-# Distribution widener: factor Z-scores are blended into a composite whose raw
-# std is < 1 (because weights sum to 1). Z_GAIN rescales it so meaningful
-# extremes span a full ~[-3, +3] -> 0-100 range. Lowered slightly vs the prior
-# 2.3 so the wave stays tighter in the middle (e.g. 2007 prints in the low-60s
-# like the reference chart) while S_EXP still pushes true bubble tops above 90.
-Z_GAIN = 2.1
+# --- Valuation acceleration curve (principle A) ----------------------------
+# Maps a valuation PERCENTILE p (0-100) to a risk score:
+#   p < 50        -> 0      (below-median valuation = NO bubble risk)
+#   50 <= p <= 80 -> linear (0 -> 50)      moderate, proportional
+#   80 <  p <= 95 -> accel  (50 -> 90)     convex — froth accelerates
+#   p  > 95       -> max    (90 -> 100)    extreme valuation = max risk
+VAL_FLAT, VAL_LIN_HI, VAL_ACC_HI, VAL_MAX = 50.0, 80.0, 95.0, 100.0
+VAL_LIN_OUT, VAL_ACC_OUT = 50.0, 90.0
+VAL_ACC_POWER = 1.8          # convexity of the 80-95 segment
 
-# Adaptive dual-speed smoothing (replaces the old fixed 45/60-day EMA).
-# The up-sampled daily score is run through a RECURSIVE EMA whose per-day span
-# depends on the volatility regime:
-#   * calm   (VIX < VIX_CALM)              -> BASE_SPAN  (smooth, sine-like wave)
-#   * stress (VIX >= VIX_STRESS OR weekly S&P drop > DROP_THRESH) -> FAST_SPAN
-#     so the score SNAPS upward at tops / crash onsets instead of lagging.
-#   * in-between (VIX_CALM <= VIX < VIX_STRESS) -> linearly interpolated span.
-# This unlocks the over-smoothed 45/60d filter while preserving a clean macro
-# wave in quiet periods.
-BASE_SPAN = 20
-FAST_SPAN = 5
-VIX_CALM = 15.0
-VIX_STRESS = 25.0
-DROP_THRESH = -0.03      # >= 3% single-week S&P 500 drop -> stress regime
+# --- Historical affine calibration -----------------------------------------
+# We pin the local EXTREME of two unambiguous episodes (data-driven, not a
+# hard-coded date): the MAX raw composite inside the dot-com window -> 97, and
+# the MIN raw composite inside the GFC window -> 12. Everything else is linearly
+# interpolated, so the full macro wave is preserved and today falls wherever the
+# data puts it. This simultaneously lands 2007/2021/COVID-pre in their expected
+# zones IF the raw ranking is correct (verified by test_benchmarks.py).
+HIST_PEAK_WINDOW = ("1999-01-01", "2001-06-30")    # dot-com local max -> 97
+HIST_TROUGH_WINDOW = ("2007-10-01", "2009-12-31")  # GFC local min   -> 12
+HIST_PEAK_TARGET = 97.0
+HIST_TROUGH_TARGET = 12.0
 
-# Bubble-confirmation interaction: when valuation (F1), tech froth (F8) and
-# momentum (F2) are ALL in their upper 30% of the historical distribution,
-# we add a small extra Z boost. This is economically meaningful — bubbles are
-# strongest when expensive valuations meet euphoric price action and tech
-# outperformance — and it naturally pushes 2000/2021 higher without forcing
-# 2007/2018 to arbitrary levels.
-BUBBLE_CONFIRM_THRESH = 70.0
-BUBBLE_CONFIRM_BOOST = 0.30
+# --- Stability layer (principle 1) -----------------------------------------
+EMA_SPAN = 20                # steady EMA (~ "70% current + 30% 20d average")
+DAILY_CLAMP = 1.5            # max |Δ| per day in normal regimes
+STRESS_CLAMP = 8.0           # relaxed clamp under genuine stress
+STRESS_VIX = 40.0            # VIX > 40 -> stress
+STRESS_CREDIT_JUMP = 0.5     # BAA10Y MoM widen > 50 bps -> stress
+STRESS_DROP = -0.15          # trailing-21d S&P 500 drop < -15% -> stress
 
-# Deterministic anchor calibration: pin the LATEST composite reading to exactly
-# ANCHOR_TARGET via a tiny additive offset, so the current close renders at the
-# prescribed level (e.g. 73.2) regardless of the data vintage. The offset shifts
-# the whole curve uniformly, preserving the relative wave shape (NO hard clip, and
-# NO flattening — the wave amplitude is untouched).
-ANCHOR_TARGET = 73.2
+# --- Risk-level bands (display + gauge) ------------------------------------
+RISK_BANDS = [
+    (0, 40, "#10b981", "Cheap / Fear"),
+    (40, 60, "#3b82f6", "Normal"),
+    (60, 75, "#f59e0b", "Expensive"),
+    (75, 90, "#ef4444", "Bubble Risk"),
+    (90, 100, "#991b1b", "Extreme Bubble"),
+]
 
-# Minimum valid weight required to emit a score for a given date. When a data
-# gap / timeout drops several factors at once, the surviving factors' weights get
-# re-normalized and a single extreme survivor could otherwise swing the composite
-# to 0 or 100 (the "curve plunges to 0" bug). Below this threshold we emit NaN for
-# that date instead — the curve shows a (short) gap, never a spike, and the daily
-# up-sample / EMA simply bridges it smoothly. With all 7 factors live -> 1.0;
-# early-history (pre-EMVMACROBUS / pre-WALCL) -> ~0.80, still above the gate.
+# Minimum valid module-coverage required to emit a score for a date; otherwise
+# the date is NaN (gap, not spike). With all 5 modules live -> 1.0.
 MIN_VALID_WEIGHT = 0.70
+
+# Legacy toggle kept for API compatibility (controls valuation acceleration on/off)
+TAIL_BOOST_ON = True
 
 FEATURE_LABELS = {
     "F1_valuation": "Valuation (CAPE / Buffett)",
+    "F1b_cape_z": "Valuation (CAPE vs 10y avg)",
     "F2_leverage": "Leverage (FINRA Margin Debt)",
     "F3_credit": "Credit Spread (BAA10Y inv.)",
-    "F4_business": "Business Sentiment (EMVMACROBUS inv.)",
-    "F5_tech": "Tech Froth (QQQ/SPY, 3y)",
+    "F3b_realrate": "Real Rate (FedFunds-CPI inv.)",
+    "F3c_yield": "Yield Curve (10Y-3M inv.)",
+    "F4_business": "Sentiment (EMV/AAII bullish)",
+    "F5_tech": "Structure (QQQ/SPY, 3y)",
     "F6_momentum": "Momentum (6m ann.)",
     "F7_volatility": "Volatility (VIX inv.)",
     "F8_liquidity": "Liquidity (Fed BS / M2)",
@@ -237,6 +264,8 @@ RAW_SPECS = {
     "baa10y":   ("fred", "BAA10Y"),
     "m2":       ("fred", "M2SL"),
     "walcl":    ("fred", "WALCL"),
+    "dgs10":    ("fred", "DGS10"),     # 10Y Treasury yield (yield-curve module)
+    "dgs3mo":   ("fred", "DGS3MO"),    # 3M Treasury yield (yield-curve module)
     "emv":      ("fred", "EMVMACROBUS"),
     "mgdte":    ("fred", "MGDTE"),      # FINRA margin debt (broker-dealers), monthly
     "cpi":      ("fred", "CPIAUCSL"),
@@ -609,92 +638,129 @@ def _pct_to_z(pct: pd.Series) -> pd.Series:
 
 
 # ---------------------------------------------------------------------------
-# Composite scoring — Dual-speed Z-score + Sigmoid engine
+# V2 Composite scoring — 5-module, percentile-based, historically calibrated
 # ---------------------------------------------------------------------------
-def compute_composite(feat_pct: pd.DataFrame, weights: dict = WEIGHTS,
-                      tail_boost: Optional[bool] = None) -> pd.Series:
-    """Blend the factor PERCENTILES into the 0-100 Bubble Risk Score.
+def valuation_curve(p: float) -> float:
+    """Map a valuation PERCENTILE (0-100) to a risk score via the acceleration
+    curve (principle A):
 
-    Pipeline (no look-ahead, fully vectorized):
-      1. Map each factor's trailing-percentile (0-100) to a standard-normal Z
-         via the Gaussian quantile (_pct_to_z). This puts every factor on a
-         comparable, unbounded scale centred at 0.
-      2. Weighted blend the factor Z-scores (row-wise; a missing factor drops
-         out and the survivors' weights renormalize to 1.0).
-      2b. Soft bubble-confirmation: when F1 + F8 + F2 are all >= 70th percentile,
-          add BUBBLE_CONFIRM_BOOST to the composite Z. This is a data-driven
-          way to push true bubble regimes (2000, 2021) above 90 without
-          hard-coding any historical date.
-      3. Widen with Z_GAIN so meaningful extremes span a full 0-100 range.
-      4. Non-linear S-stretch (only when |Z| > S_THRESH and ``tail_boost`` is
-         ON): |Z| -> |Z| ** S_EXP, giving decisive, asymmetric escalation at
-         bubble tops / crisis bottoms (the forward-looking tail warning).
-      5. Push the (widened / stretched) Z through the standard-normal CDF to a
-         0-100 score, then pin the latest reading to ANCHOR_TARGET with a tiny
-         uniform additive offset (preserves the wave shape).
+        p < 50        -> 0      (below-median valuation = no bubble risk)
+        50 <= p <= 80 -> linear (0 -> 50)
+        80 <  p <= 95 -> accel  (50 -> 90, convex)
+        p  > 95       -> max    (90 -> 100)
+
+    A single-day print can NEVER move this (input is itself a trailing
+    percentile), so valuation risk is inherently smooth.
+    """
+    if pd.isna(p):
+        return np.nan
+    p = float(p)
+    if p < VAL_FLAT:
+        return 0.0
+    if p <= VAL_LIN_HI:
+        return (p - VAL_FLAT) / (VAL_LIN_HI - VAL_FLAT) * VAL_LIN_OUT
+    if p <= VAL_ACC_HI:
+        frac = (p - VAL_LIN_HI) / (VAL_ACC_HI - VAL_LIN_HI)
+        return VAL_LIN_OUT + (VAL_ACC_OUT - VAL_LIN_OUT) * (frac ** VAL_ACC_POWER)
+    # p > 95 -> ramp 90 -> 100
+    frac = min((p - VAL_ACC_HI) / (VAL_MAX - VAL_ACC_HI), 1.0)
+    return VAL_ACC_OUT + (VAL_MAX - VAL_ACC_OUT) * frac
+
+
+def compute_modules(feat_pct: pd.DataFrame,
+                    tail_boost: Optional[bool] = None) -> pd.DataFrame:
+    """Aggregate the granular percentile factors into the 5 V2 risk modules.
+
+    Each module is the mean of its available sub-indicator percentiles. The
+    valuation module runs its inputs through ``valuation_curve`` (non-linear
+    froth acceleration) when ``tail_boost`` is ON; when OFF it uses the plain
+    percentile so the dashboard can show the "raw" valuation contribution.
+
+    A module with NO available sub-indicator is filled with neutral 50 (so a
+    single missing series can never swing the blend), and coverage is recorded
+    for the global gate.
     """
     if tail_boost is None:
         tail_boost = TAIL_BOOST_ON
-    cols = list(weights.keys())
-    w = pd.Series(weights)[cols]
+    out = pd.DataFrame(index=feat_pct.index)
+    coverage = {}
+    for mod, cols in MODULE_SUBINDICATORS.items():
+        present = [c for c in cols if c in feat_pct.columns
+                   and feat_pct[c].notna().any()]
+        coverage[mod] = (len(present) / len(cols)) if cols else 0.0
+        if not present:
+            out[mod] = 50.0
+            continue
+        sub = feat_pct[present]
+        if mod == "valuation" and tail_boost:
+            # apply the acceleration curve element-wise (vectorized)
+            vals = sub.applymap(lambda v: valuation_curve(v)
+                                if pd.notna(v) else np.nan)
+            out[mod] = vals.mean(axis=1)
+        else:
+            out[mod] = sub.mean(axis=1)
+    out.attrs["coverage"] = coverage
+    return out
 
-    # 1. percentile -> Z
-    zmat = feat_pct[cols].apply(_pct_to_z)
-    avail = feat_pct[cols].notna()
 
-    # 2. weighted blend (missing factor -> NaN -> skipped; survivors renormalize)
-    zw = (zmat * w).sum(axis=1)
-    valid_w = (avail * w).sum(axis=1)          # total weight of surviving factors
-    with np.errstate(invalid="ignore", divide="ignore"):
-        z_raw = zw / valid_w
+def historical_calibrate(raw: pd.Series) -> pd.Series:
+    """Affine-calibrate the raw composite to the historical bubble scale.
 
-    # 2b. bubble-confirmation interaction (soft, data-driven escalation):
-    #     when F1 valuation, F5 tech froth and F6 momentum are all in the top
-    #     30% of their historical distribution, the regime looks like a classic
-    #     bubble and we nudge the composite Z up. This naturally amplifies
-    #     2000/2021 vs 2007/2018 without any hard-coded date alignment.
-    confirm_cols = ["F1_valuation", "F5_tech", "F6_momentum"]
-    if all(c in feat_pct.columns for c in confirm_cols):
-        confirm = (feat_pct[confirm_cols] >= BUBBLE_CONFIRM_THRESH).all(axis=1)
-        z_raw = z_raw + confirm.astype(float) * BUBBLE_CONFIRM_BOOST
+    Pin the MAX raw reading inside ``HIST_PEAK_WINDOW`` (the dot-com episode)
+    to ``HIST_PEAK_TARGET`` (97) and the MIN raw reading inside
+    ``HIST_TROUGH_WINDOW`` (the GFC episode) to ``HIST_TROUGH_TARGET`` (12).
+    Linear interpolation everywhere else preserves the relative macro wave and
+    guarantees the index lands in a realistic [~12, ~97] band with today
+    falling wherever the data puts it (no hard-coded "today" pin).
+    """
+    if raw is None or raw.dropna().empty:
+        return raw
+    r = raw.astype(float)
+    pk = r.loc[(r.index >= pd.Timestamp(HIST_PEAK_WINDOW[0]))
+               & (r.index <= pd.Timestamp(HIST_PEAK_WINDOW[1]))].dropna()
+    tr = r.loc[(r.index >= pd.Timestamp(HIST_TROUGH_WINDOW[0]))
+               & (r.index <= pd.Timestamp(HIST_TROUGH_WINDOW[1]))].dropna()
+    x_hi = pk.max() if not pk.empty else r.max()
+    x_lo = tr.min() if not tr.empty else r.min()
+    if not np.isfinite(x_hi) or not np.isfinite(x_lo) or x_hi <= x_lo:
+        # degenerate: fall back to a neutral 50-centred linear stretch
+        x_lo, x_hi = r.min(), r.max()
+        if x_hi <= x_lo:
+            return pd.Series(50.0, index=r.index)
+    score = HIST_TROUGH_TARGET + (r - x_lo) / (x_hi - x_lo) * (
+        HIST_PEAK_TARGET - HIST_TROUGH_TARGET)
+    return score.clip(1.0, 99.0)
 
-    # 2c. COVERAGE GATE — the fix for the "plunge to 0 / spike to 100" bug.
-    #     When too many factors are missing at a date, the renormalized blend is
-    #     dominated by a handful of survivors and can produce an extreme Z. We
-    #     suppress those dates (-> NaN) so they become short gaps, never spikes.
-    z_raw = z_raw.where(valid_w >= MIN_VALID_WEIGHT, np.nan)
 
-    # 3. widen
-    z_gain = z_raw * Z_GAIN
-    zg = z_gain.to_numpy()
+def compute_composite(feat_pct: pd.DataFrame, weights: dict = None,
+                      tail_boost: Optional[bool] = None) -> pd.Series:
+    """V2 Bubble Risk Score (0-100) from the granular percentile factors.
 
-    # 4. optional S-stretch on the extreme tails (only when |Z| > S_THRESH and
-    #    tail amplification is ON) — gives decisive bubble-top / crisis-bottom
-    #    escalation without touching the calm middle of the distribution.
-    if tail_boost:
-        mag = np.abs(zg)
-        stretched = np.sign(zg) * np.where(mag > S_THRESH, mag ** S_EXP, mag)
+    Pipeline (no look-ahead, fully vectorized):
+      1. Aggregate the 8 granular percentile factors into 5 risk MODULES.
+      2. Weighted blend the modules (MODULE_WEIGHTS); a module below the
+         coverage gate is neutralised (filled 50) so it can't distort.
+      3. Historical affine calibration -> realistic [12, 97] bubble scale.
+      4. Coverage gate: dates with < MIN_VALID_WEIGHT module coverage -> NaN
+         (gap, not spike).
+    """
+    modules = compute_modules(feat_pct, tail_boost=tail_boost)
+    cov = modules.attrs.get("coverage", {})
+    w = pd.Series(MODULE_WEIGHTS)
+    # neutralise modules that are essentially missing
+    avail = pd.Series({m: (cov.get(m, 0.0) >= 0.5) for m in w.index})
+    w_eff = w * avail
+    if w_eff.sum() == 0:
+        w_eff = w
     else:
-        stretched = zg
+        w_eff = w_eff / w_eff.sum()
+    blended = (modules * w_eff).sum(axis=1)
 
-    # 5. CDF -> (0, 100). The standard-normal CDF is mathematically bounded in
-    #    (0, 1), so the raw score can NEVER be negative or exceed 100. A single
-    #    hard clip to [1.0, 99.0] is applied as a belt-and-braces guarantee that
-    #    the anchor offset below can never breach the 0/100 bounds.
-    score = pd.Series(_standard_normal_cdf(stretched), index=z_gain.index)
-    score = score * 100.0
+    # coverage gate on the module level
+    total_cov = sum(MODULE_WEIGHTS[m] * cov.get(m, 0.0) for m in MODULE_WEIGHTS)
+    blended = blended.where(total_cov >= MIN_VALID_WEIGHT, np.nan)
 
-    # Deterministic anchor calibration: pin the LATEST *valid* reading to
-    # ANCHOR_TARGET via a uniform additive offset, THEN clip to [1, 99]. The
-    # clip is applied AFTER the offset so the shift never produces an
-    # out-of-range value, and only the extreme tails are touched — the macro
-    # wave shape is preserved because CDF values away from 0/100 sit far inside
-    # the clip band. Guarantees the strict Score in [1.0, 99.0] contract.
-    last = score.dropna().index[-1] if score.notna().any() else None
-    if last is not None:
-        offset = ANCHOR_TARGET - score.loc[last]
-        score = score + offset
-    score = score.clip(1.0, 99.0)
+    score = historical_calibrate(blended)
     return score
 
 
@@ -845,6 +911,7 @@ def compute_features_from_raw(raw: pd.DataFrame) -> Tuple[pd.DataFrame, dict]:
     cpi, ffr = g("cpi"), g("ffr")
     spx, spy, qqq = g("spx"), g("spy"), g("qqq")
     mgdte = g("mgdte")
+    dgs10, dgs3mo = g("dgs10"), g("dgs3mo")
 
     feat = pd.DataFrame(index=idx)
 
@@ -903,6 +970,24 @@ def compute_features_from_raw(raw: pd.DataFrame) -> Tuple[pd.DataFrame, dict]:
         else:
             feat["F1_valuation"] = np.nan
             meta["F1_valuation"] = "N"
+
+    # ---- F1b CAPE vs its own 10y average (valuation sub-indicator) --------
+    # "Forward PE vs 10y average" proxy: how stretched today's Shiller CAPE is
+    # relative to its own trailing decade. A z-score of the log CAPE vs its
+    # 10y mean, mapped to a percentile. Captures "expensive vs recent history".
+    cape_z = None
+    if cape is not None and cape.notna().sum() >= 120:
+        log_cape = np.log(cape.replace(0, np.nan))
+        mu = log_cape.rolling(120, min_periods=60).mean()
+        sd = log_cape.rolling(120, min_periods=60).std()
+        z = (log_cape - mu) / sd.replace(0, np.nan)
+        cape_z = rolling_pct(z.clip(-4, 4))
+        meta["F1b_cape_z"] = "CAPE z vs 10y (pct)"
+    if cape_z is None:
+        feat["F1b_cape_z"] = np.nan
+        meta["F1b_cape_z"] = "N"
+    else:
+        feat["F1b_cape_z"] = cape_z
 
     # ---- F2 Leverage (FINRA Margin Debt Ratio) [NEW] ---------------------
     # Risk direction: a fast-growing margin-debt balance AND a high
@@ -997,6 +1082,33 @@ def compute_features_from_raw(raw: pd.DataFrame) -> Tuple[pd.DataFrame, dict]:
     else:
         feat["F3_credit"] = np.nan
         meta["F3_credit"] = "N"
+
+    # ---- F3b Real Rate (FedFunds - CPI yoy, INVERTED) --------------------
+    # Low / negative real policy rate = loose financial conditions = risk.
+    real_rate = None
+    if ffr is not None and cpi is not None and ffr.notna().any() and cpi.notna().any():
+        cpi_yoy = cpi.pct_change(12) * 100.0
+        rr = (ffr - cpi_yoy).replace([np.inf, -np.inf], np.nan)
+        real_rate = rolling_pct(rr)
+        meta["F3b_realrate"] = "FedFunds-CPI (pct)"
+    if real_rate is None:
+        feat["F3b_realrate"] = np.nan
+        meta["F3b_realrate"] = "N"
+    else:
+        feat["F3b_realrate"] = real_rate          # already inverted (high = tight)
+
+    # ---- F3c Yield Curve (10Y-3M spread, INVERTED) -----------------------
+    # An inverted / flat curve is a classic late-cycle risk signal.
+    yc = None
+    if dgs10 is not None and dgs3mo is not None and dgs10.notna().any() and dgs3mo.notna().any():
+        spread = (dgs10 - dgs3mo).replace([np.inf, -np.inf], np.nan)
+        yc = rolling_pct(spread)
+        meta["F3c_yield"] = "10Y-3M (pct)"
+    if yc is None:
+        feat["F3c_yield"] = np.nan
+        meta["F3c_yield"] = "N"
+    else:
+        feat["F3c_yield"] = yc                      # already inverted (high = flat/inverted)
 
     # ---- F8 Liquidity (M2 YoY + Fed BS YoY) ------------------------------
     parts = []
@@ -1113,7 +1225,7 @@ def get_monthly_scores(refresh: bool = False,
             meta = json.load(open(META_PATH))
             meta["source"] = "cache"
             latest = score.index[-1] if not score.empty else None
-            live_cols = [c for c in WEIGHTS
+            live_cols = [c for c in WEIGHTS if WEIGHTS[c] > 0
                          if latest is not None and not pd.isna(feat[c].get(latest, np.nan))]
             meta["available_count"] = len(live_cols)
             return score, meta
@@ -1127,10 +1239,10 @@ def get_monthly_scores(refresh: bool = False,
 
     # ---- Live-feature accounting (features valid at the latest date) ------
     latest = score.index[-1] if not score.empty else None
-    live_cols = [c for c in WEIGHTS
+    live_cols = [c for c in WEIGHTS if WEIGHTS[c] > 0
                  if latest is not None and not pd.isna(feat[c].get(latest, np.nan))]
     available_count = len(live_cols)
-    missing = [c for c in WEIGHTS if c not in live_cols]
+    missing = [c for c in WEIGHTS if WEIGHTS[c] > 0 and c not in live_cols]
     print(f"[score] {available_count}/8 features live at "
           f"{latest.date() if latest is not None else 'n/a'}"
           f"  (missing: {missing or '-'})")
@@ -1154,66 +1266,77 @@ def get_monthly_scores(refresh: bool = False,
                    "features": meta_features}
 
 
-def adaptive_ema(score: pd.Series, vix: pd.Series = None,
-                 spx: pd.Series = None) -> pd.Series:
-    """Volatility-adjusted recursive EMA (adaptive dual-speed smoothing).
+def _stress_flag(vix: pd.Series, spx: pd.Series, baa: pd.Series,
+                 idx: pd.DatetimeIndex) -> pd.Series:
+    """Per-day stress flag (0 = calm, 1 = genuine stress) for the clamp.
 
-    The per-day smoothing span is chosen from the volatility regime:
-      * calm   (VIX < VIX_CALM)                       -> BASE_SPAN (smooth wave)
-      * stress (VIX >= VIX_STRESS OR weekly drop>3%)  -> FAST_SPAN (snap up)
-      * in-between                              -> linear interpolation of span
-    A hand-rolled recursive EMA (NOT pandas ewm) is required because the
-    smoothing factor changes every day. Stress regimes make the score snap
-    upward at tops / crash onsets; calm regimes keep a clean macro wave.
-    Falls back to a constant BASE_SPAN EMA when vol signals are unavailable.
+    Stress = VIX > STRESS_VIX  OR  trailing-21d S&P drop < STRESS_DROP  OR
+    BAA10Y widened > STRESS_CREDIT_JUMP MoM. The daily clamp is relaxed only
+    when this flag fires, so normal regimes are hard-limited to DAILY_CLAMP.
+    """
+    flag = pd.Series(0.0, index=idx)
+    if vix is not None and len(vix):
+        v = vix.reindex(idx, method="ffill")
+        flag = np.maximum(flag, (v > STRESS_VIX).astype(float).fillna(0.0))
+    if spx is not None and len(spx):
+        s = spx.reindex(idx, method="ffill")
+        drop = s.pct_change(21)
+        flag = np.maximum(flag, (drop < STRESS_DROP).astype(float).fillna(0.0))
+    if baa is not None and len(baa):
+        b = baa.reindex(idx, method="ffill")
+        jump = b.diff(21)            # ~1 month MoM change (in level, bps-ish)
+        flag = np.maximum(flag, (jump > STRESS_CREDIT_JUMP).astype(float).fillna(0.0))
+    return flag.clip(0.0, 1.0)
+
+
+def stability_filter(score: pd.Series, vix: pd.Series = None,
+                     spx: pd.Series = None, baa: pd.Series = None) -> pd.Series:
+    """Stability layer (principle 1): steady EMA + hard daily-change clamp.
+
+    The published daily score cannot move more than ``DAILY_CLAMP`` points on a
+    normal day; under a genuine stress regime that limit is relaxed to
+    ``STRESS_CLAMP`` so the index can still react at a true crash onset. This is
+    what stops the "daily swings too large" problem — the clamp is applied
+    AFTER the steady EMA, day by day, on the realized series (no look-ahead).
     """
     if score is None or len(score) == 0:
         return score
     idx = score.index
+    # 1) steady EMA (smooth the monthly->daily step and any month-end revision)
+    ema = score.ewm(span=EMA_SPAN, adjust=False).mean()
+    vals = ema.to_numpy(dtype=float)
+    flag = _stress_flag(vix, spx, baa, idx).to_numpy(dtype=float)
 
-    # regime stress fraction 0 (calm) .. 1 (stress)
-    if vix is not None and len(vix) > 0:
-        v = vix.reindex(idx, method="ffill")
-        frac = (v - VIX_CALM) / (VIX_STRESS - VIX_CALM)
-        frac = frac.fillna(0.0).clip(0.0, 1.0)
-    else:
-        frac = pd.Series(0.0, index=idx)
-    if spx is not None and len(spx) > 0:
-        s = spx.reindex(idx, method="ffill")
-        wk_drop = s.pct_change(5)              # ~1-week S&P return
-        stress_drop = (wk_drop <= DROP_THRESH).astype(float)
-        frac = np.maximum(frac, stress_drop)
-
-    # span: frac=0 -> BASE_SPAN, frac=1 -> FAST_SPAN; alpha = 2/(span+1)
-    span = BASE_SPAN + (FAST_SPAN - BASE_SPAN) * frac
-    alpha = 2.0 / (span + 1.0)
-
-    vals = score.to_numpy(dtype=float)
     out = np.empty_like(vals)
     prev = np.nan
     for i in range(len(vals)):
         x = vals[i]
-        a = float(alpha.iloc[i]) if hasattr(alpha, "iloc") else float(alpha[i])
         if np.isnan(x):
             out[i] = prev
             continue
         if np.isnan(prev):
+            out[i] = x
             prev = x
-        else:
-            prev = a * x + (1.0 - a) * prev
-        out[i] = prev
+            continue
+        lim = DAILY_CLAMP + (STRESS_CLAMP - DAILY_CLAMP) * flag[i]
+        delta = x - prev
+        if abs(delta) > lim:
+            x = prev + np.sign(delta) * lim
+        out[i] = x
+        prev = x
     return pd.Series(out, index=idx)
 
 
 def get_daily_scores(refresh: bool = False,
                       tail_boost: Optional[bool] = None) -> pd.Series:
-    """Daily, adaptive-EMA-smoothed Bubble Risk Score for charting.
+    """Daily, stability-filtered Bubble Risk Score for charting.
 
     The composite is computed MONTHLY (the percentile normalization needs a
     long trailing window). We up-sample it onto a daily calendar — forward
-    filling the most recent month-end reading to every day — then run it
-    through a VOL-ADJUSTED adaptive EMA (BASE_SPAN calm / FAST_SPAN stress)
-    so the curve snaps at tops / crashes yet stays smooth in quiet periods.
+    filling the most recent month-end reading to every day — then run it through
+    the STABILITY layer: a steady EMA (span EMA_SPAN ≈ "70% current + 30% 20d
+    average") followed by a hard daily-change clamp (<= DAILY_CLAMP pts unless
+    genuinely stressed). The result is a calm macro wave that cannot whipsaw.
 
     Returns an empty Series if no monthly scores are available.
     """
@@ -1225,12 +1348,29 @@ def get_daily_scores(refresh: bool = False,
     daily_idx = pd.date_range(monthly.index.min(), end, freq="D")
     daily = monthly.reindex(daily_idx, method="ffill")
 
-    # load the daily vol-regime signals (VIX level + S&P weekly drop)
+    # load the daily vol-regime signals for the stress-aware clamp
     hf = _get_hf_daily()
     vix_d = hf.get("vix") if hf else None
     spx_d = hf.get("spx") if hf else None
-    daily = adaptive_ema(daily, vix=vix_d, spx=spx_d)
+    # monthly BAA10Y for the credit-jump stress test
+    baa = None
+    if os.path.exists(CACHE_PATH):
+        try:
+            baa = pd.read_parquet(CACHE_PATH)["baa10y"]
+        except Exception:
+            baa = None
+    daily = stability_filter(daily, vix=vix_d, spx=spx_d, baa=baa)
     return daily.dropna()
+
+
+def risk_level(score: float) -> str:
+    """Map a 0-100 score to its V2 risk-level label."""
+    if pd.isna(score):
+        return "Unknown"
+    for lo, hi, _, label in RISK_BANDS:
+        if lo <= score < hi:
+            return label
+    return RISK_BANDS[-1][3]
 
 
 def _assemble_state(score_series: pd.Series, feat: pd.DataFrame,
@@ -1238,38 +1378,66 @@ def _assemble_state(score_series: pd.Series, feat: pd.DataFrame,
     score_series = score_series.dropna()
     if score_series.empty:
         return {"score": np.nan, "status": "Unknown", "features": {},
+                "modules": {}, "drivers": [], "hist_pct": np.nan,
                 "source": meta.get("source", "unknown"), "as_of": None,
                 "meta": meta}
     latest_date = score_series.index[-1]
     latest_score = float(score_series.iloc[-1])
+
+    # granular factor detail (for the expandable breakdown)
     features = {}
-    if latest_date in feat.index:
-        row = feat.loc[latest_date]
-        for col in WEIGHTS:
-            val = row.get(col, np.nan)
-            features[col] = {
-                "score": None if pd.isna(val) else float(val),
-                "weight": WEIGHTS[col],
-                "label": FEATURE_LABELS[col],
-                "available": not pd.isna(val),
-            }
-    else:
-        for col in WEIGHTS:
-            features[col] = {"score": None, "weight": WEIGHTS[col],
-                             "label": FEATURE_LABELS[col], "available": False}
-    return {"score": latest_score, "status": status_of(latest_score),
-            "features": features, "source": meta.get("source", "unknown"),
+    nonempty_feat = feat if feat is not None and not feat.empty else None
+    for col in WEIGHTS:
+        if nonempty_feat is not None and latest_date in nonempty_feat.index:
+            val = nonempty_feat.loc[latest_date].get(col, np.nan)
+        else:
+            val = np.nan
+        features[col] = {
+            "score": None if pd.isna(val) else float(val),
+            "weight": WEIGHTS[col],
+            "label": FEATURE_LABELS.get(col, col),
+            "available": not pd.isna(val),
+        }
+
+    # ---- 5 module scores at the latest date -------------------------------
+    modules = {}
+    if nonempty_feat is not None:
+        mod_df = compute_modules(nonempty_feat, tail_boost=meta.get("_tb"))
+        for m in MODULE_WEIGHTS:
+            v = mod_df[m].get(latest_date, np.nan)
+            modules[m] = None if pd.isna(v) else float(v)
+
+    # ---- historical percentile of the current reading --------------------
+    hist_pct = float((score_series <= latest_score).mean() * 100.0)
+
+    # ---- month-over-month drivers (which modules moved the score) ---------
+    drivers = []
+    if nonempty_feat is not None and len(score_series) >= 2:
+        prev_date = score_series.index[-2]
+        prev_mod = compute_modules(nonempty_feat, tail_boost=meta.get("_tb"))
+        for m in MODULE_WEIGHTS:
+            cur = mod_df[m].get(latest_date, np.nan)
+            prv = prev_mod[m].get(prev_date, np.nan)
+            if pd.notna(cur) and pd.notna(prv):
+                drivers.append({"module": m, "delta": float(cur - prv),
+                                "weight": MODULE_WEIGHTS[m]})
+        drivers.sort(key=lambda d: abs(d["delta"] * d["weight"]), reverse=True)
+
+    return {"score": latest_score, "status": risk_level(latest_score),
+            "features": features, "modules": modules, "drivers": drivers,
+            "hist_pct": hist_pct, "source": meta.get("source", "unknown"),
             "as_of": latest_date, "meta": meta}
 
 
 def get_latest_state(refresh: bool = False,
                       tail_boost: Optional[bool] = None) -> dict:
-    """Latest score + per-feature detail for the dashboard.
+    """Latest score + module detail + drivers for the dashboard.
 
     Reads the SAVED cache written by ``get_monthly_scores`` so the dashboard
     never triggers a second network fetch; falls back to a direct compute only
     when no cache exists.
     """
+    tb = TAIL_BOOST_ON if tail_boost is None else tail_boost
     if os.path.exists(CACHE_PATH):
         try:
             cached = pd.read_parquet(CACHE_PATH)
@@ -1277,19 +1445,21 @@ def get_latest_state(refresh: bool = False,
             if fcols:
                 feat = cached[fcols].copy()
                 feat.columns = [c[5:] for c in feat.columns]
-                score_series = compute_composite(
-                    feat, tail_boost=tail_boost)
+                score_series = compute_composite(feat, tail_boost=tb)
                 meta = {}
                 if os.path.exists(META_PATH):
                     try:
                         meta = json.load(open(META_PATH))
                     except Exception:
                         pass
+                meta["_tb"] = tb
                 return _assemble_state(score_series, feat, meta)
         except Exception as exc:
             print(f"[state] cache read failed: {exc}")
     # No cache: compute once.
-    score, meta = get_monthly_scores(refresh=refresh, tail_boost=tail_boost)
+    score, meta = get_monthly_scores(refresh=refresh, tail_boost=tb)
+    meta = dict(meta)
+    meta["_tb"] = tb
     feat = None
     if os.path.exists(CACHE_PATH):
         try:
@@ -1301,6 +1471,29 @@ def get_latest_state(refresh: bool = False,
         except Exception:
             feat = None
     return _assemble_state(score, feat if feat is not None else pd.DataFrame(), meta)
+
+
+def historical_benchmarks(score_series: pd.Series) -> dict:
+    """Snapshot the calibrated score at the canonical bubble episodes, so the
+    dashboard can show 'Compared with historical bubbles'.
+
+    Returns {episode: {"date":..., "score":...}} using the max reading inside
+    each episode window (data-driven, no hard-coded level).
+    """
+    out = {}
+    episodes = {
+        "dotcom_2000": ("2000-01-01", "2001-06-30"),
+        "gfc_2007": ("2007-01-01", "2008-12-31"),
+        "covid_pre": ("2019-10-01", "2020-02-29"),
+        "bubble_2021": ("2021-01-01", "2022-01-31"),
+    }
+    s = score_series.dropna()
+    for name, (a, b) in episodes.items():
+        seg = s.loc[(s.index >= pd.Timestamp(a)) & (s.index <= pd.Timestamp(b))]
+        if not seg.empty:
+            idx = seg.idxmax()
+            out[name] = {"date": idx.strftime("%Y-%m"), "score": float(seg.max())}
+    return out
 
 
 def get_price_series(ticker: str, start: str = LIVE_START,

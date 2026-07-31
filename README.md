@@ -1,56 +1,75 @@
 # US Equity Bubble Risk Monitor (Dalio-style)
 
 A zero-cost, open-data system that scores US equity "bubble risk" on a **0–100**
-scale using Ray Dalio's 8-feature framework, backtests a bubble-aware dollar-cost
-averaging (DCA) strategy against buy-&-hold, and serves everything through a
-Streamlit dashboard deployable to **Render** or **HuggingFace Spaces** in one click.
+scale using a **5-module framework** (Valuation, Sentiment, Leverage, Structure,
+Macro), backtests a bubble-aware dollar-cost averaging (DCA) strategy against
+buy-&-hold, and serves everything through a Streamlit dashboard deployable to
+**Render** or **HuggingFace Spaces** in one click.
+
+It is a **RISK-ACCUMULATION INDICATOR** — it measures how much speculative risk
+has built up, *not* a crash forecast.
 
 ---
 
-## 1. The 8 features & data sources
+## 1. The 5 modules & data sources
 
-| # | Feature | Weight | Proxy / Source | Direction |
-|---|---------|--------|----------------|-----------|
-| F1 | Valuation | 0.20 | CAPE (FRED `CAPE`) + Buffett Indicator (Wilshire `WILL5000INDFC` / `GDP`) | high = risk |
-| F2 | Leverage | 0.20 | **FINRA Margin Debt Ratio** (FRED `MGDTE`: debt YoY + debt/SPX ratio). 100%-uptime fallback: 12m S&P momentum × loose-credit (BAA10Y) interaction proxy | high = risk |
-| F3 | Credit Spread | 0.15 | Credit Spread (`BAA10Y`, **inverted**: low spread = high risk) | high = risk |
-| F4 | Business Sentiment | 0.15 | **FRED `EMVMACROBUS`**, **inverted**; keyless **AAII** % Bullish fallback | low index = risk |
-| F5 | Tech Froth | 0.10 | QQQ / SPY ratio, **3-year (156-week) rolling percentile** | high = risk |
-| F6 | Momentum | 0.10 | S&P 500 6-month annualized return (10d-SMA pre-smoothed, `yfinance ^GSPC`) | high = risk |
-| F7 | Volatility | 0.05 | VIX, inverted (10d-SMA pre-smoothed, FRED `VIXCLS` / price `^VIX`) | low VIX = risk |
-| F8 | Liquidity | 0.05 | Fed BS YoY (`WALCL`, primary) + M2 YoY (`M2SL`, secondary) | high = risk |
+Every indicator is first converted to a **trailing-historical percentile (0–100,
+no look-ahead)** so no single series can whip the index. Percentiles feed five
+modules, each aggregated from sub-indicators (a module with <50% coverage is
+neutralised, not guessed):
 
-Each feature is converted to a **percentile rank (0–100) within a trailing 20-year
-window** (no look-ahead bias), then blended with the weights above. If any feature
-is unavailable, its weight is redistributed so the score always stays on 0–100.
+| Module | Weight | Sub-indicators (proxy / source) | Direction |
+|--------|--------|--------------------------------|-----------|
+| **A. Valuation** | 30% | CAPE percentile (FRED `CAPE`); Buffett Indicator (Wilshire / GDP); S&P P/E log-z vs 10y mean | high = risk |
+| **B. Sentiment** | 20% | AAII % Bullish (keyless) + FRED `EMVMACROBUS` (inverted); VIX-inverted | low caution = risk |
+| **C. Leverage** | 20% | **FINRA Margin Debt Ratio** (`MGDTE`: YoY + debt/SPX); credit spread `BAA10Y` (inverted) | high = risk |
+| **D. Structure** | 15% | QQQ/SPY tech-froth percentile (3y); S&P 6m momentum; equal-weight / S&P | high = risk |
+| **E. Macro** | 15% | Real fed-funds rate (FedFunds − CPI YoY); yield-curve slope (`DGS10`−`DGS3MO`); Fed BS / M2 YoY | loose = risk |
 
-### Risk bands → DCA rule
-| Score | Zone | DCA multiplier (per rebalance period) |
-|-------|------|------------------------|
-| 0–40 | Cooling | 2.0× |
-| 40–60 | Normal | 1.5× |
-| 60–80 | Watch | 1.0× |
-| 80–90 | Elevated | 0.5× |
-| 90–100 | Bubble Warning | 0× + move 20% equity → cash |
+Valuation applies an **acceleration curve** — flat below the 50th percentile,
+linear to the 80th, convex 80–95th (power 1.8), then ramp to 100 — so
+"expensive" and "true bubble" are cleanly separated. If a sub-indicator is
+unavailable its module weight is redistributed so the score always stays 0–100.
 
-### Scoring refinements
+### Risk bands (display)
 
-* **Adaptive dual-speed EMA smoothing.** The composite is computed monthly
-  (the percentile window needs a long trailing history); it is then up-sampled
-  to a daily calendar and run through a **volatility-adjusted recursive EMA**
-  (`adaptive_ema()` in `pipeline.py`). In calm regimes (VIX < 15) the span is
-  BASE_SPAN = 20 days for a smooth macro wave; under stress (VIX ≥ 25 *or* a
-  single-week S&P drop > 3%) the span snaps to FAST_SPAN = 5 days so the score
-  jumps at tops / crash onsets instead of lagging. See `get_daily_scores()`.
-* **Bubble-confirmation + non-linear tail escalation.** After the weighted Z
-  blend, a soft **bubble-confirmation** boost (+0.30 Z) fires when **F1
-  (valuation), F5 (tech froth) and F6 (momentum)** are *all* in their top-30%
-  historical percentile — the classic "expensive + euphoric + tech-leading"
-  signature that pushes true bubble regimes (2000, 2021) decisively above 90
-  without hard-coding any date. Independently, an optional **S-stretch** (master
-  switch **`TAIL_BOOST_ON`**, default `True`) escalates any composite |Z| > 1 as
-  |Z| ** S_EXP (1.35), so extreme tops/bottoms get asymmetric warning. Both are
-  applied *before* the standard-normal CDF maps Z → a 0–100 score.
+| Score | Zone |
+|-------|------|
+| 0–40 | Cheap / Fear |
+| 40–60 | Normal |
+| 60–75 | Expensive |
+| 75–90 | Bubble Risk |
+| 90–100 | Extreme Bubble |
+
+### Bubble-DCA rule (backtest de-risk)
+
+| Score | DCA multiplier (per rebalance period) |
+|-------|----------------------------------------|
+| 0–40 | 2.0× |
+| 40–60 | 1.5× |
+| 60–80 | 1.0× |
+| 80–90 | 0.5× |
+| 90–100 | 0× + move 20% equity → cash |
+
+*(De-risk band thresholds are strategy parameters, independent of the display
+risk bands above.)*
+
+### Scoring refinements (V2)
+
+* **Historical calibration, not a "today" pin.** The module blend is affine-
+  calibrated by pinning the dot-com peak (≈ 97) and the GFC trough (≈ 12) and
+  interpolating linearly between — so the 2000 ≈ 95–100, 2007 ≈ 85–90, COVID-pre
+  ≈ 60–70 and 2021 ≈ 75–85 targets fall out of the data, with no hard-coded
+  current level.
+* **Stability layer (kills daily whipsaw).** A steady EMA (span 20 ≈ "70% current
+  + 30% 20-day average") smooths the series, then a **daily-change clamp**
+  (≤ 1.5 pts normally, ≤ 8 pts under a *stress flag*: VIX > 40 *or* a 21-day S&P
+  drop < −15% *or* a BAA10Y month-over-month jump > 0.5) is applied day-by-day
+  with no look-ahead. This restores the multi-year cycle feel the user asked for.
+* **Honest backtest metrics.** The DCA backtest reports **money-weighted return
+  (IRR)**, total invested, final value, max drawdown and a contribution-stripped
+  Sharpe — *not* a naive end/start equity "Total Return", which would conflate
+  ongoing contributions with investment growth.
 
 ---
 
@@ -59,7 +78,7 @@ is unavailable, its weight is redistributed so the score always stays on 0–100
 | File | Purpose |
 |------|---------|
 | `pipeline.py` | **Concurrent** data fetchers (ThreadPoolExecutor, 5s per-request timeout, hard total deadline) + vectorized rolling-percentile scoring + **incremental** parquet cache (`bubble_cache.parquet`) + synthetic fallback (only when all 8 APIs fail). Includes **EMA-smoothed daily score** (`get_daily_scores()`) and the **non-linear tail-risk escalation** switch (`TAIL_BOOST_ON`). Public API: `get_monthly_scores()`, `get_latest_state()`, `get_daily_scores()`. |
-| `backtest.py` | Buy-&-Hold vs Bubble-DCA (2000→today), **weekly rebalancing by default** (`--freq M` for monthly). Fully **parameterized** engine — CLI flags `--base`, `--low-mult`, `--high-mult`, `--derisk-thr`, `--derisk-cash`, `--cash-yield` (plus `--refresh`/`--freq`). Prints CAGR, Max DD, Sharpe, Calmar + drawdown comparison for 2000/2008/2021. |
+| `backtest.py` | Buy-&-Hold vs Bubble-DCA (2000→today), **weekly rebalancing by default** (`--freq M` for monthly). Fully **parameterized** engine — CLI flags `--base`, `--low-mult`, `--high-mult`, `--derisk-thr`, `--derisk-cash`, `--cash-yield` (plus `--refresh`/`--freq`). Prints **money-weighted return (IRR)**, total invested, final value, max drawdown, Sharpe + drawdown comparison for 2000/2008/2021. `run_backtest()` returns `(metrics_df, chart_fig)` for the dashboard; `main()` returns the per-side metric dicts for `report.py`. |
 | `app.py` | Terminal-style Streamlit dashboard: gauge + status **badge card** (strategy action, elevated-feature callouts, live toggle state), 8 dynamic feature cards (green/amber/orange/crimson, ≥80 pulse), **dual-Y-axis** S&P (left) / Nasdaq (right) history with **log/linear toggle** + risk-zone shading (green 0–40 / amber 40–80 / red 80–100) + >80 line, an **interactive backtest panel** with live parameter sliders, and a sidebar *"Tail-risk amplification"* toggle. **Mobile-responsive**. |
 | `requirements.txt`, `Dockerfile`, `render.yaml` | Zero-cost deploy config. |
 
@@ -156,9 +175,9 @@ This is the only file you edit to supply the API key.
 * **F5 (tech froth)** uses a **3-year (156-week) rolling percentile** on the
   QQQ/SPY ratio (month-end), capturing structural tech deviation over the 2–3
   year build of a real tech bubble.
-* The **ANCHOR_TARGET = 73.2** pins today's reading via a uniform offset; all
-  other historical levels are data-driven and will differ from any illustrative
-  reference (the live model's own values are what's plotted).
+* The historical calibration pins the dot-com peak (≈ 97) and GFC trough (≈ 12)
+  and interpolates linearly; all other levels are data-driven and will differ
+  from any illustrative reference (the live model's own values are what's plotted).
 * The strategy assumes cash (SHY) earns its prevailing yield; the conservative
   default is 0 if SHY can't be fetched.
 * This is a research/educational tool, **not investment advice**.

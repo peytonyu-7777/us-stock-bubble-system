@@ -38,6 +38,7 @@ from typing import Optional, Tuple
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 
 import pipeline as pipe
 
@@ -79,30 +80,75 @@ def _load_prices(freq: str = "W") -> Tuple[pd.Series, pd.Series]:
 # ---------------------------------------------------------------------------
 # Metrics
 # ---------------------------------------------------------------------------
-def metrics(equity: pd.Series, rf_annual: float = 0.0, ppy: int = 52) -> dict:
+def _irr(cashflows: list, ppy: int) -> float:
+    """Money-weighted return (annualized) via bisection on the per-period rate.
+
+    ``cashflows`` is the net cashflow per period (negative = contribution out,
+    positive = withdrawal) with the FINAL portfolio value appended as the last
+    positive inflow. This is the HONEST return for a DCA strategy — it weights
+    each dollar by when it was invested, unlike a naive end/start equity ratio
+    which conflates ongoing contributions with investment growth.
+    """
+    if len(cashflows) < 2:
+        return np.nan
+    lo, hi = -0.95, 2.0          # per-period search bounds
+    for _ in range(80):
+        r = 0.5 * (lo + hi)
+        npv = sum(cf / (1.0 + r) ** t for t, cf in enumerate(cashflows))
+        if npv > 0:
+            lo = r
+        else:
+            hi = r
+    r = 0.5 * (lo + hi)
+    return float((1.0 + r) ** ppy - 1.0)
+
+
+def metrics(equity: pd.Series, contrib: pd.Series,
+            rf_annual: float = 0.0, ppy: int = 12) -> dict:
+    """Honest DCA metrics.
+
+    * total_invested : sum of all contributions (the real cash the investor put in)
+    * final_value    : ending portfolio value
+    * mwr            : money-weighted (IRR) annualized return
+    * max_drawdown   : worst peak-to-trough decline of the account value
+    * sharpe         : on contribution-STRIPPED (time-weighted) returns, so it is
+                       not inflated by the DCA cashflows
+    """
     eq = equity.dropna()
+    cf = contrib.reindex(eq.index).fillna(0.0)
     if len(eq) < 2:
         return {}
-    rets = eq.pct_change().dropna()
-    cum = eq.iloc[-1] / eq.iloc[0] - 1.0
-    yrs = (eq.index[-1] - eq.index[0]).days / 365.25
-    cagr = (eq.iloc[-1] / eq.iloc[0]) ** (1.0 / yrs) - 1.0 if yrs > 0 else np.nan
+    total_invested = float(cf.sum())
+    final_value = float(eq.iloc[-1])
 
+    # Max drawdown of the account value (peak-to-trough).
     roll_max = eq.cummax()
-    dd = eq / roll_max - 1.0
-    mdd = float(dd.min())
+    mdd = float((eq / roll_max - 1.0).min())
 
-    vol = rets.std()
-    sharpe = ((rets.mean() - rf_annual / ppy) / vol * np.sqrt(ppy)) if vol > 0 else 0.0
-    calmar = (cagr / abs(mdd)) if mdd < 0 else np.nan
+    # Time-weighted (contribution-STRIPPED) returns: the value BEFORE the
+    # end-of-period contribution is (eq - cf); its period-over-period growth is
+    # the pure market return, undistorted by how much cash was added. Using this
+    # (instead of a naive end/start equity ratio) is exactly what makes the
+    # backtest honest for a DCA strategy — it never conflates new contributions
+    # with investment growth.
+    mkt = (eq - cf).replace(0, np.nan)
+    twr_ret = (mkt / mkt.shift(1) - 1.0).dropna()
+    vol = twr_ret.std()
+    sharpe = float(((twr_ret.mean() - rf_annual / ppy) / vol * np.sqrt(ppy))
+                   if vol and vol > 0 else 0.0)
+
+    # Money-weighted return (IRR): per-period OUTflows (contributions) plus the
+    # final portfolio value as the terminal INflow. This is the real investor
+    # return because it weights every dollar by *when* it entered the market.
+    cfs = ([-c for c in cf.values] + [final_value])
+    mwr = _irr(cfs, ppy)
 
     return {
-        "cum_return": float(cum),
-        "cagr": float(cagr),
+        "total_invested": total_invested,
+        "final_value": final_value,
+        "mwr": mwr,
         "max_drawdown": mdd,
-        "sharpe": float(sharpe),
-        "calmar": float(calmar) if calmar == calmar else np.nan,
-        "end_value": float(eq.iloc[-1]),
+        "sharpe": sharpe,
     }
 
 
@@ -150,6 +196,7 @@ def _simulate(price: pd.Series, shy_ret: pd.Series, scores: pd.Series,
     shares = 0.0
     cash = 0.0
     vals = []
+    contribs = []
     derisk_dates = []
     prev_p = None
     prev_total = 0.0
@@ -189,14 +236,18 @@ def _simulate(price: pd.Series, shy_ret: pd.Series, scores: pd.Series,
                     cash -= move
                     shares += move / price_d
                 derisk_dates.append(d)
+            contribs.append(base_contrib * mult)
         else:
             shares += base_contrib / price_d
+            contribs.append(base_contrib)
 
         prev_total = shares * price_d + cash
         vals.append(prev_total)
         prev_p = price_d
 
-    return pd.Series(vals, index=dates), derisk_dates
+    return (pd.Series(vals, index=dates),
+            pd.Series(contribs, index=dates),
+            derisk_dates)
 
 
 # ---------------------------------------------------------------------------
@@ -253,38 +304,80 @@ def run_backtest(scores: Optional[pd.Series], spy_df: Optional[pd.Series],
     else:
         shy_ret = pd.Series(0.0, index=spy.index)
 
-    bench, _ = _simulate(spy, shy_ret, sc, dates, base, ppy, timing=False, params=prm)
-    strat, derisk_dates = _simulate(spy, shy_ret, sc, dates, base, ppy,
-                                     timing=True, params=prm)
+    bench, bench_cf, _ = _simulate(spy, shy_ret, sc, dates, base, ppy,
+                                    timing=False, params=prm)
+    strat, strat_cf, derisk_dates = _simulate(spy, shy_ret, sc, dates, base, ppy,
+                                              timing=True, params=prm)
 
-    mb = metrics(bench, ppy=ppy)
-    ms = metrics(strat, ppy=ppy)
+    mb = metrics(bench, bench_cf, ppy=ppy)
+    ms = metrics(strat, strat_cf, ppy=ppy)
 
     # ---- Metrics table (formatted, ready to display) ---------------------
-    rows = []
-    for name in ("cum_return", "cagr", "max_drawdown", "sharpe"):
-        b, s = mb.get(name, np.nan), ms.get(name, np.nan)
-        if name == "sharpe":
-            rows.append({"Metric": "Sharpe Ratio",
-                         "Benchmark (Buy & Hold DCA)": f"{b:.2f}",
-                         "Bubble-DCA Strategy": f"{s:.2f}"})
-        else:
-            label = {"cum_return": "Total Return",
-                     "cagr": "CAGR",
-                     "max_drawdown": "Max Drawdown"}[name]
-            rows.append({"Metric": label,
-                         "Benchmark (Buy & Hold DCA)": f"{b*100:.1f}%",
-                         "Bubble-DCA Strategy": f"{s*100:.1f}%"})
+    # HONEST framing: Total Invested / Final Value / Total Gain show the real
+    # dollars; "Money-Weighted Return (IRR)" replaces the old misleading naive
+    # "Total Return" (end/start equity ratio) which conflated contributions
+    # with investment growth for a DCA strategy.
+    def _money(x):
+        return "—" if x is None or (isinstance(x, float) and np.isnan(x)) else f"${x:,.0f}"
+    def _pct(x):
+        return "—" if x is None or (isinstance(x, float) and np.isnan(x)) else f"{x*100:.1f}%"
+    def _num(x):
+        return "—" if x is None or (isinstance(x, float) and np.isnan(x)) else f"{x:.2f}"
+
+    gain_b = (mb.get("final_value") or 0) - (mb.get("total_invested") or 0)
+    gain_s = (ms.get("final_value") or 0) - (ms.get("total_invested") or 0)
+    rows = [
+        {"Metric": "Total Invested",
+         "Benchmark (Buy & Hold DCA)": _money(mb.get("total_invested")),
+         "Bubble-DCA Strategy": _money(ms.get("total_invested"))},
+        {"Metric": "Final Value",
+         "Benchmark (Buy & Hold DCA)": _money(mb.get("final_value")),
+         "Bubble-DCA Strategy": _money(ms.get("final_value"))},
+        {"Metric": "Total Gain ($)",
+         "Benchmark (Buy & Hold DCA)": _money(gain_b),
+         "Bubble-DCA Strategy": _money(gain_s)},
+        {"Metric": "Money-Weighted Return (IRR)",
+         "Benchmark (Buy & Hold DCA)": _pct(mb.get("mwr")),
+         "Bubble-DCA Strategy": _pct(ms.get("mwr"))},
+        {"Metric": "Max Drawdown",
+         "Benchmark (Buy & Hold DCA)": _pct(mb.get("max_drawdown")),
+         "Bubble-DCA Strategy": _pct(ms.get("max_drawdown"))},
+        {"Metric": "Sharpe Ratio",
+         "Benchmark (Buy & Hold DCA)": _num(mb.get("sharpe")),
+         "Bubble-DCA Strategy": _num(ms.get("sharpe"))},
+    ]
     metrics_df = pd.DataFrame(rows)
 
-    # ---- Chart: equity curves + de-risk markers --------------------------
-    fig = go.Figure()
+    # ---- Chart: equity curves + Bubble Risk Score (dual axis) ------------
+    # Uses the SAME V2 risk-band shading as the history view so the backtest
+    # reads with the rest of the dashboard instead of looking like a stray plot.
+    fig = make_subplots(specs=[[{"secondary_y": True}]])
     fig.add_trace(go.Scatter(x=bench.index, y=bench.values,
                              name="Benchmark (Buy & Hold DCA)",
-                             line={"color": "#1f4e79", "width": 2}))
+                             line={"color": "#1f4e79", "width": 2},
+                             secondary_y=False), 0, 0)
     fig.add_trace(go.Scatter(x=strat.index, y=strat.values,
                              name="Bubble Risk-Adjusted DCA",
-                             line={"color": "#c1121f", "width": 2}))
+                             line={"color": "#c1121f", "width": 2},
+                             secondary_y=False), 0, 0)
+
+    # V2 risk-band horizontal shading + labels on the score (right) axis.
+    band_tints = ["#e8f0fe", "#e6f4ea", "#fef6e0", "#fde7d3", "#fbe2e2"]
+    for i, (lo, hi, _color, label) in enumerate(pipe.RISK_BANDS):
+        fig.add_shape(type="rect", xref="paper", x0=0, x1=1,
+                      yref="y2", y0=lo, y1=hi,
+                      fillcolor=band_tints[i], opacity=0.30, line_width=0,
+                      layer="below")
+        fig.add_annotation(xref="paper", x=1.012, yref="y2", y=(lo + hi) / 2,
+                           text=label, showarrow=False, xanchor="left",
+                           font={"size": 9, "color": "#555"})
+
+    # Bubble Risk Score context line (right axis) — explains the de-risk calls.
+    fig.add_trace(go.Scatter(x=sc.index, y=sc.values,
+                             name="Bubble Risk Score",
+                             line={"color": "#888888", "width": 1, "dash": "dot"},
+                             opacity=0.65, secondary_y=True), 0, 0)
+
     if derisk_dates:
         dm = pd.Series([strat.get(d, np.nan) for d in derisk_dates],
                        index=derisk_dates).dropna()
@@ -293,12 +386,15 @@ def run_backtest(scores: Optional[pd.Series], spy_df: Optional[pd.Series],
                                      name="De-risk triggered",
                                      marker={"color": "#e4572e", "size": 7,
                                              "symbol": "triangle-down"},
-                                     hovertemplate="De-risk @ %{x|%Y-%m}<extra></extra>"))
-    fig.update_layout(height=440, hovermode="x unified",
-                      yaxis_title="Portfolio Value (USD)",
-                      margin={"t": 30, "b": 30, "l": 75, "r": 30},
-                      legend=dict(orientation="h", y=1.06, x=0),
+                                     hovertemplate="De-risk @ %{x|%Y-%m}<extra></extra>"),
+                          0, 0)
+
+    fig.update_layout(height=460, hovermode="x unified",
+                      margin={"t": 30, "b": 30, "l": 75, "r": 95},
+                      legend=dict(orientation="h", y=1.08, x=0),
                       plot_bgcolor="white", paper_bgcolor="white")
+    fig.update_yaxes(title_text="Portfolio Value (USD)", secondary_y=False)
+    fig.update_yaxes(title_text="Bubble Risk Score", range=[0, 100], secondary_y=True)
 
     return metrics_df, fig
 
@@ -331,27 +427,40 @@ def main(refresh: bool = False, freq: str = "W", params: dict = None) -> dict:
     print(metrics_df.to_string(index=False))
     print("=" * 72)
 
-    # ---- Drawdown comparison during classic tops -------------------------
-    bench, derisk = _simulate(
+    # ---- Per-side metric dicts (honest) + drawdown comparison ------------
+    # Reuse the same simulations so the CLI / report and the dashboard agree.
+    strat_eq, strat_cf, _ = _simulate(
         spy, shy.pct_change().fillna(0.0), scores_ff, list(spy.index),
         base, ppy, timing=True, params=prm)
-    # re-run benchmark for the trough comparison
-    bench_eq, _ = _simulate(
+    # benchmark (no timing) for the metrics + trough comparison
+    bench_eq, bench_cf, _ = _simulate(
         spy, shy.pct_change().fillna(0.0), scores_ff, list(spy.index),
         base, ppy, timing=False, params=prm)
+    mb = metrics(bench_eq, bench_cf, ppy=ppy)
+    ms = metrics(strat_eq, strat_cf, ppy=ppy)
+
     windows = {
         "2000 Dot-com": ("2000-03-01", "2002-12-31"),
         "2008 GFC": ("2007-10-01", "2009-06-30"),
         "2021 COVID-tech": ("2021-01-01", "2022-12-31"),
     }
+    tops = {}
     print("\nDrawdown comparison during classic tops (strategy vs benchmark):")
     for name, (s, e) in windows.items():
-        t = _trough_during(bench_eq, bench, s, e)
+        t = _trough_during(bench_eq, strat_eq, s, e)
         if t:
+            tops[name] = t
             print(f"  {name:<18} bench MDD {t['bench_mdd']*100:6.1f}%  |  "
                   f"strategy MDD {t['strat_mdd']*100:6.1f}%  |  "
                   f"avoided {t['avoided_pp']:5.1f} pp")
-    return {"metrics_df": metrics_df}
+
+    return {
+        "metrics_df": metrics_df,
+        "freq": period_label,
+        "benchmark": mb,
+        "strategy": ms,
+        "tops": tops,
+    }
 
 
 if __name__ == "__main__":
