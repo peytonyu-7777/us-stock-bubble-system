@@ -38,6 +38,18 @@ LIVE_START = pipe.LIVE_START
 MONTHLY_BUY = 1000.0
 WEEKLY_BUY = MONTHLY_BUY * 12.0 / 52.0   # ~ $230.77/wk -> same annual flow
 
+# Default backtest parameters. These reproduce the original fixed-schedule
+# behaviour (2.0x / 1.5x / 1.0x / 0.5x / 0x bands, 20% de-risk at >=90, cash
+# modelled off the real SHY short-bond return since cash_yield defaults to 0).
+DEFAULT_PARAMS = {
+    "base_monthly": 1000.0,    # base contribution per rebalance period
+    "low_mult": 2.0,           # multiplier when score < 40
+    "high_mult": 0.5,          # multiplier when 80 <= score < de-risk threshold
+    "derisk_threshold": 90.0,  # score at/above which contribution -> 0x + de-risk
+    "derisk_cash": 0.20,       # fraction of portfolio moved to cash on de-risk
+    "cash_yield": 0.0,         # annualized cash return (%); 0 => use SHY return
+}
+
 
 # ---------------------------------------------------------------------------
 # Data
@@ -107,56 +119,89 @@ def _trough_during(eq_bench: pd.Series, eq_strat: pd.Series,
 # Unified simulator (weekly or monthly)
 # ---------------------------------------------------------------------------
 def _simulate(price: pd.Series, shy_ret: pd.Series, scores: pd.Series,
-              dates: list, base_contrib: float, timing: bool = True) -> pd.Series:
+              dates: list, base_contrib: float, ppy: int,
+              timing: bool = True, params: dict = None) -> pd.Series:
     """
     Walk `dates`, buying SPY with `base_contrib` each period.
 
     timing=True  -> scale contribution by the Bubble Risk Score band and
-                    rebalance toward a 20% cash sleeve when score > 90
-                    (idempotent target: re-deploys to equity when risk fades).
+                    rebalance toward a cash sleeve when score >= de-risk
+                    threshold (idempotent target: re-deploys to equity when
+                    risk fades).
     timing=False -> pure buy & hold benchmark (fixed contribution, no de-risk).
+
+    `params` (see DEFAULT_PARAMS) controls the multipliers, de-risk threshold,
+    cash allocation and cash yield. `ppy` is periods-per-year (52 weekly /
+    12 monthly) used to convert the annualized cash yield to a per-period one.
     """
+    p = params or DEFAULT_PARAMS
+    low_mult = float(p["low_mult"])
+    high_mult = float(p["high_mult"])
+    thr = float(p["derisk_threshold"])
+    cash_frac = float(p["derisk_cash"])
+    cash_yield = float(p["cash_yield"])
+    # When cash_yield > 0 we use a fixed money-market return; otherwise we keep
+    # the real SHY short-bond return (backward-compatible default).
+    fixed_growth = (1.0 + cash_yield / 100.0 / ppy) if cash_yield > 0 else None
+
     shares = 0.0
     cash = 0.0
     vals = []
     for i, d in enumerate(dates):
-        # cash sleeve earns the short-bond return over the prior period
+        # cash sleeve earns its return over the prior period
         if i > 0:
-            cash *= (1.0 + float(shy_ret.get(d, 0.0)))
+            if fixed_growth is not None:
+                cash *= fixed_growth
+            else:
+                cash *= (1.0 + float(shy_ret.get(d, 0.0)))
 
-        p = float(price[d])
+        price_d = float(price[d])
         sc = scores.get(d, np.nan) if timing else np.nan
 
         if timing:
-            invest = base_contrib * pipe.contribution_factor(sc)
-            shares += invest / p
-            target_cash = 0.20 if (not pd.isna(sc) and sc > 90) else 0.0
-            total = shares * p + cash
-            desired_cash = target_cash * total
-            if desired_cash > cash:            # sell equity -> raise cash
-                move = desired_cash - cash
-                shares -= move / p
-                cash += move
-            elif desired_cash < cash:          # buy equity -> redeploy cash
-                move = cash - desired_cash
-                cash -= move
-                shares += move / p
+            if pd.isna(sc):
+                mult, derisk = 1.0, False
+            elif sc < 40:
+                mult, derisk = low_mult, False
+            elif sc < 60:
+                mult, derisk = 1.5, False
+            elif sc < 80:
+                mult, derisk = 1.0, False
+            elif sc < thr:
+                mult, derisk = high_mult, False
+            else:
+                mult, derisk = 0.0, True
+            shares += base_contrib * mult / price_d
+            if derisk:
+                total = shares * price_d + cash
+                desired_cash = cash_frac * total
+                if desired_cash > cash:            # sell equity -> raise cash
+                    move = desired_cash - cash
+                    shares -= move / price_d
+                    cash += move
+                elif desired_cash < cash:          # buy equity -> redeploy cash
+                    move = cash - desired_cash
+                    cash -= move
+                    shares += move / price_d
         else:
-            shares += base_contrib / p
+            shares += base_contrib / price_d
 
-        vals.append(shares * p + cash)
+        vals.append(shares * price_d + cash)
     return pd.Series(vals, index=dates)
 
 
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
-def main(refresh: bool = False, freq: str = "W") -> dict:
+def main(refresh: bool = False, freq: str = "W", params: dict = None) -> dict:
     freq = freq.upper()
     is_weekly = freq.startswith("W")
     ppy = 52 if is_weekly else 12
     base = WEEKLY_BUY if is_weekly else MONTHLY_BUY
     period_label = "weekly" if is_weekly else "monthly"
+    prm = dict(DEFAULT_PARAMS)
+    if params:
+        prm.update({k: v for k, v in params.items() if k in DEFAULT_PARAMS})
 
     spy, shy = _load_prices(freq)
     scores, meta = pipe.get_monthly_scores(refresh=refresh)
@@ -173,8 +218,10 @@ def main(refresh: bool = False, freq: str = "W") -> dict:
 
     shy_ret = shy.pct_change().fillna(0.0)
 
-    bench = _simulate(spy, shy_ret, scores_ff, dates, base, timing=False)
-    strat = _simulate(spy, shy_ret, scores_ff, dates, base, timing=True)
+    bench = _simulate(spy, shy_ret, scores_ff, dates, base, ppy,
+                      timing=False, params=prm)
+    strat = _simulate(spy, shy_ret, scores_ff, dates, base, ppy,
+                      timing=True, params=prm)
 
     mb = metrics(bench, ppy=ppy)
     ms = metrics(strat, ppy=ppy)
@@ -192,6 +239,9 @@ def main(refresh: bool = False, freq: str = "W") -> dict:
     print(f"  rebalances={len(dates)}   {dates[0].date()} -> {dates[-1].date()}")
     print(f"  per-period contribution = ${base:,.2f} "
           f"(annual ~ ${base*ppy:,.0f})")
+    print(f"  params: low_mult={prm['low_mult']}  high_mult={prm['high_mult']}  "
+          f"de-risk>= {prm['derisk_threshold']} ({prm['derisk_cash']*100:.0f}% cash)"
+          f"  cash_yield={prm['cash_yield']:.1f}%")
     print("=" * 72)
     print(f"{'Metric':<18}{'Benchmark':>16}{'Bubble-DCA':>16}{'Δ':>12}")
     print("-" * 72)
@@ -234,9 +284,29 @@ if __name__ == "__main__":
     ap.add_argument("--refresh", action="store_true", help="force re-fetch score history")
     ap.add_argument("--freq", choices=["W", "M"], default="W",
                     help="rebalancing frequency: W=weekly (default), M=monthly")
+    ap.add_argument("--base", type=float, default=DEFAULT_PARAMS["base_monthly"],
+                    help="base contribution per period (USD)")
+    ap.add_argument("--low-mult", type=float, default=DEFAULT_PARAMS["low_mult"],
+                    help="contribution multiplier when score < 40")
+    ap.add_argument("--high-mult", type=float, default=DEFAULT_PARAMS["high_mult"],
+                    help="contribution multiplier when 80<=score<threshold")
+    ap.add_argument("--derisk-thr", type=float, default=DEFAULT_PARAMS["derisk_threshold"],
+                    help="score at/above which contribution -> 0x and de-risk fires")
+    ap.add_argument("--derisk-cash", type=float, default=DEFAULT_PARAMS["derisk_cash"],
+                    help="fraction of portfolio moved to cash on de-risk (0-1)")
+    ap.add_argument("--cash-yield", type=float, default=DEFAULT_PARAMS["cash_yield"],
+                    help="annualized cash yield (%%); 0 = use real SHY return")
     args = ap.parse_args()
+    cli_params = {
+        "base_monthly": args.base,
+        "low_mult": args.low_mult,
+        "high_mult": args.high_mult,
+        "derisk_threshold": args.derisk_thr,
+        "derisk_cash": args.derisk_cash,
+        "cash_yield": args.cash_yield,
+    }
     try:
-        main(refresh=args.refresh, freq=args.freq)
+        main(refresh=args.refresh, freq=args.freq, params=cli_params)
     except Exception as exc:
         print(f"BACKTEST ERROR: {exc}", file=sys.stderr)
         sys.exit(1)

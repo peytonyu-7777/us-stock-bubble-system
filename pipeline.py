@@ -98,6 +98,25 @@ WEIGHTS = {
     "F8_tech": 0.15,
 }
 
+# Non-linear tail-risk escalation: F1 (valuation), F4 (credit spread) and F8
+# (tech froth) are the strongest forward predictors of blow-off tops. When any
+# of their percentile readings exceeds TAIL_THRESHOLD we amplify its marginal
+# weight up to TAIL_MAX_BOOST (1.5x at pct == 100). This makes an extreme,
+# frenzied reading push the composite decisively through the 85-90 warning line
+# rather than being diluted by calmer features. Only these three tail features
+# are boosted; the others always keep weight 1.0.
+TAIL_FEATURES = {"F1_valuation", "F4_leverage", "F8_tech"}
+TAIL_THRESHOLD = 85.0
+TAIL_MAX_BOOST = 1.5
+# Master switch for the non-linear tail amplification above. Set False to show
+# the plain weighted-percentile composite (no escalation); the dashboard exposes
+# this as a live toggle so the two regimes can be compared without code edits.
+TAIL_BOOST_ON = True
+
+# EMA span (in DAYS) applied to the up-sampled daily score for a smooth,
+# noise-free trend line on the dashboard chart.
+EMA_SPAN = 10
+
 FEATURE_LABELS = {
     "F1_valuation": "Valuation (CAPE / Buffett)",
     "F2_momentum": "Momentum (6m ann.)",
@@ -366,17 +385,53 @@ def rolling_pct(series, window: int = WINDOW_MONTHS,
 # ---------------------------------------------------------------------------
 # Composite scoring
 # ---------------------------------------------------------------------------
-def compute_composite(feat_pct: pd.DataFrame, weights: dict = WEIGHTS) -> pd.Series:
+def _boost_vector(s: pd.Series, is_tail: bool) -> pd.Series:
+    """Per-date weight multiplier for one feature.
+
+    Returns all 1.0 unless ``is_tail`` and the percentile exceeds
+    TAIL_THRESHOLD, in which case the weight ramps linearly from 1.0 (at the
+    threshold) to TAIL_MAX_BOOST (at 100).
+    """
+    out = pd.Series(1.0, index=s.index, dtype="float64")
+    if not is_tail:
+        return out
+    m = s.notna() & (s > TAIL_THRESHOLD)
+    if m.any():
+        frac = (s[m] - TAIL_THRESHOLD) / (100.0 - TAIL_THRESHOLD)
+        out[m] = 1.0 + (TAIL_MAX_BOOST - 1.0) * frac
+    return out
+
+
+def compute_composite(feat_pct: pd.DataFrame, weights: dict = WEIGHTS,
+                      tail_boost: Optional[bool] = None) -> pd.Series:
     """Weighted blend of available feature percentiles. Vectorized; missing
     features have their weight redistributed across the present ones (row-wise,
     so a feature absent at a given date simply drops out of that row's blend).
+
+    With ``tail_boost`` (defaults to the global TAIL_BOOST_ON switch), the three
+    tail predictors (TAIL_FEATURES) get a non-linear weight amplification above
+    their 85th percentile so extreme readings dominate the composite.
     """
+    if tail_boost is None:
+        tail_boost = TAIL_BOOST_ON
     cols = list(weights.keys())
-    w = pd.Series(weights)[cols]
+    base_w = pd.Series(weights)[cols]
     vals = feat_pct[cols]
     avail = vals.notna()
-    numer = (vals * w).sum(axis=1)
-    denom = (avail * w).sum(axis=1)
+    if tail_boost:
+        boosts = pd.DataFrame(
+            {c: _boost_vector(vals[c], c in TAIL_FEATURES) for c in cols}
+        ).fillna(1.0)
+        # base_w (Series, index=cols) broadcasts across the date rows:
+        w_eff = base_w * boosts
+    else:
+        w_eff = pd.DataFrame({c: base_w[c] for c in cols}, index=feat_pct.index)
+    # Mask missing values to 0 so they contribute nothing to either numerator
+    # or denominator (avail already zeroes their weight; this avoids any NaN
+    # leaking through multiplication).
+    vals_masked = vals.where(avail, 0.0)
+    numer = (vals_masked * w_eff).sum(axis=1)
+    denom = (avail * w_eff).sum(axis=1)
     with np.errstate(invalid="ignore", divide="ignore"):
         score = numer / denom
     return score
@@ -712,7 +767,8 @@ def _synthetic_scores(start: str = LIVE_START) -> pd.Series:
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
-def get_monthly_scores(refresh: bool = False) -> Tuple[pd.Series, dict]:
+def get_monthly_scores(refresh: bool = False,
+                        tail_boost: Optional[bool] = None) -> Tuple[pd.Series, dict]:
     """
     Returns (monthly_score_series, meta).
     Order of resolution: on-disk cache -> live fetch -> synthetic.
@@ -732,11 +788,12 @@ def get_monthly_scores(refresh: bool = False) -> Tuple[pd.Series, dict]:
             fcols = [c for c in cached.columns if c.startswith("feat_")]
             feat = cached[fcols].copy()
             feat.columns = [c[5:] for c in feat.columns]
-            score = (cached["score"] if "score" in cached.columns
-                     else compute_composite(feat))
+            # Always recompute the composite from the stored features using the
+            # CURRENT tail_boost setting, so toggling the switch takes effect
+            # immediately on cached data (no refetch needed).
+            score = compute_composite(feat, tail_boost=tail_boost).dropna()
             meta = json.load(open(META_PATH))
             meta["source"] = "cache"
-            score = score.dropna()
             latest = score.index[-1] if not score.empty else None
             live_cols = [c for c in WEIGHTS
                          if latest is not None and not pd.isna(feat[c].get(latest, np.nan))]
@@ -748,7 +805,7 @@ def get_monthly_scores(refresh: bool = False) -> Tuple[pd.Series, dict]:
     incremental = os.path.exists(CACHE_PATH)
     raw, fmeta = fetch_all_raw(incremental=incremental)
     feat, fmeta_feat = compute_features_from_raw(raw)
-    score = compute_composite(feat).dropna()
+    score = compute_composite(feat, tail_boost=tail_boost).dropna()
 
     # ---- Live-feature accounting (features valid at the latest date) ------
     latest = score.index[-1] if not score.empty else None
@@ -777,6 +834,29 @@ def get_monthly_scores(refresh: bool = False) -> Tuple[pd.Series, dict]:
     })
     return score, {"source": "live", "available_count": available_count,
                    "features": meta_features}
+
+
+def get_daily_scores(refresh: bool = False,
+                      tail_boost: Optional[bool] = None) -> pd.Series:
+    """Daily, EMA-smoothed Bubble Risk Score for charting.
+
+    The composite is computed MONTHLY (the percentile normalization needs a
+    long trailing window). We up-sample it onto a daily calendar — forward
+    filling the most recent month-end reading to every day — and then apply a
+    short EMA (``EMA_SPAN`` days) to suppress day-to-day noise, yielding a
+    smooth trend line for the dashboard chart.
+
+    Returns an empty Series if no monthly scores are available.
+    """
+    monthly, _ = get_monthly_scores(refresh=refresh, tail_boost=tail_boost)
+    monthly = monthly.dropna()
+    if monthly.empty:
+        return monthly
+    end = pd.Timestamp.today().normalize()
+    daily_idx = pd.date_range(monthly.index.min(), end, freq="D")
+    daily = monthly.reindex(daily_idx, method="ffill")
+    daily = daily.ewm(span=EMA_SPAN, adjust=False).mean()
+    return daily.dropna()
 
 
 def _assemble_state(score_series: pd.Series, feat: pd.DataFrame,
@@ -808,7 +888,8 @@ def _assemble_state(score_series: pd.Series, feat: pd.DataFrame,
             "as_of": latest_date, "meta": meta}
 
 
-def get_latest_state(refresh: bool = False) -> dict:
+def get_latest_state(refresh: bool = False,
+                      tail_boost: Optional[bool] = None) -> dict:
     """Latest score + per-feature detail for the dashboard.
 
     Reads the SAVED cache written by ``get_monthly_scores`` so the dashboard
@@ -822,8 +903,7 @@ def get_latest_state(refresh: bool = False) -> dict:
             if fcols:
                 feat = cached[fcols].copy()
                 feat.columns = [c[5:] for c in feat.columns]
-                score_series = (cached["score"] if "score" in cached.columns
-                                else compute_composite(feat))
+                score_series = compute_composite(feat, tail_boost=tail_boost)
                 meta = {}
                 if os.path.exists(META_PATH):
                     try:
@@ -834,7 +914,7 @@ def get_latest_state(refresh: bool = False) -> dict:
         except Exception as exc:
             print(f"[state] cache read failed: {exc}")
     # No cache: compute once.
-    score, meta = get_monthly_scores(refresh=refresh)
+    score, meta = get_monthly_scores(refresh=refresh, tail_boost=tail_boost)
     feat = None
     if os.path.exists(CACHE_PATH):
         try:

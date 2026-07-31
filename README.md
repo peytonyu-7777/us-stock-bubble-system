@@ -33,15 +33,37 @@ is unavailable, its weight is redistributed so the score always stays on 0–100
 | 80–90 | Elevated | 0.5× |
 | 90–100 | Bubble Warning | 0× + move 20% equity → cash |
 
+### Scoring refinements
+
+* **EMA smoothing.** The composite is computed monthly (the percentile window
+  needs a long trailing history); it is then up-sampled to a daily calendar and
+  passed through a short **EMA** (`EMA_SPAN = 10` days) so the dashboard's risk
+  line is a smooth trend rather than a noisy monthly step. See `get_daily_scores()`.
+* **Non-linear tail-risk escalation (optional).** The three strongest
+  forward-predictors of blow-off tops — **F1 (valuation), F4 (credit spread),
+  F8 (tech froth)** — get a non-linear weight amplification once their
+  percentile exceeds **85**: the marginal weight ramps **1.0 → 1.5×** (linearly
+  to 100), so a genuinely frenzied reading pushes the composite decisively
+  through the 85–90 warning line instead of being diluted by calmer features.
+  Only these three tail features are boosted; the rest keep weight 1.0.
+  Controlled by the master switch **`TAIL_BOOST_ON`** (default `True`) in
+  `pipeline.py`. In `app.py` it is exposed as a live sidebar toggle —
+  *"Tail-risk amplification (F1/F4/F8 >85)"* — so the dashboard can show either
+  the **plain weighted-percentile score** (toggle off) or the **escalated score**
+  (toggle on) without code edits. The 8 feature percentile cards are always raw;
+  only the composite gauge/score is affected. Because the cache always
+  recomputes the composite from stored features using the current toggle,
+  flipping it takes effect immediately — no re-fetch needed.
+
 ---
 
 ## 2. Files
 
 | File | Purpose |
 |------|---------|
-| `pipeline.py` | **Concurrent** data fetchers (ThreadPoolExecutor, 5s per-request timeout, hard total deadline) + vectorized rolling-percentile scoring + **incremental** parquet cache (`bubble_cache.parquet`) + synthetic fallback (only when all 8 APIs fail). Public API: `get_monthly_scores()`, `get_latest_state()`. |
-| `backtest.py` | Buy-&-Hold vs Bubble-DCA (2000→today), **weekly rebalancing by default** (`--freq M` for monthly). Prints CAGR, Max DD, Sharpe, Calmar + drawdown comparison for 2000/2008/2021. |
-| `app.py` | Streamlit dashboard: gauge, 8 feature cards, S&P/Nasdaq + score history with >80 zone shaded. **Mobile-responsive** (feature cards reflow, columns stack on phones). |
+| `pipeline.py` | **Concurrent** data fetchers (ThreadPoolExecutor, 5s per-request timeout, hard total deadline) + vectorized rolling-percentile scoring + **incremental** parquet cache (`bubble_cache.parquet`) + synthetic fallback (only when all 8 APIs fail). Includes **EMA-smoothed daily score** (`get_daily_scores()`) and the **non-linear tail-risk escalation** switch (`TAIL_BOOST_ON`). Public API: `get_monthly_scores()`, `get_latest_state()`, `get_daily_scores()`. |
+| `backtest.py` | Buy-&-Hold vs Bubble-DCA (2000→today), **weekly rebalancing by default** (`--freq M` for monthly). Fully **parameterized** engine — CLI flags `--base`, `--low-mult`, `--high-mult`, `--derisk-thr`, `--derisk-cash`, `--cash-yield` (plus `--refresh`/`--freq`). Prints CAGR, Max DD, Sharpe, Calmar + drawdown comparison for 2000/2008/2021. |
+| `app.py` | Terminal-style Streamlit dashboard: gauge + status **badge card** (strategy action, elevated-feature callouts, live toggle state), 8 dynamic feature cards (green/amber/orange/crimson, ≥80 pulse), **dual-Y-axis** S&P (left) / Nasdaq (right) history with **log/linear toggle** + risk-zone shading (green 0–40 / amber 40–80 / red 80–100) + >80 line, an **interactive backtest panel** with live parameter sliders, and a sidebar *"Tail-risk amplification"* toggle. **Mobile-responsive**. |
 | `requirements.txt`, `Dockerfile`, `render.yaml` | Zero-cost deploy config. |
 
 ---
@@ -57,7 +79,11 @@ python pipeline.py     # score history -> bubble_cache.parquet (full fetch first
 python backtest.py          # weekly rebalance strategy comparison (default)
 python backtest.py --freq M   # monthly rebalance instead
 python backtest.py --refresh  # force re-fetch score history
+python backtest.py --base 1000 --low-mult 2.0 --high-mult 0.5 --derisk-thr 90 \
+                   --derisk-cash 0.20 --cash-yield 4.0   # tunable params
 streamlit run app.py   # LIVE dashboard on http://localhost:8501
+# In the sidebar you can toggle "Tail-risk amplification (F1/F4/F8 >85)"
+# and live-tune the backtest parameters (base DCA, multipliers, de-risk %, cash yield).
 python report.py       # static report.html (open directly in a browser, no server)
 ```
 
