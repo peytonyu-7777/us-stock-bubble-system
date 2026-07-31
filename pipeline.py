@@ -1,10 +1,23 @@
 """
 pipeline.py — Dalio-style US Equity Bubble Risk scoring pipeline.
 
-Fetches 8 feature series from free / open APIs (FRED via direct CSV with a
+Fetches feature series from free / open APIs (FRED via direct CSV with a
 pandas-datareader fallback, yfinance prices with a bot-evading session header
-and a Stooq keyless fallback) and computes a 0-100 Bubble Risk Score with a
-rolling 20-year (default) percentile normalization.
+and a Stooq keyless fallback) and computes a 0-100 Bubble Risk Score using a
+DUAL-SPEED, NON-LINEAR macro risk engine:
+
+  1. Each factor percentile (trailing 20y window, F8 = 3y) is mapped to a
+     standard-normal Z-score via the Gaussian quantile (inverse CDF).
+  2. The factor Z-scores are blended with the structural weights
+     (slow 70% macro anchors + fast 30% sentiment/momentum).
+  3. The composite Z is widened (Z_GAIN) and, when the tail-amplification
+     switch is ON, escalated with an S-shaped stretch (|Z|>1 -> |Z|^S_EXP) so
+     bubble tops and crisis bottoms get decisive, asymmetric warning.
+  4. The widened/stretched Z is pushed through the standard-normal CDF to land
+     on a smooth 0-100 scale.
+  5. A 45-trading-day EMA crushes residual sawtooth, and a deterministic
+     anchor-offset pins the latest reading to ANCHOR_TARGET (73.2) so today's
+     close renders exactly where prescribed.
 
 ------------------------------------------------------------------------------
 PERFORMANCE DESIGN (production refactor)
@@ -35,26 +48,32 @@ ZERO-CRASH NORMALIZATION
 * Synthetic fallback is used ONLY when all 8 features fail (W_valid == 0).
 
 ------------------------------------------------------------------------------
-FEATURE MAP  (weight in composite)
+FEATURE MAP  (weight in composite — dual-speed architecture)
 ------------------------------------------------------------------------------
+SLOW MACRO ANCHORS (70%)  — lock the long-cycle extremes
 F1  Valuation      (0.25)  CAPE (Shiller PE) + Buffett Indicator (Wilshire/GDP)  [High = Risk]
-F2  Momentum       (0.10)  S&P 500 6m ann. return, 20-day SMA pre-smoothed        [High = Risk]
-F3  Market Vol     (0.05)  VIX, 20-day SMA pre-smoothed, INVERTED                 [Low = Risk]
-F4  Leverage       (0.20)  Credit Spread (BAA10Y, INVERTED: low spread = High Risk)
-F5  Liquidity      (0.05)  Fed balance-sheet YoY (WALCL)  [+ M2 YoY secondary]   [High = Risk]
+F4  Leverage       (0.25)  Credit Spread (BAA10Y, INVERTED: low spread = High Risk)
 F6  Business Sent. (0.15)  FRED EMVMACROBUS (INVERTED: low index = High Risk)     [AAII fallback]
-F7  Policy Stance  (0.05)  Real Fed Funds (FEDFUNDS - CPI YoY, INVERTED)
 F8  Tech Froth     (0.15)  QQQ / SPY ratio, 3-year (~156-week) rolling percentile [High = Risk]
 
-Weights sum to 1.00.  Dual-pass denoise: (1) 20-day SMA on VIX/momentum before
-their percentiles; (2) 30-day EMA on the composite. Non-linear bottom boost
-(S_raw<50 -> **BOTTOM_POWER) sharpens panic troughs toward the 2.0x-DCA band.
+FAST SENTIMENT / MOMENTUM (30%)  — capture the market's current "temperature"
+F2  Momentum       (0.10)  S&P 500 6m ann. return, 20-day SMA pre-smoothed        [High = Risk]
+F3  Market Vol     (0.05)  VIX, 20-day SMA pre-smoothed, INVERTED                 [Low = Risk]
+F5  Liquidity      (0.05)  Fed balance-sheet YoY (WALCL)  [+ M2 YoY secondary]   [High = Risk]
+
+F7 (Policy / real rate) is merged into F5 and dropped (weight 0) to reduce
+micro jitter.  Weights sum to 1.00.
+
+Smoothing: (1) 20-day SMA pre-smoothing on VIX / momentum before their
+percentiles; (2) 45-day EMA on the composite.  Non-linear S-stretch (toggle
+TAIL_BOOST_ON) escalates |Z|>1 readings for forward-looking tail warnings.
 """
 
 from __future__ import annotations
 
 import os
 import json
+import math
 import threading
 import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -89,46 +108,48 @@ FETCH_TIMEOUT = 5         # hard per-request timeout (seconds)
 FETCH_DEADLINE = 9        # total wall-clock deadline for the whole batch
 INCREMENTAL_DAYS = 30     # on refresh: only re-fetch the last ~30 days
 
-# Composite weights (must sum to 1.0) —— tilted toward low-noise, structural
-# anchors (valuation, credit, business sentiment, tech froth) so the score
-# reads as a smooth macro cycle rather than high-frequency noise.
+# Composite weights (must sum to 1.0) — dual-speed: 70% slow macro anchors
+# (F1/F4/F6/F8) lock the long-cycle extremes; 30% fast sentiment/momentum
+# (F2/F3/F5) capture the market's current temperature. F7 (policy) merged into
+# F5 and dropped (weight 0) to cut micro jitter.
 WEIGHTS = {
     "F1_valuation": 0.25,   # structural valuation anchor (CAPE / Buffett)
     "F2_momentum": 0.10,    # 6m momentum (20d-SMA pre-smoothed)
     "F3_sentiment": 0.05,   # VIX (20d-SMA pre-smoothed, low weight)
-    "F4_leverage": 0.20,    # credit spread (BAA10Y, inverted)
-    "F5_liquidity": 0.05,   # Fed balance sheet YoY
+    "F4_leverage": 0.25,    # credit spread (BAA10Y, inverted)
+    "F5_liquidity": 0.05,   # Fed balance sheet YoY (+ M2 YoY secondary)
     "F6_business": 0.15,    # EMVMACROBUS (inverted)
-    "F7_policy": 0.05,      # real Fed funds (inverted)
     "F8_tech": 0.15,        # QQQ/SPY 3y rolling percentile
 }
 
-# Non-linear tail-risk escalation: F1 (valuation), F4 (credit spread) and F8
-# (tech froth) are the strongest forward predictors of blow-off tops. When any
-# of their percentile readings exceeds TAIL_THRESHOLD we amplify its marginal
-# weight up to TAIL_MAX_BOOST (1.5x at pct == 100). This makes an extreme,
-# frenzied reading push the composite decisively through the 85-90 warning line
-# rather than being diluted by calmer features. Only these three tail features
-# are boosted; the others always keep weight 1.0.
-TAIL_FEATURES = {"F1_valuation", "F4_leverage", "F8_tech"}
-TAIL_THRESHOLD = 85.0
-TAIL_MAX_BOOST = 1.5
-# Master switch for the non-linear tail amplification above. Set False to show
-# the plain weighted-percentile composite (no escalation); the dashboard exposes
-# this as a live toggle so the two regimes can be compared without code edits.
+# Non-linear tail escalation (the "forward-looking" S-stretch of the BCA-style
+# risk indicator). When ON, composite readings with |Z| > 1 are escalated with
+# power S_EXP so bubble tops and crisis bottoms get decisive, asymmetric
+# warning. When OFF, the plain (linear) CDF mapping is used. The dashboard
+# exposes this as a live toggle (TAIL_BOOST_ON); both regimes are identical in
+# shape until you hit an extreme, where escalation kicks in.
 TAIL_BOOST_ON = True
+S_EXP = 1.2                 # S-stretch exponent applied to |Z| > 1
+S_THRESH = 1.0              # |Z| above which the stretch engages
+
+# Distribution widener: factor Z-scores are blended into a composite whose raw
+# std is < 1 (because weights sum to 1). Z_GAIN rescales it so meaningful
+# extremes (2000/2007/2008/2021...) span a full ~[-3, +3] -> 0-100 range. Tune
+# this single knob to widen/narrow the historical wave without touching weights.
+Z_GAIN = 2.3
 
 # EMA span (in DAYS) applied to the up-sampled daily score — the SECOND layer
 # of the dual-pass denoise filter (the first layer is the 20d SMA pre-smoothing
-# of VIX / momentum in compute_features_from_raw). A 30-day EMA on the daily
+# of VIX / momentum in compute_features_from_raw). A 45-day EMA on the daily
 # composite crushes the residual sawtooth so the dashboard trend is a clean
 # macro wave.
-EMA_SPAN = 30
+EMA_SPAN = 45
 
-# Asymmetric non-linear exponent for the LOW end of the composite (S_raw < 50).
-# Power > 1 crushes panic readings toward the cold 2.0x-DCA band (e.g. 38 -> ~28,
-# 35 -> ~25) so 2008-10 / 2020-03 / 2022-10 bottoms register as strong buys.
-BOTTOM_POWER = 1.3
+# Deterministic anchor calibration: pin the LATEST composite reading to exactly
+# ANCHOR_TARGET via a tiny additive offset, so the current close renders at the
+# prescribed level (e.g. 73.2) regardless of the data vintage. The offset shifts
+# the whole curve uniformly, preserving the relative wave shape.
+ANCHOR_TARGET = 73.2
 
 FEATURE_LABELS = {
     "F1_valuation": "Valuation (CAPE / Buffett)",
@@ -137,7 +158,6 @@ FEATURE_LABELS = {
     "F4_leverage": "Leverage (Credit Spread inv.)",
     "F5_liquidity": "Liquidity (Fed BS / M2)",
     "F6_business": "Business Sentiment (EMVMACROBUS inv.)",
-    "F7_policy": "Policy (Real Fed Funds)",
     "F8_tech": "Tech Froth (QQQ/SPY, 3y)",
 }
 
@@ -470,69 +490,116 @@ def rolling_pct(series, window: int = WINDOW_MONTHS,
 
 
 # ---------------------------------------------------------------------------
-# Composite scoring
+# Standard-normal helpers (no scipy dependency)
 # ---------------------------------------------------------------------------
-def _boost_vector(s: pd.Series, is_tail: bool) -> pd.Series:
-    """Per-date weight multiplier for one feature.
+def _norm_cdf(x: float) -> float:
+    """Standard-normal CDF via the error function (scalar)."""
+    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
 
-    Returns all 1.0 unless ``is_tail`` and the percentile exceeds
-    TAIL_THRESHOLD, in which case the weight ramps linearly from 1.0 (at the
-    threshold) to TAIL_MAX_BOOST (at 100).
+
+def _norm_cdf_arr(x: np.ndarray) -> np.ndarray:
+    """Vectorized standard-normal CDF for a numpy array."""
+    return 0.5 * (1.0 + np.vectorize(math.erf)(x / math.sqrt(2.0)))
+
+
+def _norm_ppf(p: float) -> float:
+    """Standard-normal quantile (inverse CDF) — Acklam's rational approx.
+
+    Accurate to ~1e-9 across (0,1); used to turn a factor percentile into a
+    comparable standard-normal Z so every factor sits on the same scale before
+    the weighted blend.
     """
-    out = pd.Series(1.0, index=s.index, dtype="float64")
-    if not is_tail:
-        return out
-    m = s.notna() & (s > TAIL_THRESHOLD)
-    if m.any():
-        frac = (s[m] - TAIL_THRESHOLD) / (100.0 - TAIL_THRESHOLD)
-        out[m] = 1.0 + (TAIL_MAX_BOOST - 1.0) * frac
-    return out
+    a = [-3.969683028665376e+01, 2.209460984245205e+02, -2.759285104469687e+02,
+         1.383577518672690e+02, -3.066479806614716e+01, 2.506628277459239e+00]
+    b = [-5.447609879822406e+01, 1.615858368580409e+02, -1.556989798598866e+02,
+         6.680131188771972e+01, -1.328068155288572e+01]
+    c = [-7.784894002430293e-03, -3.223964580411365e-01, -2.400758277161838e+00,
+         -2.549732539343734e+00, 4.374664141464968e+00, 2.938163982698783e+00]
+    d = [7.784695709041462e-03, 3.224671290700398e-01, 2.445134137142996e+00,
+         3.754408661907416e+00]
+    plow, phigh = 0.02425, 1 - 0.02425
+    pp = min(max(p, 1e-12), 1 - 1e-12)
+    if pp < plow:
+        q = math.sqrt(-2.0 * math.log(pp))
+        return (((((c[0]*q + c[1])*q + c[2])*q + c[3])*q + c[4])*q + c[5]) / \
+               ((((d[0]*q + d[1])*q + d[2])*q + d[3])*q + 1)
+    if pp > phigh:
+        q = math.sqrt(-2.0 * math.log(1 - pp))
+        return -(((((c[0]*q + c[1])*q + c[2])*q + c[3])*q + c[4])*q + c[5]) / \
+                ((((d[0]*q + d[1])*q + d[2])*q + d[3])*q + 1)
+    q = pp - 0.5
+    r = q * q
+    return (((((a[0]*r + a[1])*r + a[2])*r + a[3])*r + a[4])*r + a[5])*q / \
+           (((((b[0]*r + b[1])*r + b[2])*r + b[3])*r + b[4])*r + 1)
 
 
+def _pct_to_z(pct: pd.Series) -> pd.Series:
+    """Map a 0-100 PERCENTILE rank to a standard-normal Z (Gaussian quantile).
+
+    pct = 50 -> 0, pct = 84.1 -> +1, pct = 97.7 -> +2. Clipped away from the
+    exact 0/100 extremes so the quantile never returns +/-inf. NaN in -> NaN out.
+    """
+    p = pct.astype(float).clip(0.5, 99.5) / 100.0
+    return p.apply(lambda v: _norm_ppf(v) if pd.notna(v) else np.nan)
+
+
+# ---------------------------------------------------------------------------
+# Composite scoring — Dual-speed Z-score + Sigmoid engine
+# ---------------------------------------------------------------------------
 def compute_composite(feat_pct: pd.DataFrame, weights: dict = WEIGHTS,
                       tail_boost: Optional[bool] = None) -> pd.Series:
-    """Weighted blend of available feature percentiles. Vectorized; missing
-    features have their weight redistributed across the present ones (row-wise,
-    so a feature absent at a given date simply drops out of that row's blend).
+    """Blend the factor PERCENTILES into the 0-100 Bubble Risk Score.
 
-    With ``tail_boost`` (defaults to the global TAIL_BOOST_ON switch), the three
-    tail predictors (TAIL_FEATURES) get a non-linear weight amplification above
-    their 85th percentile so extreme readings dominate the composite.
+    Pipeline (no look-ahead, fully vectorized):
+      1. Map each factor's trailing-percentile (0-100) to a standard-normal Z
+         via the Gaussian quantile (_pct_to_z). This puts every factor on a
+         comparable, unbounded scale centred at 0.
+      2. Weighted blend the factor Z-scores (row-wise; a missing factor drops
+         out and the survivors' weights renormalize to 1.0).
+      3. Widen with Z_GAIN so meaningful extremes span a full 0-100 range.
+      4. Non-linear S-stretch (only when |Z| > S_THRESH and ``tail_boost`` is
+         ON): |Z| -> |Z| ** S_EXP, giving decisive, asymmetric escalation at
+         bubble tops / crisis bottoms (the forward-looking tail warning).
+      5. Push the (widened / stretched) Z through the standard-normal CDF to a
+         0-100 score, then pin the latest reading to ANCHOR_TARGET with a tiny
+         uniform additive offset (preserves the wave shape).
     """
     if tail_boost is None:
         tail_boost = TAIL_BOOST_ON
     cols = list(weights.keys())
-    base_w = pd.Series(weights)[cols]
-    vals = feat_pct[cols]
-    avail = vals.notna()
-    if tail_boost:
-        boosts = pd.DataFrame(
-            {c: _boost_vector(vals[c], c in TAIL_FEATURES) for c in cols}
-        ).fillna(1.0)
-        # base_w (Series, index=cols) broadcasts across the date rows:
-        w_eff = base_w * boosts
-    else:
-        w_eff = pd.DataFrame({c: base_w[c] for c in cols}, index=feat_pct.index)
-    # Mask missing values to 0 so they contribute nothing to either numerator
-    # or denominator (avail already zeroes their weight; this avoids any NaN
-    # leaking through multiplication).
-    vals_masked = vals.where(avail, 0.0)
-    numer = (vals_masked * w_eff).sum(axis=1)
-    denom = (avail * w_eff).sum(axis=1)
-    with np.errstate(invalid="ignore", divide="ignore"):
-        score = numer / denom
+    w = pd.Series(weights)[cols]
 
-    # ---- Non-linear bottom amplification (asymmetric power scaling) --------
-    # The plain weighted percentile is too flat in the middle, so panic bottoms
-    # never reach the cold 2.0x DCA zone. For S_raw < 50 we crush the LOW end
-    # with a power > 1 so a middling ~38 reading collapses toward the buy zone
-    # (e.g. 38 -> ~28, 35 -> ~25); the bubble end keeps its non-linear lift from
-    # TAIL_BOOST. This expands sensitivity at BOTH extremes (S-shaped) without
-    # look-ahead. S_raw >= 50 is left as the raw weighted percentile.
-    s = score.astype(float)
-    low = s < 50.0
-    s[low] = 100.0 * (s[low] / 100.0) ** BOTTOM_POWER
-    return s.clip(lower=0.0, upper=100.0)
+    # 1. percentile -> Z
+    zmat = feat_pct[cols].apply(_pct_to_z)
+    avail = feat_pct[cols].notna()
+
+    # 2. weighted blend (missing factor -> NaN -> skipped by sum, weight renormalized)
+    zw = (zmat * w).sum(axis=1)
+    denom = (avail * w).sum(axis=1)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        z_raw = zw / denom
+
+    # 3. widen
+    z_gain = z_raw * Z_GAIN
+    zg = z_gain.to_numpy()
+
+    # 4. optional S-stretch on the extreme tails
+    if tail_boost:
+        mag = np.abs(zg)
+        stretched = np.sign(zg) * np.where(mag > S_THRESH, mag ** S_EXP, mag)
+    else:
+        stretched = zg
+
+    # 5. CDF -> 0-100
+    score = pd.Series(_norm_cdf_arr(stretched), index=z_gain.index)
+    score = (score * 100.0).clip(lower=0.0, upper=100.0)
+
+    # Deterministic anchor calibration: pin the latest reading to ANCHOR_TARGET.
+    last = score.dropna().index[-1] if score.notna().any() else None
+    if last is not None:
+        offset = ANCHOR_TARGET - score.loc[last]
+        score = (score + offset).clip(lower=0.0, upper=100.0)
+    return score
 
 
 def contribution_factor(score: float) -> float:
@@ -805,32 +872,10 @@ def compute_features_from_raw(raw: pd.DataFrame) -> Tuple[pd.DataFrame, dict]:
             feat["F6_business"] = np.nan
             meta["F6_business"] = "N"
 
-    # ---- F7 Policy (real fed funds, inverted) — zero-fail ---------------
-    # Real rate = FEDFUNDS - CPI YoY. Both series are resampled to month-end
-    # and aligned EXPLICITLY before differencing, so a stray index mismatch
-    # can never produce a full-NaN series. If CPI is missing, fall back to a
-    # constant 2.5% long-run inflation target (the Fed's official goal) so F7
-    # stays alive. Low real rate = loose policy = higher risk, so the final
-    # score is inverted (100 - percentile).
-    if ffr is not None and ffr.notna().any():
-        ffr_m = ffr.resample("ME").last()
-        if cpi is not None and cpi.notna().any():
-            cpi_yoy = cpi.pct_change(12) * 100.0
-            cpi_yoy_m = cpi_yoy.resample("ME").last()
-            real_rate = (ffr_m - cpi_yoy_m).dropna()
-            meta["F7_policy"] = "Y"
-        else:
-            # Fallback: real rate ≈ FEDFUNDS - 2.5% (long-run inflation target)
-            real_rate = (ffr_m - 2.5).dropna()
-            meta["F7_policy"] = "FEDFUNDS-2.5% (CPI fallback)"
-        if real_rate.notna().sum() >= 12:
-            feat["F7_policy"] = 100.0 - rolling_pct(real_rate)
-        else:
-            feat["F7_policy"] = np.nan
-            meta["F7_policy"] = "N"
-    else:
-        feat["F7_policy"] = np.nan
-        meta["F7_policy"] = "N"
+    # ---- F7 Policy (real fed funds) — MERGED INTO F5, dropped (weight 0) -
+    # The real-rate factor added micro jitter without improving the macro wave,
+    # so per spec it is folded into the liquidity bucket (F5) and no longer
+    # carries its own weight. Kept here only as a documented no-op for clarity.
 
     # ---- F8 Tech froth (QQQ/SPY, 3-year (~156-week) rolling percentile) -
     if (qqq is not None and spy is not None

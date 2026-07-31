@@ -217,8 +217,12 @@ def feature_cards(features: dict):
     st.markdown(f'<div class="feat-grid">{cells}</div>', unsafe_allow_html=True)
 
 
-def history_fig(scores: pd.Series, spx, ndx, log_scale: bool = True) -> go.Figure:
-    START = pd.Timestamp("2000-01-01")
+def history_fig(scores: pd.Series, spx, ndx, log_scale: bool = True,
+                view: str = "all") -> go.Figure:
+    if view == "3y":
+        START = pd.Timestamp("2023-07-31")
+    else:
+        START = pd.Timestamp("2000-01-01")
     ytype = "log" if log_scale else "linear"
 
     # --- strict alignment: crop to >=START, then intersect the two prices so
@@ -286,6 +290,10 @@ def history_fig(scores: pd.Series, spx, ndx, log_scale: bool = True) -> go.Figur
                       margin={"t": 50, "b": 30, "l": 62, "r": 62},
                       legend=dict(orientation="h", y=1.05, x=0),
                       plot_bgcolor="white", paper_bgcolor="white")
+    if view == "3y":
+        # Clean presentation window: lock the score axis to 0-100 so the near-3y
+        # wave reads as a crisp macro oscillator (matches the reference chart).
+        fig.update_yaxes(range=[0, 100], row=2, col=1)
     return fig
 
 
@@ -313,9 +321,10 @@ def backtest_panel(scores: pd.Series, params: dict):
 
 def main():
     st.title("📈 US Equity Bubble Risk — Dalio-style Monitor")
-    st.caption("8-feature percentile model · rolling 20-year window · "
-               "dual-pass smoothing (20d SMA + 30d EMA) · "
-               "free/open data (FRED incl. EMVMACROBUS, yfinance/Stooq)")
+    st.caption("Dual-speed Z-score + Sigmoid macro model · 7 factors (70% slow "
+               "macro anchors + 30% fast sentiment/momentum) · dual-pass "
+               "smoothing (20d SMA + 45d EMA) · free/open data (FRED incl. "
+               "EMVMACROBUS, yfinance/Stooq)")
 
     # ---- Sidebar: refresh controls ---------------------------------------
     refresh = st.sidebar.checkbox("Force refresh live data", value=False)
@@ -376,10 +385,18 @@ def main():
 
     # ---- History (dual-axis, linked zoom) --------------------------------
     st.subheader("Historical Trend")
+    view = st.radio(
+        "Historical view",
+        options=["all", "3y"],
+        format_func=lambda v: ("All (2000 - Present)"
+                               if v == "all" else "3-Year Trend (近3年历史走势)"),
+        horizontal=True,
+        help="All = full 2000-present macro cycle; 3-Year = zoomed 2023-07-31 → "
+             "today window with a fixed 0-100 score axis.")
     daily = load_daily_scores(refresh=False, tail_boost=tail_boost)
     spx, ndx = load_prices()
     st.plotly_chart(history_fig(daily if not daily.empty else scores, spx, ndx,
-                                log_scale=log_scale),
+                                log_scale=log_scale, view=view),
                     use_container_width=True)
 
     # ---- Strategy backtest (interactive) --------------------------------
