@@ -724,7 +724,7 @@ def get_monthly_scores(refresh: bool = False) -> Tuple[pd.Series, dict]:
     synth = _synthetic_scores()
     meta = {"source": "synthetic",
             "features": fmeta,
-            "available_count": len(available),
+            "available_count": available_count,
             "note": "Live APIs unavailable; showing deterministic synthetic series."}
     return synth, meta
 
