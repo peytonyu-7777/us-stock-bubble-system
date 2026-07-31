@@ -126,6 +126,7 @@ RAW_SPECS = {
     "emv":      ("fred", "EMVMACROBUS"),
     "cpi":      ("fred", "CPIAUCSL"),
     "ffr":      ("fred", "FEDFUNDS"),
+    "sp500div": ("fred", "SP500DIV"),   # tertiary F1 valuation fallback
     "spx":      ("price", "^GSPC"),
     "spy":      ("price", "SPY"),
     "qqq":      ("price", "QQQ"),
@@ -521,11 +522,36 @@ def compute_features_from_raw(raw: pd.DataFrame) -> Tuple[pd.DataFrame, dict]:
         parts.append(rolling_pct(cape))
     if (wilshire is not None and gdp is not None
             and wilshire.notna().any() and gdp.notna().any()):
-        buffett = (wilshire / gdp) * 1000.0   # scale-invariant ratio
-        parts.append(rolling_pct(buffett))
-    feat["F1_valuation"] = np.mean(parts, axis=0) if parts else np.nan
-    meta["F1_valuation"] = (f"CAPE={'Y' if cape is not None and cape.notna().any() else 'N'} "
-                            f"Buffett={'Y' if wilshire is not None and gdp is not None and wilshire.notna().any() and gdp.notna().any() else 'N'}")
+        # GDP is QUARTERLY; FRED returns it only at Mar/Jun/Sep/Dec. A naive
+        # monthly division (wilshire / gdp) leaves 8 of 12 months as NaN, and
+        # np.mean([cape, buffett]) then becomes NaN at the latest date ->
+        # F1 shows as Pending. Fix: promote GDP to a DAILY skeleton (.last()),
+        # then forward-fill across days (.ffill()) so the quarter figure is
+        # carried to every day, and collapse back to month-end. Every month
+        # now carries the current quarter's GDP — cross-frequency NaN gone.
+        # (Note: resample("D").ffill() alone fills WITHIN each day group and
+        #  would NOT carry the value forward — the .last() step is required.)
+        gdp_daily = gdp.resample("D").last().ffill()
+        gdp_m = gdp_daily.resample("ME").last()
+        buffett = (wilshire / gdp_m) * 1000.0   # scale-invariant ratio
+        parts.append(rolling_pct(buffett.dropna()))
+    if parts:
+        # nanmean: a missing sub-component must NOT poison the others.
+        feat["F1_valuation"] = np.nanmean(parts, axis=0)
+        meta["F1_valuation"] = (
+            f"CAPE={'Y' if cape is not None and cape.notna().any() else 'N'} "
+            f"Buffett={'Y' if len(parts) > 1 else 'N'}")
+    else:
+        # Tertiary valuation proxy only if BOTH CAPE and Buffett are missing:
+        # inverse of the S&P 500 dividend yield (a low yield = expensive
+        # market = higher risk -> inverted percentile).
+        sp500div = g("sp500div")
+        if sp500div is not None and sp500div.notna().sum() >= 12:
+            feat["F1_valuation"] = 100.0 - rolling_pct(sp500div)
+            meta["F1_valuation"] = "SP500DIV inverse (valuation fallback)"
+        else:
+            feat["F1_valuation"] = np.nan
+            meta["F1_valuation"] = "N"
 
     # ---- F2 Momentum (6m annualized S&P return) --------------------------
     if spx is not None and spx.notna().any():
@@ -561,7 +587,7 @@ def compute_features_from_raw(raw: pd.DataFrame) -> Tuple[pd.DataFrame, dict]:
         parts.append(rolling_pct(m2.pct_change(12) * 100.0))
     if walcl is not None and walcl.notna().any():
         parts.append(rolling_pct(walcl.pct_change(12) * 100.0))
-    feat["F5_liquidity"] = np.mean(parts, axis=0) if parts else np.nan
+    feat["F5_liquidity"] = np.nanmean(parts, axis=0) if parts else np.nan
     meta["F5_liquidity"] = (f"M2={'Y' if m2 is not None and m2.notna().any() else 'N'} "
                             f"FedBS={'Y' if walcl is not None and walcl.notna().any() else 'N'}")
 
@@ -583,10 +609,17 @@ def compute_features_from_raw(raw: pd.DataFrame) -> Tuple[pd.DataFrame, dict]:
             meta["F6_business"] = "N"
 
     # ---- F7 Policy (real fed funds, inverted) ----------------------------
+    # Real rate = FEDFUNDS - CPI YoY. Both series are resampled to month-end
+    # and aligned EXPLICITLY before differencing, so a stray index mismatch
+    # can never produce a full-NaN series. Low real rate = loose policy =
+    # higher risk, so the final score is inverted (100 - percentile).
     if (ffr is not None and cpi is not None
             and ffr.notna().any() and cpi.notna().any()):
-        real_ffr = ffr - cpi.pct_change(12) * 100.0
-        feat["F7_policy"] = 100.0 - rolling_pct(real_ffr)
+        cpi_yoy = cpi.pct_change(12) * 100.0
+        ffr_m = ffr.resample("ME").last()
+        cpi_yoy_m = cpi_yoy.resample("ME").last()
+        real_rate = (ffr_m - cpi_yoy_m).dropna()
+        feat["F7_policy"] = 100.0 - rolling_pct(real_rate)
         meta["F7_policy"] = "Y"
     else:
         feat["F7_policy"] = np.nan

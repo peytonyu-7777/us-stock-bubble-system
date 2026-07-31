@@ -134,8 +134,13 @@ def history_fig(scores: pd.Series, spx, ndx) -> go.Figure:
                                  line={"color": "steelblue"}),
                       row=1, col=1)
     if ndx is not None:
+        # NOTE: `yaxis` is a TOP-LEVEL trace property, not a property of
+        # `line`. Nesting it inside `line={...}` raises
+        #   "Invalid property specified for ... scatter.Line: 'yaxis'".
+        # S&P 500 and Nasdaq share the row-1 log axis, so no secondary axis
+        # is required — we simply keep `yaxis="y"` (the default) at top level.
         fig.add_trace(go.Scatter(x=ndx.index, y=ndx.values, name="Nasdaq",
-                                 line={"color": "purple", "yaxis": "y"}),
+                                 yaxis="y", line={"color": "purple"}),
                       row=1, col=1)
     fig.update_yaxes(type="log", row=1, col=1)
 
