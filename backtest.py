@@ -208,13 +208,25 @@ def main(refresh: bool = False, freq: str = "W", params: dict = None) -> dict:
 
     # Forward-fill the MONTHLY score onto the rebalance calendar so every
     # week (or month) is scored by the most recent month-end reading.
-    idx = spy.index
-    scores_ff = scores.reindex(idx, method="ffill")
+    scores_ff = scores.reindex(spy.index, method="ffill")
 
-    common = idx[idx >= pd.Timestamp(LIVE_START)].sort_values()
-    dates = list(common)
-    if not dates:
-        raise RuntimeError("No overlapping periods between prices and scores.")
+    # --- Problem-1 fix: strict inner-join alignment across prices & scores,
+    #     NaN-dropped, with a safe fallback (no raise -> no unpacking crash). ---
+    aligned = pd.concat(
+        [spy.rename("spy"), scores_ff.rename("score")], axis=1, join="inner"
+    ).dropna()
+    aligned = aligned[aligned.index >= pd.Timestamp(LIVE_START)]
+    dates = list(aligned.index.sort_values())
+    if len(dates) < 12:
+        print("BACKTEST: insufficient overlapping price/score data "
+              f"(got {len(dates)} periods); skipping report.")
+        return {"benchmark": {}, "strategy": {}, "tops": {},
+                "bench_equity": pd.Series(dtype=float),
+                "strat_equity": pd.Series(dtype=float),
+                "scores": scores.reindex(dates), "freq": period_label}
+
+    spy = aligned["spy"]
+    scores_ff = aligned["score"]
 
     shy_ret = shy.pct_change().fillna(0.0)
 

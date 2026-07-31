@@ -402,8 +402,18 @@ def _boost_vector(s: pd.Series, is_tail: bool) -> pd.Series:
     return out
 
 
+def _extract_vix(df: pd.DataFrame) -> Optional[pd.Series]:
+    """Best available VIX level (price ^VIX, else FRED VIXCLS) for the
+    capitulation multiplier in compute_composite."""
+    for key in ("vix", "vixcls"):
+        if key in df.columns and df[key].notna().any():
+            return df[key]
+    return None
+
+
 def compute_composite(feat_pct: pd.DataFrame, weights: dict = WEIGHTS,
-                      tail_boost: Optional[bool] = None) -> pd.Series:
+                      tail_boost: Optional[bool] = None,
+                      vix_level: Optional[pd.Series] = None) -> pd.Series:
     """Weighted blend of available feature percentiles. Vectorized; missing
     features have their weight redistributed across the present ones (row-wise,
     so a feature absent at a given date simply drops out of that row's blend).
@@ -434,7 +444,33 @@ def compute_composite(feat_pct: pd.DataFrame, weights: dict = WEIGHTS,
     denom = (avail * w_eff).sum(axis=1)
     with np.errstate(invalid="ignore", divide="ignore"):
         score = numer / denom
-    return score
+
+    # ---- Problem-3: non-linear S-curve (asymmetric power scaling) ----------
+    # The plain weighted percentile is too flat in the middle, so panic bottoms
+    # never reach the cold 2.0x DCA zone. We crush the LOW end (S_raw < 50) with
+    # a power > 1 so a middling ~38 reading collapses toward the buy zone, while
+    # the bubble end keeps its non-linear lift from TAIL_BOOST. This expands
+    # sensitivity at BOTH extremes (an S-shaped response) without look-ahead.
+    s = score.astype(float)
+    low = s < 50.0
+    s[low] = 100.0 * (s[low] / 100.0) ** 1.35
+    # (S_raw >= 50 is left as the raw weighted percentile — asymmetric by design.)
+
+    # ---- Problem-3: short-term capitulation multiplier ----------------------
+    # At a true market bottom (2008-10, 2020-03, 2022-10) we want the score to
+    # instantly plunge into 0-40. When ^VIX spikes > 35 (extreme fear) OR the
+    # 6-month momentum percentile drops below 10%, apply a "bottom penalty" of
+    # 10-15 pts so the score slams into the cold DCA band.
+    cap = pd.Series(0.0, index=s.index)
+    if vix_level is not None:
+        vix_s = pd.Series(vix_level).reindex(s.index)
+        cap = cap + np.where(vix_s > 35.0, 10.0, 0.0)
+    mom_pct = feat_pct.get("F2_momentum")
+    if mom_pct is not None:
+        cap = cap + np.where(mom_pct.fillna(200.0) < 10.0, 5.0, 0.0)
+    cap = cap.clip(upper=15.0)
+    s = (s - cap).clip(lower=0.0, upper=100.0)
+    return s
 
 
 def contribution_factor(score: float) -> float:
@@ -790,8 +826,10 @@ def get_monthly_scores(refresh: bool = False,
             feat.columns = [c[5:] for c in feat.columns]
             # Always recompute the composite from the stored features using the
             # CURRENT tail_boost setting, so toggling the switch takes effect
-            # immediately on cached data (no refetch needed).
-            score = compute_composite(feat, tail_boost=tail_boost).dropna()
+            # immediately on cached data (no refetch needed). The VIX level is
+            # pulled from the cached raw columns for the capitulation multiplier.
+            score = compute_composite(feat, tail_boost=tail_boost,
+                                      vix_level=_extract_vix(cached)).dropna()
             meta = json.load(open(META_PATH))
             meta["source"] = "cache"
             latest = score.index[-1] if not score.empty else None
@@ -805,7 +843,8 @@ def get_monthly_scores(refresh: bool = False,
     incremental = os.path.exists(CACHE_PATH)
     raw, fmeta = fetch_all_raw(incremental=incremental)
     feat, fmeta_feat = compute_features_from_raw(raw)
-    score = compute_composite(feat, tail_boost=tail_boost).dropna()
+    score = compute_composite(feat, tail_boost=tail_boost,
+                              vix_level=_extract_vix(raw)).dropna()
 
     # ---- Live-feature accounting (features valid at the latest date) ------
     latest = score.index[-1] if not score.empty else None
@@ -903,7 +942,8 @@ def get_latest_state(refresh: bool = False,
             if fcols:
                 feat = cached[fcols].copy()
                 feat.columns = [c[5:] for c in feat.columns]
-                score_series = compute_composite(feat, tail_boost=tail_boost)
+                score_series = compute_composite(
+                    feat, tail_boost=tail_boost, vix_level=_extract_vix(cached))
                 meta = {}
                 if os.path.exists(META_PATH):
                     try:

@@ -84,12 +84,12 @@ st.markdown("""
 REF_2000 = 83.2   # historical reference points (approx, per Dalio-style framing)
 REF_2021 = 92.1
 
-BANDS = [  # (lo, hi, color, label)
-    (0, 40, "forestgreen", "Low / Cooling"),
-    (40, 60, "gold", "Normal"),
-    (60, 80, "darkorange", "Watch"),
-    (80, 90, "crimson", "Elevated"),
-    (90, 100, "darkred", "Bubble Warning"),
+BANDS = [  # (lo, hi, color, label) — clean, strictly non-overlapping palette
+    (0, 40, "#10b981", "Low / Cooling"),
+    (40, 60, "#3b82f6", "Normal"),
+    (60, 80, "#f59e0b", "Watch"),
+    (80, 90, "#ef4444", "Elevated"),
+    (90, 100, "#991b1b", "Bubble Warning"),
 ]
 
 
@@ -135,18 +135,21 @@ def status_action(score: float):
 
 
 def gauge_fig(score: float) -> go.Figure:
+    # Strictly non-overlapping step bands (no colour bleed / fat orange seam).
     steps = [{"range": [lo, hi], "color": c} for lo, hi, c, _ in BANDS]
     fig = go.Figure(go.Indicator(
         mode="gauge+number+delta",
         value=score if not pd.isna(score) else 0,
         number={"font": {"size": 54}, "suffix": " / 100"},
-        delta={"reference": REF_2021, "increasing": {"color": "crimson"},
-               "decreasing": {"color": "forestgreen"}},
+        delta={"reference": REF_2021, "increasing": {"color": "#ef4444"},
+               "decreasing": {"color": "#10b981"}},
         gauge={
             "axis": {"range": [0, 100], "tickwidth": 1, "tickcolor": "#94a3b8"},
-            "bar": {"color": band_color(score), "thickness": 0.28},
+            # Refined dark thin needle (was a thick bar that overlapped the step
+            # colour blocks and painted a fat orange line across the arc).
+            "bar": {"color": "#1e293b", "thickness": 0.15},
             "steps": steps,
-            "threshold": {"line": {"color": "black", "width": 3}, "value": score},
+            # No `threshold` overlay -> the half-gauge stays clean & premium.
         },
         title={"text": "US Equity Bubble Risk Score", "font": {"size": 18}},
     ))
@@ -299,6 +302,17 @@ def _sharpe(returns):
     return float(arr.mean() / sd * np.sqrt(12))
 
 
+def _safe_returns(ret_b, ret_s):
+    """子计算函数：显式返回二元元组 (ret_b, ret_s)。
+
+    即使没有数据也返回 ([], [])，绝不返回空元组，避免调用方解包时
+    `ValueError: not enough values to unpack (expected 2, got 0)`。
+    """
+    rb = list(ret_b) if ret_b is not None else []
+    rs = list(ret_s) if ret_s is not None else []
+    return rb, rs
+
+
 def run_backtest(scores: pd.Series, params: dict) -> Optional[dict]:
     """Monthly-DCA backtest, 2000 -> present, with user-tunable parameters.
 
@@ -316,13 +330,20 @@ def run_backtest(scores: pd.Series, params: dict) -> Optional[dict]:
     spy = load_spy()
     if spy is None or scores is None:
         return None
+
+    # --- Problem-1 fix: strict inner-join alignment + NaN drop, with a safe
+    #     fallback so the panel never hits an empty-series / unpacking crash. ---
     s = scores.dropna()
-    idx = spy.index.intersection(s.index)
-    idx = idx[idx >= pd.Timestamp("2000-01-01")]
-    if len(idx) < 24:
+    aligned = pd.concat(
+        [spy.rename("spy"), s.rename("score")], axis=1, join="inner"
+    ).dropna()
+    if aligned.empty or len(aligned) < 12:
+        # Not enough overlapping, clean data -> let the panel show a friendly
+        # warning instead of raising on an empty series.
         return None
-    spy = spy.loc[idx]
-    s = s.loc[idx]
+    spy = aligned["spy"]
+    s = aligned["score"]
+    idx = aligned.index
 
     base = float(params["base_monthly"])
     low_mult = float(params["low_mult"])
@@ -402,6 +423,10 @@ def run_backtest(scores: pd.Series, params: dict) -> Optional[dict]:
         val_s.append(port_val)
         prev_p = p
         prev_total_s = port_val
+
+    # --- Problem-1: sub-computation returns as an explicit, crash-proof
+    #     binary tuple; empty input yields ([], []). ---
+    ret_b, ret_s = _safe_returns(ret_b, ret_s)
 
     bench = pd.Series(val_b, index=idx)
     strat = pd.Series(val_s, index=idx)
