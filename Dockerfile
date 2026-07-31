@@ -11,6 +11,14 @@ RUN pip install --no-cache-dir -r requirements.txt
 # App code
 COPY . .
 
+# Render passes FRED_API_KEY as a *build* env var. Docker does NOT auto-expose
+# env vars at build time — we must declare it as ARG then promote it to ENV so
+# the RUN steps below can see it. Without this, the build-time pre-fetch never
+# receives the key, so EMVMACROBUS (F6) and the other FRED features are NOT
+# baked into the image (they would silently fall back to AAII/runtime fetch).
+ARG FRED_API_KEY
+ENV FRED_API_KEY=$FRED_API_KEY
+
 # Pre-fetch & bake data caches into the image so the FIRST request is instant
 # and free-tier health checks don't time out on a slow live data pull.
 # Network at build is best-effort: if it fails we just fall back to a runtime
