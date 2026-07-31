@@ -37,16 +37,18 @@ ZERO-CRASH NORMALIZATION
 ------------------------------------------------------------------------------
 FEATURE MAP  (weight in composite)
 ------------------------------------------------------------------------------
-F1  Valuation      (0.20)  CAPE (Shiller PE) + Buffett Indicator (Wilshire/GDP)  [High = Risk]
-F2  Momentum       (0.10)  S&P 500 6-month annualized return                     [High = Risk]
-F3  Market Vol     (0.10)  VIX (INVERTED: low VIX = complacency = High Risk)
-F4  Leverage       (0.15)  Credit Spread (BAA10Y, INVERTED: low spread = High Risk)
-F5  Liquidity      (0.10)  Fed balance-sheet YoY (WALCL)  [+ M2 YoY secondary]   [High = Risk]
+F1  Valuation      (0.25)  CAPE (Shiller PE) + Buffett Indicator (Wilshire/GDP)  [High = Risk]
+F2  Momentum       (0.10)  S&P 500 6m ann. return, 20-day SMA pre-smoothed        [High = Risk]
+F3  Market Vol     (0.05)  VIX, 20-day SMA pre-smoothed, INVERTED                 [Low = Risk]
+F4  Leverage       (0.20)  Credit Spread (BAA10Y, INVERTED: low spread = High Risk)
+F5  Liquidity      (0.05)  Fed balance-sheet YoY (WALCL)  [+ M2 YoY secondary]   [High = Risk]
 F6  Business Sent. (0.15)  FRED EMVMACROBUS (INVERTED: low index = High Risk)     [AAII fallback]
 F7  Policy Stance  (0.05)  Real Fed Funds (FEDFUNDS - CPI YoY, INVERTED)
 F8  Tech Froth     (0.15)  QQQ / SPY ratio, 3-year (~156-week) rolling percentile [High = Risk]
 
-Weights sum to 1.00.
+Weights sum to 1.00.  Dual-pass denoise: (1) 20-day SMA on VIX/momentum before
+their percentiles; (2) 30-day EMA on the composite. Non-linear bottom boost
+(S_raw<50 -> **BOTTOM_POWER) sharpens panic troughs toward the 2.0x-DCA band.
 """
 
 from __future__ import annotations
@@ -77,6 +79,7 @@ warnings.filterwarnings("ignore")
 FRED_API_KEY = os.getenv("FRED_API_KEY", "")  # optional; api endpoint needs it
 CACHE_PATH = os.getenv("BUBBLE_CACHE", "bubble_cache.parquet")
 META_PATH = os.getenv("BUBBLE_META", "bubble_cache_meta.json")
+HF_DAILY_PATH = os.getenv("HF_DAILY_CACHE", "hf_daily.parquet")
 
 WINDOW_MONTHS = 240       # 20 years for the "trailing percentile" window
 WINDOW_TECH_MONTHS = 36   # 3-year (~156-week) window for the tech-froth feature (F8)
@@ -86,16 +89,18 @@ FETCH_TIMEOUT = 5         # hard per-request timeout (seconds)
 FETCH_DEADLINE = 9        # total wall-clock deadline for the whole batch
 INCREMENTAL_DAYS = 30     # on refresh: only re-fetch the last ~30 days
 
-# Composite weights (must sum to 1.0)
+# Composite weights (must sum to 1.0) —— tilted toward low-noise, structural
+# anchors (valuation, credit, business sentiment, tech froth) so the score
+# reads as a smooth macro cycle rather than high-frequency noise.
 WEIGHTS = {
-    "F1_valuation": 0.20,
-    "F2_momentum": 0.10,
-    "F3_sentiment": 0.10,
-    "F4_leverage": 0.15,
-    "F5_liquidity": 0.10,
-    "F6_business": 0.15,
-    "F7_policy": 0.05,
-    "F8_tech": 0.15,
+    "F1_valuation": 0.25,   # structural valuation anchor (CAPE / Buffett)
+    "F2_momentum": 0.10,    # 6m momentum (20d-SMA pre-smoothed)
+    "F3_sentiment": 0.05,   # VIX (20d-SMA pre-smoothed, low weight)
+    "F4_leverage": 0.20,    # credit spread (BAA10Y, inverted)
+    "F5_liquidity": 0.05,   # Fed balance sheet YoY
+    "F6_business": 0.15,    # EMVMACROBUS (inverted)
+    "F7_policy": 0.05,      # real Fed funds (inverted)
+    "F8_tech": 0.15,        # QQQ/SPY 3y rolling percentile
 }
 
 # Non-linear tail-risk escalation: F1 (valuation), F4 (credit spread) and F8
@@ -113,9 +118,17 @@ TAIL_MAX_BOOST = 1.5
 # this as a live toggle so the two regimes can be compared without code edits.
 TAIL_BOOST_ON = True
 
-# EMA span (in DAYS) applied to the up-sampled daily score for a smooth,
-# noise-free trend line on the dashboard chart.
-EMA_SPAN = 10
+# EMA span (in DAYS) applied to the up-sampled daily score — the SECOND layer
+# of the dual-pass denoise filter (the first layer is the 20d SMA pre-smoothing
+# of VIX / momentum in compute_features_from_raw). A 30-day EMA on the daily
+# composite crushes the residual sawtooth so the dashboard trend is a clean
+# macro wave.
+EMA_SPAN = 30
+
+# Asymmetric non-linear exponent for the LOW end of the composite (S_raw < 50).
+# Power > 1 crushes panic readings toward the cold 2.0x-DCA band (e.g. 38 -> ~28,
+# 35 -> ~25) so 2008-10 / 2020-03 / 2022-10 bottoms register as strong buys.
+BOTTOM_POWER = 1.3
 
 FEATURE_LABELS = {
     "F1_valuation": "Valuation (CAPE / Buffett)",
@@ -326,6 +339,80 @@ def _fetch_price(ticker: str, start: str = HISTORY_START,
     return None
 
 
+def _fetch_daily_prices(ticker: str, start: str = HISTORY_START,
+                        timeout: int = FETCH_TIMEOUT) -> Optional[pd.Series]:
+    """DAILY-close price for the high-frequency pre-smoothing layer (VIX, SPX).
+
+    Unlike _fetch_price (which resamples to month-end), this returns the raw
+    daily close so we can compute a 20-trading-day SMA BEFORE the percentile.
+    """
+    try:
+        import yfinance as yf
+        df = yf.download(ticker, start=start, auto_adjust=True, actions=False,
+                         progress=False, threads=False, timeout=timeout,
+                         session=_yf_session())
+        if df is not None and not df.empty:
+            close = df["Close"]
+            if isinstance(close, pd.DataFrame):
+                close = close.iloc[:, 0]
+            s = close.dropna()
+            if not s.empty:
+                return s
+    except Exception as exc:  # pragma: no cover - network dependent
+        print(f"[yfinance-daily] {ticker} failed: {exc}")
+    st = _STOOQ_MAP.get(ticker)
+    if st:
+        return _stooq_daily(st, start=start)
+    return None
+
+
+def _load_hf_cache() -> Optional[pd.DataFrame]:
+    if not os.path.exists(HF_DAILY_PATH):
+        return None
+    try:
+        return pd.read_parquet(HF_DAILY_PATH)
+    except Exception:
+        return None
+
+
+def _save_hf_cache(df: pd.DataFrame) -> None:
+    try:
+        df.to_parquet(HF_DAILY_PATH)
+    except Exception:
+        pass
+
+
+def _get_hf_daily() -> dict:
+    """Return a dict of daily Series (keys: 'vix', 'spx') used for the first
+    smoothing layer, with an incremental parquet cache so refreshes only pull
+    the last ~30 days. Non-fatal: missing keys simply fall back to the monthly
+    path inside compute_features_from_raw.
+
+    Network is bounded by FETCH_TIMEOUT + the global deadline; any failure
+    returns whatever subset is available (possibly empty).
+    """
+    cached = _load_hf_cache()
+    df = cached if cached is not None else pd.DataFrame()
+    out: dict = {}
+    for tag, ticker in (("vix", "^VIX"), ("spx", "^GSPC")):
+        start = HISTORY_START
+        if tag in df.columns and df[tag].notna().any():
+            last = df[tag].dropna().index.max()
+            start = (last - pd.Timedelta(days=INCREMENTAL_DAYS)).strftime("%Y-%m-%d")
+        s = _fetch_daily_prices(ticker, start=start)
+        if s is not None and not s.empty:
+            s = s[s.index >= pd.Timestamp(HISTORY_START)]
+            if tag in df.columns:
+                df[tag] = s.combine_first(df[tag]).sort_index()
+            else:
+                df[tag] = s
+            df[tag] = df[tag].ffill(limit=6)
+            out[tag] = df[tag].dropna()
+    if not df.empty:
+        _save_hf_cache(df)
+    return out
+
+
 def _fetch_one(spec: Tuple[str, str], start: str,
                timeout: int = FETCH_TIMEOUT) -> Optional[pd.Series]:
     """Single-series fetch wrapper. Never raises — returns None on any failure."""
@@ -402,18 +489,8 @@ def _boost_vector(s: pd.Series, is_tail: bool) -> pd.Series:
     return out
 
 
-def _extract_vix(df: pd.DataFrame) -> Optional[pd.Series]:
-    """Best available VIX level (price ^VIX, else FRED VIXCLS) for the
-    capitulation multiplier in compute_composite."""
-    for key in ("vix", "vixcls"):
-        if key in df.columns and df[key].notna().any():
-            return df[key]
-    return None
-
-
 def compute_composite(feat_pct: pd.DataFrame, weights: dict = WEIGHTS,
-                      tail_boost: Optional[bool] = None,
-                      vix_level: Optional[pd.Series] = None) -> pd.Series:
+                      tail_boost: Optional[bool] = None) -> pd.Series:
     """Weighted blend of available feature percentiles. Vectorized; missing
     features have their weight redistributed across the present ones (row-wise,
     so a feature absent at a given date simply drops out of that row's blend).
@@ -445,32 +522,17 @@ def compute_composite(feat_pct: pd.DataFrame, weights: dict = WEIGHTS,
     with np.errstate(invalid="ignore", divide="ignore"):
         score = numer / denom
 
-    # ---- Problem-3: non-linear S-curve (asymmetric power scaling) ----------
+    # ---- Non-linear bottom amplification (asymmetric power scaling) --------
     # The plain weighted percentile is too flat in the middle, so panic bottoms
-    # never reach the cold 2.0x DCA zone. We crush the LOW end (S_raw < 50) with
-    # a power > 1 so a middling ~38 reading collapses toward the buy zone, while
-    # the bubble end keeps its non-linear lift from TAIL_BOOST. This expands
-    # sensitivity at BOTH extremes (an S-shaped response) without look-ahead.
+    # never reach the cold 2.0x DCA zone. For S_raw < 50 we crush the LOW end
+    # with a power > 1 so a middling ~38 reading collapses toward the buy zone
+    # (e.g. 38 -> ~28, 35 -> ~25); the bubble end keeps its non-linear lift from
+    # TAIL_BOOST. This expands sensitivity at BOTH extremes (S-shaped) without
+    # look-ahead. S_raw >= 50 is left as the raw weighted percentile.
     s = score.astype(float)
     low = s < 50.0
-    s[low] = 100.0 * (s[low] / 100.0) ** 1.35
-    # (S_raw >= 50 is left as the raw weighted percentile — asymmetric by design.)
-
-    # ---- Problem-3: short-term capitulation multiplier ----------------------
-    # At a true market bottom (2008-10, 2020-03, 2022-10) we want the score to
-    # instantly plunge into 0-40. When ^VIX spikes > 35 (extreme fear) OR the
-    # 6-month momentum percentile drops below 10%, apply a "bottom penalty" of
-    # 10-15 pts so the score slams into the cold DCA band.
-    cap = pd.Series(0.0, index=s.index)
-    if vix_level is not None:
-        vix_s = pd.Series(vix_level).reindex(s.index)
-        cap = cap + np.where(vix_s > 35.0, 10.0, 0.0)
-    mom_pct = feat_pct.get("F2_momentum")
-    if mom_pct is not None:
-        cap = cap + np.where(mom_pct.fillna(200.0) < 10.0, 5.0, 0.0)
-    cap = cap.clip(upper=15.0)
-    s = (s - cap).clip(lower=0.0, upper=100.0)
-    return s
+    s[low] = 100.0 * (s[low] / 100.0) ** BOTTOM_POWER
+    return s.clip(lower=0.0, upper=100.0)
 
 
 def contribution_factor(score: float) -> float:
@@ -594,6 +656,10 @@ def compute_features_from_raw(raw: pd.DataFrame) -> Tuple[pd.DataFrame, dict]:
     meta: dict = {}
     idx = raw.index
 
+    # First smoothing layer for the high-frequency indicators (VIX, S&P): pull
+    # the DAILY series once and reuse it for F2 / F3 below.
+    hf = _get_hf_daily()
+
     def g(key):
         return raw[key] if key in raw.columns else None
 
@@ -663,22 +729,43 @@ def compute_features_from_raw(raw: pd.DataFrame) -> Tuple[pd.DataFrame, dict]:
             feat["F1_valuation"] = np.nan
             meta["F1_valuation"] = "N"
 
-    # ---- F2 Momentum (6m annualized S&P return) --------------------------
-    if spx is not None and spx.notna().any():
+    # ---- F2 Momentum (6m annualized, 20-day SMA pre-smoothed) -----------
+    # FIRST-pass denoise: take the 20-trading-day SMA of DAILY S&P 500, then
+    # resample to month-end and compute the 6-month annualized return. This
+    # strips intra-month whipsaw before it ever reaches the percentile.
+    f2_src = None
+    if "spx" in hf and hf["spx"].notna().any():
+        spx_sma = hf["spx"].rolling(20).mean().dropna()
+        spx_m = spx_sma.resample("ME").last().dropna()
+        if len(spx_m) >= 6:
+            mom6 = (spx_m / spx_m.shift(6)) ** (12.0 / 6.0) - 1.0
+            f2_src = rolling_pct(mom6)
+            meta["F2_momentum"] = "SPX 20d-SMA -> 6m ann."
+    if f2_src is None and spx is not None and spx.notna().any():
         mom6 = (spx / spx.shift(6)) ** (12.0 / 6.0) - 1.0
-        feat["F2_momentum"] = rolling_pct(mom6)
-        meta["F2_momentum"] = "Y"
-    else:
-        feat["F2_momentum"] = np.nan
+        f2_src = rolling_pct(mom6)
+        meta["F2_momentum"] = "SPX monthly (SMA fallback)"
+    feat["F2_momentum"] = f2_src if f2_src is not None else np.nan
+    if meta.get("F2_momentum") is None:
         meta["F2_momentum"] = "N"
 
-    # ---- F3 Sentiment (VIX inverted) -------------------------------------
-    v = vix if (vix is not None and vix.notna().any()) else vixcls
-    if v is not None and v.notna().any():
-        feat["F3_sentiment"] = 100.0 - rolling_pct(v)   # low VIX = risk
-        meta["F3_sentiment"] = "Y"
-    else:
-        feat["F3_sentiment"] = np.nan
+    # ---- F3 Sentiment (VIX inverted, 20-day SMA pre-smoothed) ------------
+    # Denoise VIX with a 20-trading-day SMA before inverting into a risk
+    # percentile, so a single vol spike doesn't paint a false "all-clear".
+    f3_src = None
+    if "vix" in hf and hf["vix"].notna().any():
+        vix_sma = hf["vix"].rolling(20).mean().dropna()
+        vix_m = vix_sma.resample("ME").last().dropna()
+        if not vix_m.empty:
+            f3_src = 100.0 - rolling_pct(vix_m)
+            meta["F3_sentiment"] = "VIX 20d-SMA (inv)"
+    if f3_src is None:
+        v = vix if (vix is not None and vix.notna().any()) else vixcls
+        if v is not None and v.notna().any():
+            f3_src = 100.0 - rolling_pct(v)
+            meta["F3_sentiment"] = "VIX/VIXCLS monthly (inv)"
+    feat["F3_sentiment"] = f3_src if f3_src is not None else np.nan
+    if meta.get("F3_sentiment") is None:
         meta["F3_sentiment"] = "N"
 
     # ---- F4 Leverage (credit spread INVERTED) ----------------------------
@@ -828,8 +915,7 @@ def get_monthly_scores(refresh: bool = False,
             # CURRENT tail_boost setting, so toggling the switch takes effect
             # immediately on cached data (no refetch needed). The VIX level is
             # pulled from the cached raw columns for the capitulation multiplier.
-            score = compute_composite(feat, tail_boost=tail_boost,
-                                      vix_level=_extract_vix(cached)).dropna()
+            score = compute_composite(feat, tail_boost=tail_boost).dropna()
             meta = json.load(open(META_PATH))
             meta["source"] = "cache"
             latest = score.index[-1] if not score.empty else None
@@ -843,8 +929,7 @@ def get_monthly_scores(refresh: bool = False,
     incremental = os.path.exists(CACHE_PATH)
     raw, fmeta = fetch_all_raw(incremental=incremental)
     feat, fmeta_feat = compute_features_from_raw(raw)
-    score = compute_composite(feat, tail_boost=tail_boost,
-                              vix_level=_extract_vix(raw)).dropna()
+    score = compute_composite(feat, tail_boost=tail_boost).dropna()
 
     # ---- Live-feature accounting (features valid at the latest date) ------
     latest = score.index[-1] if not score.empty else None
@@ -943,7 +1028,7 @@ def get_latest_state(refresh: bool = False,
                 feat = cached[fcols].copy()
                 feat.columns = [c[5:] for c in feat.columns]
                 score_series = compute_composite(
-                    feat, tail_boost=tail_boost, vix_level=_extract_vix(cached))
+                    feat, tail_boost=tail_boost)
                 meta = {}
                 if os.path.exists(META_PATH):
                     try:
@@ -991,6 +1076,20 @@ def get_price_series(ticker: str, start: str = LIVE_START,
     if s is None:
         return None
     return s.resample("ME").last()
+
+
+def warm_cache() -> None:
+    """Pre-compute and persist the feature cache (used at Docker BUILD time so
+    FRED EMVMACROBUS and friends are baked into the image, and the first user
+    request is instant). Failures are surfaced but never fatal.
+    """
+    try:
+        s, m = get_monthly_scores(refresh=True)
+        s = s.dropna()
+        print(f"[warm] source={m.get('source')} live={m.get('available_count')}/8 "
+              f"as_of={s.index[-1].date() if not s.empty else 'n/a'}")
+    except Exception as exc:  # pragma: no cover
+        print(f"[warm] pre-warm failed: {exc}")
 
 
 if __name__ == "__main__":

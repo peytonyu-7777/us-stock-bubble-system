@@ -7,9 +7,12 @@ Sections
    2. Middle: 8 feature cards (dynamic colour by percentile band, crimson pulse
               when in the >80 danger zone, greyed "Pending" when missing).
    3. Bottom: dual-axis S&P 500 / Nasdaq main chart (log/linear toggle) linked
-              to a smoothed Bubble Risk Score history with risk-zone shading.
+              to a 30-day-EMA-smoothed Bubble Risk Score history with risk-zone
+              shading and a shared, zoom-linked time axis (hovermode="x unified").
    4. Backtest: interactive Bubble Risk-Adjusted DCA vs Buy & Hold, with
-              user-tunable parameters (sidebar) and de-risk markers.
+              user-tunable sliders and de-risk markers. The engine lives in
+              backtest.py and returns (metrics_df, chart_fig) or None — the
+              panel shows a friendly card if data is unavailable.
 
 Deploy: `streamlit run app.py`  (Render / HuggingFace Spaces ready).
 Live data needs a FRED_API_KEY env var; without it the app still runs on cache
@@ -27,6 +30,7 @@ import streamlit as st
 from typing import Optional
 
 import pipeline as pipe
+import backtest as bt
 
 st.set_page_config(page_title="US Equity Bubble Risk", page_icon="📈",
                    layout="wide", initial_sidebar_state="auto")
@@ -110,6 +114,11 @@ def load_prices():
     return spx, ndx
 
 
+@st.cache_data(ttl=3600)
+def load_spy():
+    return pipe.get_price_series("SPY", start=pipe.LIVE_START)
+
+
 def band_color(score: float) -> str:
     if pd.isna(score):
         return "gray"
@@ -147,7 +156,7 @@ def gauge_fig(score: float) -> go.Figure:
             "axis": {"range": [0, 100], "tickwidth": 1, "tickcolor": "#94a3b8"},
             # Refined dark thin needle (was a thick bar that overlapped the step
             # colour blocks and painted a fat orange line across the arc).
-            "bar": {"color": "#1e293b", "thickness": 0.15},
+            "bar": {"color": "#1f2937", "thickness": 0.15},
             "steps": steps,
             # No `threshold` overlay -> the half-gauge stays clean & premium.
         },
@@ -213,7 +222,8 @@ def history_fig(scores: pd.Series, spx, ndx, log_scale: bool = True) -> go.Figur
     ytype = "log" if log_scale else "linear"
 
     # --- strict alignment: crop to >=START, then intersect the two prices so
-    #     the dual axis shares an identical x-grid (no 2001-vs-1995 drift). ---
+    #     the dual axis shares an identical x-grid (no 2001-vs-1995 drift), and
+    #     force the score onto that same intersection so zoom/hover link. ---
     if spx is not None:
         spx = spx[spx.index >= START]
     if ndx is not None:
@@ -235,10 +245,10 @@ def history_fig(scores: pd.Series, spx, ndx, log_scale: bool = True) -> go.Figur
         sc = sc[sc.index >= price_lo]   # keep the hover line aligned with prices
 
     fig = make_subplots(
-        rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.07,
+        rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.06,
         row_heights=[0.65, 0.35],
         subplot_titles=("S&P 500 (left axis)  ·  Nasdaq (right axis)",
-                        "Bubble Risk Score (EMA-smoothed)"),
+                        "Bubble Risk Score (30-day EMA-smoothed)"),
         specs=[[{"secondary_y": True}], [{}]],
     )
 
@@ -279,233 +289,32 @@ def history_fig(scores: pd.Series, spx, ndx, log_scale: bool = True) -> go.Figur
     return fig
 
 
-@st.cache_data(ttl=3600)
-def load_spy():
-    return pipe.get_price_series("SPY", start=pipe.LIVE_START)
-
-
-def _max_drawdown(series: pd.Series) -> float:
-    if series is None or series.empty:
-        return 0.0
-    cummax = series.cummax()
-    dd = series / cummax - 1.0
-    return float(dd.min())
-
-
-def _sharpe(returns):
-    if not returns or len(returns) < 2:
-        return 0.0
-    arr = np.array(returns, dtype=float)
-    sd = arr.std(ddof=1)
-    if sd == 0 or np.isnan(sd):
-        return 0.0
-    return float(arr.mean() / sd * np.sqrt(12))
-
-
-def _safe_returns(ret_b, ret_s):
-    """子计算函数：显式返回二元元组 (ret_b, ret_s)。
-
-    即使没有数据也返回 ([], [])，绝不返回空元组，避免调用方解包时
-    `ValueError: not enough values to unpack (expected 2, got 0)`。
-    """
-    rb = list(ret_b) if ret_b is not None else []
-    rs = list(ret_s) if ret_s is not None else []
-    return rb, rs
-
-
-def run_backtest(scores: pd.Series, params: dict) -> Optional[dict]:
-    """Monthly-DCA backtest, 2000 -> present, with user-tunable parameters.
-
-    Benchmark : every month invest `base_monthly` into SPY (buy & hold DCA).
-    Strategy  : invest `base_monthly` * band-multiplier, where the <40 band
-                uses `low_mult`, the 80-threshold band uses `high_mult`, and
-                at score >= `derisk_threshold` contribution -> 0x and
-                `derisk_cash` of the portfolio is moved to cash (earning
-                `cash_yield` p.a.). Idempotent target re-deploys when risk fades.
-
-    Returns a dict with the metric table, the two portfolio-value Series, and
-    the list of de-risk trigger dates (for chart markers), or None if data is
-    unavailable.
-    """
-    spy = load_spy()
-    if spy is None or scores is None:
-        return None
-
-    # --- Problem-1 fix: strict inner-join alignment + NaN drop, with a safe
-    #     fallback so the panel never hits an empty-series / unpacking crash. ---
-    s = scores.dropna()
-    aligned = pd.concat(
-        [spy.rename("spy"), s.rename("score")], axis=1, join="inner"
-    ).dropna()
-    if aligned.empty or len(aligned) < 12:
-        # Not enough overlapping, clean data -> let the panel show a friendly
-        # warning instead of raising on an empty series.
-        return None
-    spy = aligned["spy"]
-    s = aligned["score"]
-    idx = aligned.index
-
-    base = float(params["base_monthly"])
-    low_mult = float(params["low_mult"])
-    high_mult = float(params["high_mult"])
-    thr = float(params["derisk_threshold"])
-    cash_frac = float(params["derisk_cash"])
-    cash_growth = float(params["cash_yield"]) / 100.0 / 12.0
-
-    n = len(idx)
-    years = n / 12.0
-
-    shares_b = 0.0
-    shares_s = 0.0
-    cash_s = 0.0
-    val_b, val_s = [], []
-    ret_b, ret_s = []
-    inv_b = 0.0
-    inv_s = 0.0
-    prev_p = None
-    prev_total_s = 0.0
-    derisk_dates = []
-
-    for dt in idx:
-        p = float(spy.loc[dt])
-        sc = s.loc[dt]
-
-        # cash sleeve earns the money-market yield each month
-        if prev_p is not None:
-            cash_s *= (1.0 + cash_growth)
-
-        # ---------- Benchmark (always base_monthly) ----------
-        cb = base
-        shares_b += cb / p
-        inv_b += cb
-        if prev_p is not None and prev_p > 0:
-            ret_b.append(p / prev_p - 1.0)
-        val_b.append(shares_b * p)
-
-        # ---------- Strategy contribution by band ----------
-        if pd.isna(sc):
-            mult, derisk = 1.0, False
-        elif sc < 40:
-            mult, derisk = low_mult, False
-        elif sc < 60:
-            mult, derisk = 1.5, False
-        elif sc < 80:
-            mult, derisk = 1.0, False
-        elif sc < thr:
-            mult, derisk = high_mult, False
-        else:
-            mult, derisk = 0.0, True
-        cs = base * mult
-        shares_s += cs / p
-        inv_s += cs
-
-        # market move on the existing strategy book this month
-        if prev_p is not None and prev_p > 0 and prev_total_s > 0:
-            eq_pre = shares_s * p
-            total_pre = eq_pre + cash_s
-            ret_s.append((total_pre - prev_total_s) / prev_total_s)
-
-        # de-risk: move cash_frac of the portfolio into cash (idempotent)
-        if derisk:
-            total = shares_s * p + cash_s
-            desired_cash = cash_frac * total
-            if desired_cash > cash_s:
-                move = desired_cash - cash_s
-                shares_s -= move / p
-                cash_s += move
-            elif desired_cash < cash_s:
-                move = cash_s - desired_cash
-                cash_s -= move
-                shares_s += move / p
-            derisk_dates.append(dt)
-
-        port_val = shares_s * p + cash_s
-        val_s.append(port_val)
-        prev_p = p
-        prev_total_s = port_val
-
-    # --- Problem-1: sub-computation returns as an explicit, crash-proof
-    #     binary tuple; empty input yields ([], []). ---
-    ret_b, ret_s = _safe_returns(ret_b, ret_s)
-
-    bench = pd.Series(val_b, index=idx)
-    strat = pd.Series(val_s, index=idx)
-
-    twr_b = float(np.prod([1.0 + r for r in ret_b])) if ret_b else 1.0
-    twr_s = float(np.prod([1.0 + r for r in ret_s])) if ret_s else 1.0
-    cagr_b = twr_b ** (1.0 / years) - 1.0 if years > 0 else 0.0
-    cagr_s = twr_s ** (1.0 / years) - 1.0 if years > 0 else 0.0
-    tot_b = bench.iloc[-1] / inv_b - 1.0 if inv_b > 0 else 0.0
-    tot_s = strat.iloc[-1] / inv_s - 1.0 if inv_s > 0 else 0.0
-    mdd_b = _max_drawdown(bench)
-    mdd_s = _max_drawdown(strat)
-    sharpe_b = _sharpe(ret_b)
-    sharpe_s = _sharpe(ret_s)
-
-    return {
-        "bench": bench, "strat": strat,
-        "derisk_dates": derisk_dates,
-        "metrics": {
-            "Total Return": (tot_b, tot_s),
-            "CAGR": (cagr_b, cagr_s),
-            "Max Drawdown": (mdd_b, mdd_s),
-            "Sharpe": (sharpe_b, sharpe_s),
-        },
-    }
-
-
 def backtest_panel(scores: pd.Series, params: dict):
+    """Interactive Bubble-DCA vs Buy&Hold backtest. Delegates to the crash-proof
+    engine in backtest.py (run_backtest returns (metrics_df, chart_fig) or None).
+    """
     st.subheader("📊 Strategy Historical Backtest (2000 - Present)")
     st.caption("Benchmark: fixed ${:,} / mo into SPY (buy & hold). "
                "Strategy: Bubble Risk-Adjusted DCA with de-risk. "
-               "Tune the parameters in the sidebar — the table & curve recompute "
-               "live.".format(int(params["base_monthly"])))
-    res = run_backtest(scores, params)
+               "Tune the sliders — the table & curve recompute live."
+               .format(int(params["base_monthly"])))
+
+    spy = load_spy()
+    res = bt.run_backtest(scores, spy, params)
     if res is None:
         st.warning("Backtest needs SPY price history + a scored series (cache). "
                    "Run the scoring first / ensure network connectivity.")
         return
-    m = res["metrics"]
-    rows = []
-    for name, (b, s) in m.items():
-        if name == "Sharpe":
-            rows.append({"Metric": name,
-                         "Benchmark (Buy&Hold DCA)": f"{b:.2f}",
-                         "Bubble-DCA Strategy": f"{s:.2f}"})
-        else:
-            rows.append({"Metric": name,
-                         "Benchmark (Buy&Hold DCA)": f"{b*100:.1f}%",
-                         "Bubble-DCA Strategy": f"{s*100:.1f}%"})
-    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
-    # asset-curve comparison with de-risk markers
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(x=res["bench"].index, y=res["bench"].values,
-                             name="Benchmark (Buy & Hold DCA)",
-                             line={"color": "#1f4e79", "width": 2}))
-    fig.add_trace(go.Scatter(x=res["strat"].index, y=res["strat"].values,
-                             name="Bubble Risk-Adjusted DCA",
-                             line={"color": "#c1121f", "width": 2}))
-    if res["derisk_dates"]:
-        dm = pd.Series([res["strat"].get(d, np.nan) for d in res["derisk_dates"]],
-                       index=res["derisk_dates"]).dropna()
-        if not dm.empty:
-            fig.add_trace(go.Scatter(x=dm.index, y=dm.values, mode="markers",
-                                     name="De-risk triggered",
-                                     marker={"color": "#e4572e", "size": 7,
-                                             "symbol": "triangle-down"},
-                                     hovertemplate="De-risk @ %{x|%Y-%m}<extra></extra>"))
-    fig.update_layout(height=440, hovermode="x unified",
-                      yaxis_title="Portfolio Value (USD)",
-                      margin={"t": 30, "b": 30, "l": 75, "r": 30},
-                      legend=dict(orientation="h", y=1.06, x=0),
-                      plot_bgcolor="white", paper_bgcolor="white")
-    st.plotly_chart(fig, use_container_width=True)
+    metrics_df, chart_fig = res
+    st.dataframe(metrics_df, use_container_width=True, hide_index=True)
+    st.plotly_chart(chart_fig, use_container_width=True)
 
 
 def main():
     st.title("📈 US Equity Bubble Risk — Dalio-style Monitor")
     st.caption("8-feature percentile model · rolling 20-year window · "
+               "dual-pass smoothing (20d SMA + 30d EMA) · "
                "free/open data (FRED incl. EMVMACROBUS, yfinance/Stooq)")
 
     # ---- Sidebar: refresh controls ---------------------------------------
@@ -523,7 +332,7 @@ def main():
              "weighted up so the composite punches through the 85-90 warning line. "
              "When OFF, the plain weighted-percentile score is shown.")
 
-    # ---- Sidebar: interactive backtest parameters ------------------------
+    # ---- Sidebar: interactive backtest sliders ---------------------------
     with st.sidebar.expander("🎛️ Backtest Parameters", expanded=False):
         base_monthly = st.number_input("Base Monthly DCA ($)", min_value=0,
                                        max_value=10000, value=1000, step=100)

@@ -1,6 +1,6 @@
 # Dockerfile — zero-cost deploy on Render.com (Free tier)
 # Build context: this folder. Render reads render.yaml -> dockerfilePath ./Dockerfile.
-FROM python:3.11-slim
+FROM python:3.10-slim
 
 WORKDIR /app
 
@@ -22,8 +22,9 @@ ENV FRED_API_KEY=$FRED_API_KEY
 # Pre-fetch & bake data caches into the image so the FIRST request is instant
 # and free-tier health checks don't time out on a slow live data pull.
 # Network at build is best-effort: if it fails we just fall back to a runtime
-# fetch (the `|| echo` keeps the build green).
-RUN python pipeline.py \
+# fetch (the `|| echo` keeps the build green). warm_cache() also pulls the
+# high-frequency daily VIX/SPX used for the 20-day SMA pre-smoothing layer.
+RUN python -c "import pipeline as p; p.warm_cache()" \
     && python -c "import pipeline as p; [p.get_price_series(t, refresh=True) for t in ['^GSPC','^IXIC','SPY','SHY','QQQ']]" \
     || echo "pre-fetch skipped (will fetch live at runtime)"
 

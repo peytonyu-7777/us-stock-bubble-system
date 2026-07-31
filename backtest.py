@@ -7,15 +7,21 @@ Compares, from 2000-01 to today, two DCA strategies on SPY:
                   (no timing). Default $1,000/mo -> ~$230.77/wk so the
                   ANNUAL cash flow is identical across frequencies.
   2. BUBBLE-DCA : contribution scaled by the Bubble Risk Score band
-                  (2.0x / 1.5x / 1.0x / 0.5x / 0.0x), and when the score > 90
-                  the portfolio is rebalanced toward a 20% cash (SHY / T-bills)
-                  sleeve (idempotent target, so it re-deploys when risk fades).
+                  (low_mult / 1.5x / 1.0x / high_mult / 0.0x), and when the
+                  score >= derisk_threshold the portfolio is rebalanced toward
+                  a `derisk_cash` cash sleeve (idempotent target, so it
+                  re-deploys when risk fades).
 
-Default frequency is WEEKLY (`--freq W`). Monthly is supported via `--freq M`.
-
-Reports cumulative return, CAGR, max drawdown, Sharpe and Calmar, and prints
-the strategy vs benchmark trough during the three classic blow-off tops
-(2000 dot-com, 2008 GFC, 2021 COVID-tech).
+Public engine
+-------------
+  run_backtest(scores, spy_df, params) -> (metrics_df, chart_fig) | None
+      * scores   : pd.Series of the Bubble Risk Score (any frequency).
+      * spy_df   : pd.Series of SPY prices at the SAME frequency.
+      * params   : dict with base_monthly, low_mult, high_mult,
+                   derisk_threshold, derisk_cash, cash_yield.
+      * Returns None when inputs are missing / too short (guard clauses) so the
+        caller can render a friendly card instead of crashing on an empty
+        series or an unpack of `ret_b, ret_s = []`.
 
 Run:
     python backtest.py            # weekly, uses cached/live score history
@@ -27,10 +33,11 @@ from __future__ import annotations
 
 import argparse
 import sys
-from typing import Tuple
+from typing import Optional, Tuple
 
 import numpy as np
 import pandas as pd
+import plotly.graph_objects as go
 
 import pipeline as pipe
 
@@ -39,8 +46,8 @@ MONTHLY_BUY = 1000.0
 WEEKLY_BUY = MONTHLY_BUY * 12.0 / 52.0   # ~ $230.77/wk -> same annual flow
 
 # Default backtest parameters. These reproduce the original fixed-schedule
-# behaviour (2.0x / 1.5x / 1.0x / 0.5x / 0x bands, 20% de-risk at >=90, cash
-# modelled off the real SHY short-bond return since cash_yield defaults to 0).
+# behaviour (low_mult / 1.5x / 1.0x / high_mult bands, 20% de-risk at >=90,
+# cash modelled off the real SHY short-bond return since cash_yield defaults 0).
 DEFAULT_PARAMS = {
     "base_monthly": 1000.0,    # base contribution per rebalance period
     "low_mult": 2.0,           # multiplier when score < 40
@@ -116,11 +123,11 @@ def _trough_during(eq_bench: pd.Series, eq_strat: pd.Series,
 
 
 # ---------------------------------------------------------------------------
-# Unified simulator (weekly or monthly)
+# Unified simulator (returns equity + de-risk trigger dates)
 # ---------------------------------------------------------------------------
 def _simulate(price: pd.Series, shy_ret: pd.Series, scores: pd.Series,
               dates: list, base_contrib: float, ppy: int,
-              timing: bool = True, params: dict = None) -> pd.Series:
+              timing: bool = True, params: dict = None) -> Tuple[pd.Series, list]:
     """
     Walk `dates`, buying SPY with `base_contrib` each period.
 
@@ -130,9 +137,7 @@ def _simulate(price: pd.Series, shy_ret: pd.Series, scores: pd.Series,
                     risk fades).
     timing=False -> pure buy & hold benchmark (fixed contribution, no de-risk).
 
-    `params` (see DEFAULT_PARAMS) controls the multipliers, de-risk threshold,
-    cash allocation and cash yield. `ppy` is periods-per-year (52 weekly /
-    12 monthly) used to convert the annualized cash yield to a per-period one.
+    Returns (equity_series, derisk_dates).
     """
     p = params or DEFAULT_PARAMS
     low_mult = float(p["low_mult"])
@@ -140,15 +145,15 @@ def _simulate(price: pd.Series, shy_ret: pd.Series, scores: pd.Series,
     thr = float(p["derisk_threshold"])
     cash_frac = float(p["derisk_cash"])
     cash_yield = float(p["cash_yield"])
-    # When cash_yield > 0 we use a fixed money-market return; otherwise we keep
-    # the real SHY short-bond return (backward-compatible default).
     fixed_growth = (1.0 + cash_yield / 100.0 / ppy) if cash_yield > 0 else None
 
     shares = 0.0
     cash = 0.0
     vals = []
+    derisk_dates = []
+    prev_p = None
+    prev_total = 0.0
     for i, d in enumerate(dates):
-        # cash sleeve earns its return over the prior period
         if i > 0:
             if fixed_growth is not None:
                 cash *= fixed_growth
@@ -175,23 +180,131 @@ def _simulate(price: pd.Series, shy_ret: pd.Series, scores: pd.Series,
             if derisk:
                 total = shares * price_d + cash
                 desired_cash = cash_frac * total
-                if desired_cash > cash:            # sell equity -> raise cash
+                if desired_cash > cash:
                     move = desired_cash - cash
                     shares -= move / price_d
                     cash += move
-                elif desired_cash < cash:          # buy equity -> redeploy cash
+                elif desired_cash < cash:
                     move = cash - desired_cash
                     cash -= move
                     shares += move / price_d
+                derisk_dates.append(d)
         else:
             shares += base_contrib / price_d
 
-        vals.append(shares * price_d + cash)
-    return pd.Series(vals, index=dates)
+        prev_total = shares * price_d + cash
+        vals.append(prev_total)
+        prev_p = price_d
+
+    return pd.Series(vals, index=dates), derisk_dates
 
 
 # ---------------------------------------------------------------------------
-# Main
+# Crash-proof engine — returns (metrics_df, chart_fig) or None
+# ---------------------------------------------------------------------------
+def run_backtest(scores: Optional[pd.Series], spy_df: Optional[pd.Series],
+                 params: dict) -> Optional[Tuple[pd.DataFrame, go.Figure]]:
+    """
+    Bubble Risk-Adjusted DCA vs Buy & Hold, 2000 -> present.
+
+    Parameters
+    ----------
+    scores  : Bubble Risk Score series (monthly recommended) — a pd.Series.
+    spy_df  : SPY price series at the SAME frequency — a pd.Series.
+    params  : dict (base_monthly, low_mult, high_mult, derisk_threshold,
+              derisk_cash, cash_yield). Missing keys fall back to DEFAULT_PARAMS.
+
+    Returns
+    -------
+    (metrics_df, chart_fig) on success, or None when data is insufficient
+    (guard clauses — never raises, never returns a partial / empty tuple that
+    would blow up an `a, b = run_backtest(...)` unpacking).
+    """
+    # ---- Guard clauses (strict, no exception path) -----------------------
+    if scores is None or spy_df is None:
+        return None
+    scores = pd.Series(scores).dropna()
+    if len(scores) < 30:
+        return None
+
+    prm = dict(DEFAULT_PARAMS)
+    prm.update({k: v for k, v in (params or {}).items() if k in DEFAULT_PARAMS})
+
+    # ---- Inner-join alignment + NaN drop across prices & scores ----------
+    aligned = pd.concat(
+        [pd.Series(spy_df).rename("spy"),
+         scores.rename("score")], axis=1, join="inner"
+    ).dropna()
+    aligned = aligned[aligned.index >= pd.Timestamp(LIVE_START)]
+    dates = list(aligned.index.sort_values())
+    if len(dates) < 30:
+        return None
+
+    spy = aligned["spy"]
+    sc = aligned["score"]
+    ppy = 12                      # scores are monthly -> 12 periods / year
+    base = float(prm["base_monthly"])
+
+    # SHY cash return (or fixed money-market if cash_yield > 0)
+    shy = pipe.get_price_series("SHY", start="1999-06-01")
+    if shy is not None and prm["cash_yield"] <= 0:
+        shy = shy.reindex(spy.index).ffill()
+        shy_ret = shy.pct_change().fillna(0.0)
+    else:
+        shy_ret = pd.Series(0.0, index=spy.index)
+
+    bench, _ = _simulate(spy, shy_ret, sc, dates, base, ppy, timing=False, params=prm)
+    strat, derisk_dates = _simulate(spy, shy_ret, sc, dates, base, ppy,
+                                     timing=True, params=prm)
+
+    mb = metrics(bench, ppy=ppy)
+    ms = metrics(strat, ppy=ppy)
+
+    # ---- Metrics table (formatted, ready to display) ---------------------
+    rows = []
+    for name in ("cum_return", "cagr", "max_drawdown", "sharpe"):
+        b, s = mb.get(name, np.nan), ms.get(name, np.nan)
+        if name == "sharpe":
+            rows.append({"Metric": "Sharpe Ratio",
+                         "Benchmark (Buy & Hold DCA)": f"{b:.2f}",
+                         "Bubble-DCA Strategy": f"{s:.2f}"})
+        else:
+            label = {"cum_return": "Total Return",
+                     "cagr": "CAGR",
+                     "max_drawdown": "Max Drawdown"}[name]
+            rows.append({"Metric": label,
+                         "Benchmark (Buy & Hold DCA)": f"{b*100:.1f}%",
+                         "Bubble-DCA Strategy": f"{s*100:.1f}%"})
+    metrics_df = pd.DataFrame(rows)
+
+    # ---- Chart: equity curves + de-risk markers --------------------------
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=bench.index, y=bench.values,
+                             name="Benchmark (Buy & Hold DCA)",
+                             line={"color": "#1f4e79", "width": 2}))
+    fig.add_trace(go.Scatter(x=strat.index, y=strat.values,
+                             name="Bubble Risk-Adjusted DCA",
+                             line={"color": "#c1121f", "width": 2}))
+    if derisk_dates:
+        dm = pd.Series([strat.get(d, np.nan) for d in derisk_dates],
+                       index=derisk_dates).dropna()
+        if not dm.empty:
+            fig.add_trace(go.Scatter(x=dm.index, y=dm.values, mode="markers",
+                                     name="De-risk triggered",
+                                     marker={"color": "#e4572e", "size": 7,
+                                             "symbol": "triangle-down"},
+                                     hovertemplate="De-risk @ %{x|%Y-%m}<extra></extra>"))
+    fig.update_layout(height=440, hovermode="x unified",
+                      yaxis_title="Portfolio Value (USD)",
+                      margin={"t": 30, "b": 30, "l": 75, "r": 30},
+                      legend=dict(orientation="h", y=1.06, x=0),
+                      plot_bgcolor="white", paper_bgcolor="white")
+
+    return metrics_df, fig
+
+
+# ---------------------------------------------------------------------------
+# CLI entry
 # ---------------------------------------------------------------------------
 def main(refresh: bool = False, freq: str = "W", params: dict = None) -> dict:
     freq = freq.upper()
@@ -203,92 +316,42 @@ def main(refresh: bool = False, freq: str = "W", params: dict = None) -> dict:
     if params:
         prm.update({k: v for k, v in params.items() if k in DEFAULT_PARAMS})
 
-    spy, shy = _load_prices(freq)
     scores, meta = pipe.get_monthly_scores(refresh=refresh)
+    spy, shy = _load_prices(freq)
 
-    # Forward-fill the MONTHLY score onto the rebalance calendar so every
-    # week (or month) is scored by the most recent month-end reading.
     scores_ff = scores.reindex(spy.index, method="ffill")
+    res = run_backtest(scores_ff, spy, prm)
+    if res is None:
+        print("BACKTEST: insufficient overlapping price/score data; skipping report.")
+        return {}
 
-    # --- Problem-1 fix: strict inner-join alignment across prices & scores,
-    #     NaN-dropped, with a safe fallback (no raise -> no unpacking crash). ---
-    aligned = pd.concat(
-        [spy.rename("spy"), scores_ff.rename("score")], axis=1, join="inner"
-    ).dropna()
-    aligned = aligned[aligned.index >= pd.Timestamp(LIVE_START)]
-    dates = list(aligned.index.sort_values())
-    if len(dates) < 12:
-        print("BACKTEST: insufficient overlapping price/score data "
-              f"(got {len(dates)} periods); skipping report.")
-        return {"benchmark": {}, "strategy": {}, "tops": {},
-                "bench_equity": pd.Series(dtype=float),
-                "strat_equity": pd.Series(dtype=float),
-                "scores": scores.reindex(dates), "freq": period_label}
+    metrics_df, _ = res
+    print("=" * 72)
+    print(f"BUBBLE-RISK BACKTEST   freq={period_label}   source={meta.get('source')}")
+    print(metrics_df.to_string(index=False))
+    print("=" * 72)
 
-    spy = aligned["spy"]
-    scores_ff = aligned["score"]
-
-    shy_ret = shy.pct_change().fillna(0.0)
-
-    bench = _simulate(spy, shy_ret, scores_ff, dates, base, ppy,
-                      timing=False, params=prm)
-    strat = _simulate(spy, shy_ret, scores_ff, dates, base, ppy,
-                      timing=True, params=prm)
-
-    mb = metrics(bench, ppy=ppy)
-    ms = metrics(strat, ppy=ppy)
-
+    # ---- Drawdown comparison during classic tops -------------------------
+    bench, derisk = _simulate(
+        spy, shy.pct_change().fillna(0.0), scores_ff, list(spy.index),
+        base, ppy, timing=True, params=prm)
+    # re-run benchmark for the trough comparison
+    bench_eq, _ = _simulate(
+        spy, shy.pct_change().fillna(0.0), scores_ff, list(spy.index),
+        base, ppy, timing=False, params=prm)
     windows = {
         "2000 Dot-com": ("2000-03-01", "2002-12-31"),
         "2008 GFC": ("2007-10-01", "2009-06-30"),
         "2021 COVID-tech": ("2021-01-01", "2022-12-31"),
     }
-    tops = {name: _trough_during(bench, strat, s, e) for name, (s, e) in windows.items()}
-
-    # ---- Report ----------------------------------------------------------
-    print("=" * 72)
-    print(f"BUBBLE-RISK BACKTEST   freq={period_label}   source={meta.get('source')}")
-    print(f"  rebalances={len(dates)}   {dates[0].date()} -> {dates[-1].date()}")
-    print(f"  per-period contribution = ${base:,.2f} "
-          f"(annual ~ ${base*ppy:,.0f})")
-    print(f"  params: low_mult={prm['low_mult']}  high_mult={prm['high_mult']}  "
-          f"de-risk>= {prm['derisk_threshold']} ({prm['derisk_cash']*100:.0f}% cash)"
-          f"  cash_yield={prm['cash_yield']:.1f}%")
-    print("=" * 72)
-    print(f"{'Metric':<18}{'Benchmark':>16}{'Bubble-DCA':>16}{'Δ':>12}")
-    print("-" * 72)
-    rows = [
-        ("Cumulative Ret", mb['cum_return'], ms['cum_return'], "%"),
-        ("CAGR", mb['cagr'], ms['cagr'], "%"),
-        ("Max Drawdown", mb['max_drawdown'], ms['max_drawdown'], "%"),
-        ("Sharpe", mb['sharpe'], ms['sharpe'], "x"),
-        ("Calmar", mb['calmar'], ms['calmar'], "x"),
-        ("Ending Value", mb['end_value'], ms['end_value'], "$"),
-    ]
-    for name, b, s, kind in rows:
-        if kind == "%":
-            bs, ss = f"{b*100:>14.1f}%", f"{s*100:>14.1f}%"
-            delta = f"{(s-b)*100:>11.1f}pp"
-        elif kind == "$":
-            bs, ss = f"${b:>13,.0f}", f"${s:>13,.0f}"
-            delta = f"{s-b:>12,.0f}"
-        else:
-            bs, ss = f"{b:>15.2f}", f"{s:>15.2f}"
-            delta = f"{s-b:>12.2f}"
-        print(f"{name:<18}{bs:>16}{ss:>16}{delta:>12}")
-    print("-" * 72)
     print("\nDrawdown comparison during classic tops (strategy vs benchmark):")
-    for name, t in tops.items():
+    for name, (s, e) in windows.items():
+        t = _trough_during(bench_eq, bench, s, e)
         if t:
             print(f"  {name:<18} bench MDD {t['bench_mdd']*100:6.1f}%  |  "
                   f"strategy MDD {t['strat_mdd']*100:6.1f}%  |  "
                   f"avoided {t['avoided_pp']:5.1f} pp")
-    print("=" * 72)
-
-    return {"benchmark": mb, "strategy": ms, "tops": tops,
-            "bench_equity": bench, "strat_equity": strat,
-            "scores": scores.reindex(dates),
-            "freq": period_label}
+    return {"metrics_df": metrics_df}
 
 
 if __name__ == "__main__":
