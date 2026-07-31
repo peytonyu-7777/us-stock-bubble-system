@@ -516,7 +516,12 @@ def compute_features_from_raw(raw: pd.DataFrame) -> Tuple[pd.DataFrame, dict]:
 
     feat = pd.DataFrame(index=idx)
 
-    # ---- F1 Valuation ----------------------------------------------------
+    # ---- F1 Valuation (zero-fail) ---------------------------------------
+    # Primary = CAPE and/or Buffett (Wilshire/GDP), blended with nanmean.
+    # A ZERO-FAIL fallback then fills any remaining gaps with the S&P 500
+    # premium above its ~200-week (~46-month) moving average (sourced live
+    # via yfinance/Stooq). It is used ONLY where CAPE/Buffett are NaN, so it
+    # never double-counts momentum — but it guarantees F1 is never blank.
     parts = []
     if cape is not None and cape.notna().any():
         parts.append(rolling_pct(cape))
@@ -535,20 +540,34 @@ def compute_features_from_raw(raw: pd.DataFrame) -> Tuple[pd.DataFrame, dict]:
         gdp_m = gdp_daily.resample("ME").last()
         buffett = (wilshire / gdp_m) * 1000.0   # scale-invariant ratio
         parts.append(rolling_pct(buffett.dropna()))
-    if parts:
-        # nanmean: a missing sub-component must NOT poison the others.
-        feat["F1_valuation"] = np.nanmean(parts, axis=0)
+
+    primary = np.nanmean(parts, axis=0) if parts else None
+
+    # Zero-fail fallback proxy: S&P 500 distance above its ~200-week MA.
+    # A fat premium = expensive market = high risk (positive percentile).
+    ma_pct = None
+    if spx is not None and spx.notna().sum() >= 60:
+        ma_long = spx.rolling(46).mean()        # 46 months ~ 200 weeks
+        prem = (spx / ma_long - 1.0) * 100.0
+        ma_pct = rolling_pct(prem.dropna())
+
+    if primary is not None:
+        # fill only the NaN gaps in the primary with the MA proxy
+        feat["F1_valuation"] = (primary.combine_first(ma_pct)
+                                if ma_pct is not None else primary)
         meta["F1_valuation"] = (
             f"CAPE={'Y' if cape is not None and cape.notna().any() else 'N'} "
-            f"Buffett={'Y' if len(parts) > 1 else 'N'}")
+            f"Buffett={'Y' if wilshire is not None and gdp is not None and wilshire.notna().any() and gdp.notna().any() else 'N'} "
+            f"MAfallback={'Y' if ma_pct is not None else 'N'}")
+    elif ma_pct is not None:
+        feat["F1_valuation"] = ma_pct
+        meta["F1_valuation"] = "SPX_MA200w (primary fallback)"
     else:
-        # Tertiary valuation proxy only if BOTH CAPE and Buffett are missing:
-        # inverse of the S&P 500 dividend yield (a low yield = expensive
-        # market = higher risk -> inverted percentile).
+        # Last-resort tertiary proxy: inverse S&P 500 dividend yield.
         sp500div = g("sp500div")
         if sp500div is not None and sp500div.notna().sum() >= 12:
             feat["F1_valuation"] = 100.0 - rolling_pct(sp500div)
-            meta["F1_valuation"] = "SP500DIV inverse (valuation fallback)"
+            meta["F1_valuation"] = "SP500DIV inverse (last resort)"
         else:
             feat["F1_valuation"] = np.nan
             meta["F1_valuation"] = "N"
@@ -608,19 +627,29 @@ def compute_features_from_raw(raw: pd.DataFrame) -> Tuple[pd.DataFrame, dict]:
             feat["F6_business"] = np.nan
             meta["F6_business"] = "N"
 
-    # ---- F7 Policy (real fed funds, inverted) ----------------------------
+    # ---- F7 Policy (real fed funds, inverted) — zero-fail ---------------
     # Real rate = FEDFUNDS - CPI YoY. Both series are resampled to month-end
     # and aligned EXPLICITLY before differencing, so a stray index mismatch
-    # can never produce a full-NaN series. Low real rate = loose policy =
-    # higher risk, so the final score is inverted (100 - percentile).
-    if (ffr is not None and cpi is not None
-            and ffr.notna().any() and cpi.notna().any()):
-        cpi_yoy = cpi.pct_change(12) * 100.0
+    # can never produce a full-NaN series. If CPI is missing, fall back to a
+    # constant 2.5% long-run inflation target (the Fed's official goal) so F7
+    # stays alive. Low real rate = loose policy = higher risk, so the final
+    # score is inverted (100 - percentile).
+    if ffr is not None and ffr.notna().any():
         ffr_m = ffr.resample("ME").last()
-        cpi_yoy_m = cpi_yoy.resample("ME").last()
-        real_rate = (ffr_m - cpi_yoy_m).dropna()
-        feat["F7_policy"] = 100.0 - rolling_pct(real_rate)
-        meta["F7_policy"] = "Y"
+        if cpi is not None and cpi.notna().any():
+            cpi_yoy = cpi.pct_change(12) * 100.0
+            cpi_yoy_m = cpi_yoy.resample("ME").last()
+            real_rate = (ffr_m - cpi_yoy_m).dropna()
+            meta["F7_policy"] = "Y"
+        else:
+            # Fallback: real rate ≈ FEDFUNDS - 2.5% (long-run inflation target)
+            real_rate = (ffr_m - 2.5).dropna()
+            meta["F7_policy"] = "FEDFUNDS-2.5% (CPI fallback)"
+        if real_rate.notna().sum() >= 12:
+            feat["F7_policy"] = 100.0 - rolling_pct(real_rate)
+        else:
+            feat["F7_policy"] = np.nan
+            meta["F7_policy"] = "N"
     else:
         feat["F7_policy"] = np.nan
         meta["F7_policy"] = "N"

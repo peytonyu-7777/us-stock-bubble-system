@@ -15,6 +15,7 @@ or, as a last resort, a clearly-flagged synthetic series.
 from __future__ import annotations
 
 import os
+import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
@@ -124,27 +125,36 @@ def feature_cards(features: dict):
 
 
 def history_fig(scores: pd.Series, spx, ndx) -> go.Figure:
+    START = pd.Timestamp("2000-01-01")
+    # Align EVERY series to the common window [2000-01-01, today] so the price
+    # chart and the score chart never start at different years (old bug: prices
+    # from 2001, score from 1995). shared_xaxes=True then links zoom/pan
+    # between the two subplots.
+    sc = scores.dropna()
+    sc = sc[sc.index >= START]
+    if spx is not None:
+        spx = spx[spx.index >= START]
+    if ndx is not None:
+        ndx = ndx[ndx.index >= START]
+
     fig = make_subplots(
         rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.08,
-        row_heights=[0.55, 0.45],
+        row_heights=[0.6, 0.4],
         subplot_titles=("S&P 500 / Nasdaq Composite (log)", "Bubble Risk Score"),
     )
-    if spx is not None:
+    if spx is not None and not spx.empty:
         fig.add_trace(go.Scatter(x=spx.index, y=spx.values, name="S&P 500",
                                  line={"color": "steelblue"}),
                       row=1, col=1)
-    if ndx is not None:
-        # NOTE: `yaxis` is a TOP-LEVEL trace property, not a property of
-        # `line`. Nesting it inside `line={...}` raises
-        #   "Invalid property specified for ... scatter.Line: 'yaxis'".
-        # S&P 500 and Nasdaq share the row-1 log axis, so no secondary axis
-        # is required — we simply keep `yaxis="y"` (the default) at top level.
+    if ndx is not None and not ndx.empty:
+        # `yaxis` is a TOP-LEVEL trace property, not a property of `line`.
+        # Nesting it inside `line={...}` raises the scatter.Line 'yaxis' error.
+        # S&P and Nasdaq share the row-1 log axis, so `yaxis="y"` (default).
         fig.add_trace(go.Scatter(x=ndx.index, y=ndx.values, name="Nasdaq",
                                  yaxis="y", line={"color": "purple"}),
                       row=1, col=1)
     fig.update_yaxes(type="log", row=1, col=1)
 
-    sc = scores.dropna()
     if not sc.empty:
         fig.add_trace(go.Scatter(x=sc.index, y=sc.values, name="Bubble Score",
                                  line={"color": "crimson", "width": 2},
@@ -165,6 +175,167 @@ def history_fig(scores: pd.Series, spx, ndx) -> go.Figure:
     fig.update_layout(height=620, hovermode="x unified", showlegend=True,
                       margin={"t": 40, "b": 30, "l": 50, "r": 30})
     return fig
+
+
+@st.cache_data(ttl=3600)
+def load_spy():
+    return pipe.get_price_series("SPY", start=pipe.LIVE_START)
+
+
+def _max_drawdown(series: pd.Series) -> float:
+    if series is None or series.empty:
+        return 0.0
+    cummax = series.cummax()
+    dd = series / cummax - 1.0
+    return float(dd.min())
+
+
+def _sharpe(returns):
+    if not returns or len(returns) < 2:
+        return 0.0
+    arr = np.array(returns, dtype=float)
+    sd = arr.std(ddof=1)
+    if sd == 0 or np.isnan(sd):
+        return 0.0
+    return float(arr.mean() / sd * np.sqrt(12))
+
+
+def run_backtest(scores: pd.Series) -> Optional[dict]:
+    """Monthly-DCA backtest, 2000 -> present.
+
+    Benchmark : every month invest a flat $1,000 into SPY (buy & hold DCA).
+    Strategy  : invest per the Bubble Score band (<40:2.0x, 40-60:1.5x,
+                60-80:1.0x, 80-90:0.5x, >=90:0x) and, at score >= 90, move
+                20% of equities into cash (BIL proxy, modelled at 0% here).
+
+    Returns a dict with the metric table + the two portfolio-value Series,
+    or None if SPY / scores are unavailable.
+    """
+    spy = load_spy()
+    if spy is None or scores is None:
+        return None
+    s = scores.dropna()
+    idx = spy.index.intersection(s.index)
+    idx = idx[idx >= pd.Timestamp("2000-01-01")]
+    if len(idx) < 24:
+        return None
+    spy = spy.loc[idx]
+    s = s.loc[idx]
+    n = len(idx)
+    years = n / 12.0
+
+    shares_b = 0.0          # benchmark equity shares
+    shares_s = 0.0          # strategy equity shares
+    cash_s = 0.0            # strategy cash bucket
+    val_b, val_s = [], []
+    ret_b, ret_s = [], []   # monthly time-weighted returns
+    inv_b = 0.0
+    inv_s = 0.0
+    prev_p = None
+    prev_total_s = 0.0
+
+    for dt in idx:
+        p = float(spy.loc[dt])
+        sc = s.loc[dt]
+
+        # ---------- Benchmark (always $1,000) ----------
+        cb = 1000.0
+        shares_b += cb / p
+        inv_b += cb
+        if prev_p is not None and prev_p > 0:
+            ret_b.append(p / prev_p - 1.0)
+        val_b.append(shares_b * p)
+
+        # ---------- Strategy contribution by band ----------
+        if pd.isna(sc):
+            cs = 1000.0
+        elif sc < 40:   cs = 2000.0
+        elif sc < 60:   cs = 1500.0
+        elif sc < 80:   cs = 1000.0
+        elif sc < 90:   cs = 500.0
+        else:           cs = 0.0
+        shares_s += cs / p
+        inv_s += cs
+
+        # market move on the existing strategy book this month
+        if prev_p is not None and prev_p > 0 and prev_total_s > 0:
+            eq_pre = shares_s * p
+            total_pre = eq_pre + cash_s
+            ret_s.append((total_pre - prev_total_s) / prev_total_s)
+
+        # de-risk 20% of equities -> cash when score >= 90
+        if (not pd.isna(sc)) and sc >= 90:
+            eq_now = shares_s * p
+            move = 0.20 * eq_now
+            if move > 0:
+                shares_s -= move / p
+                cash_s += move
+
+        port_val = shares_s * p + cash_s
+        val_s.append(port_val)
+        prev_p = p
+        prev_total_s = port_val
+
+    bench = pd.Series(val_b, index=idx)
+    strat = pd.Series(val_s, index=idx)
+
+    twr_b = float(np.prod([1.0 + r for r in ret_b])) if ret_b else 1.0
+    twr_s = float(np.prod([1.0 + r for r in ret_s])) if ret_s else 1.0
+    cagr_b = twr_b ** (1.0 / years) - 1.0 if years > 0 else 0.0
+    cagr_s = twr_s ** (1.0 / years) - 1.0 if years > 0 else 0.0
+    tot_b = bench.iloc[-1] / inv_b - 1.0 if inv_b > 0 else 0.0
+    tot_s = strat.iloc[-1] / inv_s - 1.0 if inv_s > 0 else 0.0
+    mdd_b = _max_drawdown(bench)
+    mdd_s = _max_drawdown(strat)
+    sharpe_b = _sharpe(ret_b)
+    sharpe_s = _sharpe(ret_s)
+
+    return {
+        "bench": bench, "strat": strat,
+        "metrics": {
+            "Total Return": (tot_b, tot_s),
+            "CAGR": (cagr_b, cagr_s),
+            "Max Drawdown": (mdd_b, mdd_s),
+            "Sharpe": (sharpe_b, sharpe_s),
+        },
+    }
+
+
+def backtest_panel(scores: pd.Series):
+    st.subheader("📊 Strategy Historical Backtest (2000 - Present)")
+    st.caption("Monthly $1,000 DCA into SPY · Benchmark vs Bubble Risk-Adjusted DCA "
+               "(2.0× / 1.5× / 1.0× / 0.5× / 0×, with 20% de-risk to cash at ≥90).")
+    res = run_backtest(scores)
+    if res is None:
+        st.warning("Backtest needs SPY price history + a scored series (cache). "
+                   "Run the scoring first / ensure network connectivity.")
+        return
+    m = res["metrics"]
+    rows = []
+    for name, (b, s) in m.items():
+        if name == "Sharpe":
+            rows.append({"Metric": name,
+                         "Benchmark (Buy&Hold DCA)": f"{b:.2f}",
+                         "Bubble-DCA Strategy": f"{s:.2f}"})
+        else:
+            rows.append({"Metric": name,
+                         "Benchmark (Buy&Hold DCA)": f"{b*100:.1f}%",
+                         "Bubble-DCA Strategy": f"{s*100:.1f}%"})
+    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+    # asset-curve comparison
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=res["bench"].index, y=res["bench"].values,
+                             name="Benchmark (Buy & Hold DCA)",
+                             line={"color": "steelblue"}))
+    fig.add_trace(go.Scatter(x=res["strat"].index, y=res["strat"].values,
+                             name="Bubble Risk-Adjusted DCA",
+                             line={"color": "crimson"}))
+    fig.update_layout(height=430, hovermode="x unified",
+                      yaxis_title="Portfolio Value (USD)",
+                      margin={"t": 30, "b": 30, "l": 70, "r": 30},
+                      legend=dict(orientation="h", y=1.06, x=0))
+    st.plotly_chart(fig, use_container_width=True)
 
 
 def main():
@@ -216,24 +387,8 @@ def main():
     spx, ndx = load_prices()
     st.plotly_chart(history_fig(scores, spx, ndx), use_container_width=True)
 
-    with st.expander("Backtest snapshot (2000 → today)"):
-        st.markdown("Run `python backtest.py` for the full Buy&Hold vs "
-                    "Bubble-DCA comparison (CAGR, Max DD, Sharpe, Calmar).")
-        try:
-            import backtest as bt
-            res = bt.main(refresh=False)
-            mb, ms = res["benchmark"], res["strategy"]
-            st.table(pd.DataFrame({
-                "Metric": ["Cumulative", "CAGR", "Max DD", "Sharpe", "Calmar"],
-                "Benchmark": [f"{mb['cum_return']*100:.1f}%", f"{mb['cagr']*100:.1f}%",
-                              f"{mb['max_drawdown']*100:.1f}%", f"{mb['sharpe']:.2f}",
-                              f"{mb['calmar']:.2f}"],
-                "Bubble-DCA": [f"{ms['cum_return']*100:.1f}%", f"{ms['cagr']*100:.1f}%",
-                               f"{ms['max_drawdown']*100:.1f}%", f"{ms['sharpe']:.2f}",
-                               f"{ms['calmar']:.2f}"],
-            }))
-        except Exception as exc:
-            st.error(f"Backtest could not run inline: {exc}")
+    # ---- Strategy backtest (full panel) ----------------------------------
+    backtest_panel(scores)
 
 
 if __name__ == "__main__":
