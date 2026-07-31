@@ -22,6 +22,7 @@ or, as a last resort, a clearly-flagged synthetic series.
 from __future__ import annotations
 
 import os
+import math
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
@@ -85,9 +86,6 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-REF_2000 = 83.2   # historical reference points (approx, per Dalio-style framing)
-REF_2021 = 92.1
-
 BANDS = [  # (lo, hi, color, label) — clean, strictly non-overlapping palette
     (0, 40, "#10b981", "Low / Cooling"),
     (40, 60, "#3b82f6", "Normal"),
@@ -144,28 +142,102 @@ def status_action(score: float):
 
 
 def gauge_fig(score: float) -> go.Figure:
-    # Strictly non-overlapping step bands (no colour bleed / fat orange seam).
-    steps = [{"range": [lo, hi], "color": c} for lo, hi, c, _ in BANDS]
-    fig = go.Figure(go.Indicator(
-        mode="gauge+number+delta",
-        value=score if not pd.isna(score) else 0,
-        number={"font": {"size": 54}, "suffix": " / 100"},
-        delta={"reference": REF_2021, "increasing": {"color": "#ef4444"},
-               "decreasing": {"color": "#10b981"}},
-        gauge={
-            "axis": {"range": [0, 100], "tickwidth": 1, "tickcolor": "#94a3b8"},
-            # Refined dark thin needle (was a thick bar that overlapped the step
-            # colour blocks and painted a fat orange line across the arc).
-            "bar": {"color": "#1f2937", "thickness": 0.15},
-            "steps": steps,
-            # No `threshold` overlay -> the half-gauge stays clean & premium.
-        },
-        title={"text": "US Equity Bubble Risk Score", "font": {"size": 18}},
-    ))
-    fig.add_annotation(x=0.5, y=-0.04,
-                       text=f"Refs — 2000: {REF_2000}  |  2021: {REF_2021}",
-                       showarrow=False, font={"size": 12, "color": "gray"})
-    fig.update_layout(height=360, margin={"t": 46, "b": 24, "l": 24, "r": 24})
+    """CNN Fear & Greed style semicircular gauge.
+
+    Layout is fully de-coupled from the needle geometry: the coloured arc lives
+    in the half-disk *above* the pivot hub (cy = 0.25) while the big numeric
+    read-out and the status label are pinned *below* the hub via Plotly
+    annotations, so the needle can sweep 0..100 without ever touching the text.
+
+    Arc: outer radius 1.0, inner radius 0.70. Needle pivot (0.5, 0.25),
+    length 0.55 (tip stays inside the band). Angle θ = π·(1 − Score/100):
+    0 → 180° (left), 50 → 90° (up), 100 → 0° (right).
+    """
+    if pd.isna(score):
+        score = 0.0
+    score = max(0.0, min(100.0, score))
+
+    cx, cy = 0.5, 0.25          # pivot hub
+    R_out, R_in = 1.0, 0.70     # outer / inner arc radii
+    R_needle = 0.55             # needle length (< R_in -> tip inside the band)
+
+    # --- 5-step colour bands (new, strictly non-overlapping palette) --------
+    STEPS = [
+        (0, 20, "#059669", "Extreme Fear / Overweight"),
+        (20, 40, "#10b981", "Underweight / Add"),
+        (40, 60, "#64748b", "Neutral"),
+        (60, 80, "#f59e0b", "Overheat / Halve"),
+        (80, 100, "#dc2626", "Bubble / De-risk"),
+    ]
+
+    fig = go.Figure()
+
+    # --- filled annular arc segments ---------------------------------------
+    n = 60
+    for lo, hi, color, _ in STEPS:
+        xs, ys = [], []
+        for i in range(n + 1):                      # outer arc, lo -> hi
+            v = lo + (hi - lo) * i / n
+            th = math.pi * (1 - v / 100.0)
+            xs.append(cx + R_out * math.cos(th))
+            ys.append(cy + R_out * math.sin(th))
+        for i in range(n + 1):                      # inner arc, hi -> lo
+            v = hi + (lo - hi) * i / n
+            th = math.pi * (1 - v / 100.0)
+            xs.append(cx + R_in * math.cos(th))
+            ys.append(cy + R_in * math.sin(th))
+        fig.add_trace(go.Scatter(
+            x=xs, y=ys, fill="toself", fillcolor=color,
+            line=dict(width=0), hoverinfo="skip", showlegend=False))
+
+    # --- tick numbers: inside the inner radius, gray, clear of the needle ---
+    for v in (0, 20, 40, 60, 80, 100):
+        th = math.pi * (1 - v / 100.0)
+        tx = cx + 0.66 * math.cos(th)
+        ty = cy + 0.66 * math.sin(th)
+        fig.add_annotation(x=tx, y=ty, text=str(v), showarrow=False,
+                           font=dict(size=11, color="#94a3b8"))
+
+    # --- needle (tapered triangle) -----------------------------------------
+    th = math.pi * (1 - score / 100.0)
+    tipx = cx + R_needle * math.cos(th)
+    tipy = cy + R_needle * math.sin(th)
+    px = -math.sin(th) * 0.018          # perpendicular base half-width
+    py = math.cos(th) * 0.018
+    fig.add_trace(go.Scatter(
+        x=[cx - px, cx + px, tipx], y=[cy - py, cy + py, tipy],
+        fill="toself", fillcolor="#1e293b", line=dict(width=0),
+        hoverinfo="skip", showlegend=False))
+
+    # --- pivot hub: dark disc with white rim -------------------------------
+    fig.add_trace(go.Scatter(
+        x=[cx], y=[cy], mode="markers",
+        marker=dict(size=15, color="#1e293b", line=dict(color="#ffffff", width=2)),
+        hoverinfo="skip", showlegend=False))
+
+    # --- numeric read-out + status, anchored BELOW the hub -----------------
+    action, color, _ = status_action(score)
+    fig.add_annotation(x=0.5, y=0.135, text=f"{score:.1f}", showarrow=False,
+                       font=dict(size=46, color="#0f172a",
+                                 family="Arial Black, Arial, sans-serif"))
+    fig.add_annotation(x=0.5, y=0.055, text=action, showarrow=False,
+                       font=dict(size=15, color=color,
+                                 family="Arial, sans-serif"))
+    fig.add_annotation(x=0.5, y=0.005, text="/ 100", showarrow=False,
+                       font=dict(size=12, color="#94a3b8"))
+    fig.add_annotation(x=0.5, y=1.345,
+                       text="US Equity Bubble Risk Score", showarrow=False,
+                       font=dict(size=16, color="#0f172a",
+                                 family="Arial, sans-serif"))
+
+    # --- square-scaled, axis-less, generous margins ------------------------
+    fig.update_layout(
+        height=400, margin=dict(t=30, b=8, l=8, r=8),
+        paper_bgcolor="white", plot_bgcolor="white", showlegend=False,
+        xaxis=dict(visible=False, range=[-0.58, 1.58],
+                   scaleanchor="y", scaleratio=1),
+        yaxis=dict(visible=False, range=[-0.10, 1.44]),
+    )
     return fig
 
 
