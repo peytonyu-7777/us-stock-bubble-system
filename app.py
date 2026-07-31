@@ -324,7 +324,7 @@ def history_fig(scores: pd.Series, spx, ndx, log_scale: bool = True,
         rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.06,
         row_heights=[0.65, 0.35],
         subplot_titles=("S&P 500 (left axis)  ·  Nasdaq (right axis)",
-                        "Bubble Risk Score (30-day EMA-smoothed)"),
+                        "Bubble Risk Score (60-day EMA-smoothed)"),
         specs=[[{"secondary_y": True}], [{}]],
     )
 
@@ -393,9 +393,10 @@ def backtest_panel(scores: pd.Series, params: dict):
 
 def main():
     st.title("📈 US Equity Bubble Risk — Dalio-style Monitor")
-    st.caption("Dual-speed Z-score + Sigmoid macro model · 7 factors (70% slow "
-               "macro anchors + 30% fast sentiment/momentum) · dual-pass "
-               "smoothing (20d SMA + 45d EMA) · free/open data (FRED incl. "
+    st.caption("Dual-speed Z-score + Sigmoid macro model · 7 factors (67% slow "
+               "macro anchors + 33% fast sentiment/momentum, F8/F2 emphasised) · "
+               "soft F1+F8+F2 bubble-confirmation interaction · dual-pass "
+               "smoothing (20d SMA + 60d EMA) · free/open data (FRED incl. "
                "EMVMACROBUS, yfinance/Stooq)")
 
     # ---- Sidebar: refresh controls ---------------------------------------
