@@ -709,9 +709,13 @@ def compute_modules(feat_pct: pd.DataFrame,
             continue
         sub = feat_pct[present]
         if mod == "valuation" and tail_boost:
-            # apply the acceleration curve element-wise (vectorized)
-            vals = sub.applymap(lambda v: valuation_curve(v)
-                                if pd.notna(v) else np.nan)
+            # apply the acceleration curve element-wise (vectorized).
+            # NOTE: DataFrame.applymap was REMOVED in pandas 3.0 — use
+            # DataFrame.map (element-wise, available since pandas 2.1).
+            # The old call threw AttributeError -> compute fell into the
+            # synthetic fallback on Render (the "刷新不出数据" root cause).
+            vals = sub.map(lambda v: valuation_curve(v)
+                           if pd.notna(v) else np.nan)
             out[mod] = vals.mean(axis=1)
         else:
             out[mod] = sub.mean(axis=1)
@@ -774,7 +778,11 @@ def compute_composite(feat_pct: pd.DataFrame, weights: dict = None,
 
     # coverage gate on the module level
     total_cov = sum(MODULE_WEIGHTS[m] * cov.get(m, 0.0) for m in MODULE_WEIGHTS)
-    blended = blended.where(total_cov >= MIN_VALID_WEIGHT, np.nan)
+    # NOTE: pandas 3.0 no longer accepts a scalar bool as the cond of
+    # Series.where ("Array conditional must be same shape as self") — gate
+    # with an explicit branch instead (works on pandas 2.x AND 3.x).
+    if total_cov < MIN_VALID_WEIGHT:
+        blended = pd.Series(np.nan, index=blended.index)
 
     score = historical_calibrate(blended)
     return score

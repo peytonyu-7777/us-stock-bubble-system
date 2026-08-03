@@ -1,6 +1,9 @@
 # Core
 streamlit>=1.30
-pandas>=2.2.0
+# Pin <3.0: pandas 3.0 removed DataFrame.applymap (and other 2.x APIs) which
+# silently broke feature computation on Render -> synthetic fallback. Pin the
+# major line for build reproducibility; the code itself is 3.x-safe (uses .map).
+pandas>=2.2.0,<3.0
 numpy>=1.24
 requests>=2.31
 python-dotenv>=1.0       # load FRED_API_KEY (etc.) from a local .env file
