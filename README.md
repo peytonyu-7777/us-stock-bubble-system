@@ -13,10 +13,13 @@ has built up, *not* a crash forecast.
 
 ## 1. The 5 modules & data sources
 
-Every indicator is first converted to a **trailing-historical percentile (0–100,
-no look-ahead)** so no single series can whip the index. Percentiles feed five
-modules, each aggregated from sub-indicators (a module with <50% coverage is
-neutralised, not guessed):
+Every indicator is first converted to a **trailing robust-Z score** (MAD-based
+z of the last 20 years, clipped to ±4σ — no look-ahead, no saturation). This
+replaces the old trailing-percentile design, which pinned any record-breaking
+reading at 100 for as long as it stayed the record (the "index stuck at max"
+pathology). Robust-Z features feed five modules, each aggregated as the mean of
+its sub-indicator Z-scores (a module with <50% coverage is neutralised to 0 =
+median, not guessed):
 
 | Module | Weight | Sub-indicators (proxy / source) | Direction |
 |--------|--------|--------------------------------|-----------|
@@ -43,32 +46,55 @@ unavailable its module weight is redistributed so the score always stays 0–100
 
 ### Bubble-DCA rule (backtest de-risk)
 
-| Score | DCA multiplier (per rebalance period) |
-|-------|----------------------------------------|
-| 0–40 | 2.0× |
-| 40–60 | 1.5× |
-| 60–80 | 1.0× |
-| 80–90 | 0.5× |
-| 90–100 | 0× + move 20% equity → cash |
+The strategy **never changes your monthly outflow** (same $ as plain DCA) — the
+index only decides how much of the cash on hand to *deploy* into SPY:
 
-*(De-risk band thresholds are strategy parameters, independent of the display
-risk bands above.)*
+| Score | Deployment action |
+|-------|-------------------|
+| < 40 | **Deploy base + draw the stockpiled reserve** (up to 2× base) |
+| 40–50 | Deploy base + up to 0.5× reserve |
+| 50–80 | Deploy the base amount only |
+| 80–95 | **Taper: deploy 0.5×, stockpile 0.5× as cash reserve** (earns SHY/FRED 3M yield) |
+| ≥ 95 | Deploy 0 × + move 15% of the portfolio to cash (true extremes only) |
 
-### Scoring refinements (V2)
+Total invested therefore equals plain DCA's exactly — the IRR comparison is a
+pure measure of the index's *timing* skill (stockpile at bubble highs, deploy at
+deep-fear lows). The legacy multiplier mode (scale the contribution itself) is
+still available in the sidebar.
 
-* **Historical calibration, not a "today" pin.** The module blend is affine-
-  calibrated by pinning the dot-com peak (≈ 97) and the GFC trough (≈ 12) and
-  interpolating linearly between — so the 2000 ≈ 95–100, 2007 ≈ 85–90, COVID-pre
-  ≈ 60–70 and 2021 ≈ 75–85 targets fall out of the data, with no hard-coded
-  current level.
+*(Band thresholds are strategy parameters, independent of the display risk
+bands above.)*
+
+### Scoring refinements (V3)
+
+* **Fixed-gain calibration, not data-anchored affine.** The module blend Z is
+  mapped with a deterministic linear map `score = 50 + 28 × blend_z`, clipped to
+  [1, 99]. The old affine re-derived its scale from the dot-com window MAX on
+  every run; when feature availability depressed that anchor (e.g. CAPE missing)
+  the whole scale compressed and dozens of months clipped at 97–99 — the
+  "always at maximum" pathology. The fixed gain is anchor-free, so it is immune
+  to feature availability, and linear-in-Z keeps the top-end spacing so 2000 /
+  2007 / 2021 / today differentiate instead of saturating.
+* **Robust-Z features, no percentile saturation.** Every feature is a MAD-based
+  trailing 240-month Z (clip ±4σ; std fallback when MAD = 0). A record-breaking
+  reading moves the Z continuously instead of pinning at 100 for years.
+* **F5 structure uses the 20y window + 6-month EMA pre-smooth** on one
+  consistent IXIC/SPX ratio (FRED `NASDAQCOM`/`SP500`, 1971+; QQQ/SPY fallback).
+  The old 3-year window made it a fast momentum gauge that whipsawed the whole
+  index (z 1.2 → 3.4 → 1.2 within weeks); the long window keeps the dot-com
+  extreme as the reference max, so later readings are calm and comparable.
+* **FRED-backed price fallback chain.** Prices resolve via
+  `FRED (SP500/NASDAQCOM/VIXCLS) → yfinance → Stooq → FRED` — so the Nasdaq and
+  S&P series survive Yahoo 429s and the Stooq anti-bot wall, and the daily index
+  chart is always available.
 * **K-line stability filter (trend + bounded oscillation).** The daily index is
   decomposed into a slow-EMA trend (TREND_SPAN = 75d — the mid/long-term macro
-  wave) plus a small, hard-capped short-term oscillation (±6 pts) — like a stock
-  K-line: a clear medium-term trend with minor daily wiggle, never a violent
-  sawtooth, never an over-smoothed flat line. A **stress-aware daily clamp**
-  (≤ 1.2 pts normally, ≤ 6 pts under a *stress flag*: VIX > 40 *or* a 21-day S&P
-  drop < −15% *or* a BAA10Y month-over-month jump > 0.5) lets genuine risk
-  events break out fast. All steps are causal (no look-ahead).
+  wave) plus a small, hard-capped short-term oscillation — like a stock K-line:
+  a clear medium-term trend with minor daily wiggle, never a violent sawtooth,
+  never an over-smoothed flat line. A **stress-aware daily clamp** (≤ 0.6 pts
+  normally, ≤ 6 pts under a *stress flag*: VIX > 40 *or* a 21-day S&P drop <
+  −15% *or* a BAA10Y month-over-month jump > 0.5) lets genuine risk events break
+  out fast. All steps are causal (no look-ahead).
 * **Event detection + guidance.** Local peaks ≥ 75 are flagged as risk climaxes
   (trim); local troughs ≤ 35 as accumulation windows (buy) — the deep-fear zone
   has historically marked the strongest forward 12–24m returns (2002-09,
@@ -85,7 +111,13 @@ risk bands above.)*
 * **Honest backtest metrics.** The DCA backtest reports **money-weighted return
   (IRR)**, total invested, final value, max drawdown and a contribution-stripped
   Sharpe — *not* a naive end/start equity "Total Return", which would conflate
-  ongoing contributions with investment growth.
+  ongoing contributions with investment growth. The reserve-recycle mode keeps
+  total invested identical to DCA, isolating the index's timing skill.
+* **On-page diagnostics.** A "🔧 数据诊断" panel shows source, feature
+  availability, FRED_API_KEY presence, per-series Y/N, episode calibration
+  (dot-com/GFC/COVID/2021 peak scores — verifies the V3 calibration with the
+  container's real data) and a live connectivity probe — so a failing deploy is
+  diagnosable from the page itself.
 
 ---
 
@@ -93,9 +125,9 @@ risk bands above.)*
 
 | File | Purpose |
 |------|---------|
-| `pipeline.py` | **Crash-proof concurrent** data fetchers (ThreadPoolExecutor, 5s per-request timeout, hard total deadline, `FuturesTimeoutError` caught + non-blocking shutdown) + vectorized rolling-percentile scoring + **incremental** parquet cache (`bubble_cache.parquet`) + **cache-first, never-raises** resolution (cache → live → synthetic). Includes the **K-line two-timescale daily filter** (`get_daily_scores()`), **event detection** (`detect_events()`: risk climaxes ≥ 75, accumulation troughs ≤ 35) and `historical_benchmarks()` / `opportunity_benchmarks()`. Public API: `get_monthly_scores()`, `get_latest_state()`, `get_daily_scores()`. |
-| `backtest.py` | Buy-&-Hold vs Bubble-DCA (2000→today), **weekly rebalancing by default** (`--freq M` for monthly). Fully **parameterized** engine — CLI flags `--base`, `--low-mult`, `--high-mult`, `--derisk-thr`, `--derisk-cash`, `--cash-yield` (plus `--refresh`/`--freq`). Prints **money-weighted return (IRR)**, total invested, final value, max drawdown, Sharpe + drawdown comparison for 2000/2008/2021. `run_backtest()` returns `(metrics_df, chart_fig)` for the dashboard; `main()` returns the per-side metric dicts for `report.py`. |
-| `app.py` | Terminal-style Streamlit dashboard: gauge + status **badge card**, **🧭 current-guidance panel** (zone → posture, last risk climax / buying window), 5-module radar + monthly drivers, **historical comparison** (risk climaxes 🔴 vs accumulation troughs 🟢, incl. the late-2022 big-buy window), **dual-Y-axis** S&P/Nasdaq history with **event markers** (red ▼ risk, green ▲ opportunity), V2 risk-band shading, an **interactive backtest panel** with honest IRR metrics, and a sidebar *"Valuation acceleration"* toggle. All data loads are guarded — the page degrades to cache/synthetic with a notice instead of ever crashing. **Mobile-responsive**. |
+| `pipeline.py` | **Crash-proof concurrent** data fetchers (ThreadPoolExecutor, per-request timeout, hard total deadline, `FuturesTimeoutError` caught + non-blocking shutdown) + vectorized robust-Z scoring (V3) + **FRED-backed price fallback chain** (`SP500`/`NASDAQCOM`/`VIXCLS`) + **incremental** parquet cache (`bubble_cache.parquet`, format-versioned) + **cache-first, never-raises** resolution (cache → live → synthetic). Includes the **K-line two-timescale daily filter** (`get_daily_scores()`), **event detection** (`detect_events()`), `historical_benchmarks()` / `opportunity_benchmarks()` and `probe_connectivity()`. Public API: `get_monthly_scores()`, `get_latest_state()`, `get_daily_scores()`. |
+| `backtest.py` | Buy-&-Hold vs Bubble-DCA (2000→today), monthly by default. Fully **parameterized** engine with a **reserve-recycle default mode** (same $ outflow as DCA — taper & stockpile at high risk, deploy the reserve at deep-fear lows; bands 40/50/80/95, de-risk ≥ 95). Prints **money-weighted return (IRR)**, total invested, final value, max drawdown, Sharpe + drawdown comparison for 2000/2008/2021. `run_backtest()` returns `(metrics_df, chart_fig)` for the dashboard; `main()` returns the per-side metric dicts for `report.py`. |
+| `app.py` | Terminal-style Streamlit dashboard: gauge + status **badge card**, **🧭 current-guidance panel** (zone → posture, last risk climax / buying window), 5-module radar + monthly drivers, **historical comparison** (risk climaxes 🔴 vs accumulation troughs 🟢, incl. the late-2022 big-buy window), **dual-Y-axis** S&P/Nasdaq history with **event markers**, V3 risk-band shading, an **interactive backtest panel** (reserve-recycle default) with honest IRR metrics, an **on-page diagnostics panel** (source, feature availability, episode calibration, connectivity probe), and a sidebar *"Valuation acceleration"* toggle. All data loads are guarded — the page degrades to cache/synthetic with a notice instead of ever crashing. **Mobile-responsive**. |
 | `requirements.txt`, `Dockerfile`, `render.yaml` | Zero-cost deploy config. |
 
 ---
@@ -188,12 +220,14 @@ This is the only file you edit to supply the API key.
   Volatility Tracker — Business & Sentiment, Baker/Bloom/Davis, monthly, 1985+),
   **inverted** so a *low* index (complacency) scores *high* risk. Only if FRED is
   entirely unavailable does it fall back to the keyless **AAII** % Bullish survey.
-* **F5 (tech froth)** uses a **3-year (156-week) rolling percentile** on the
-  QQQ/SPY ratio (month-end), capturing structural tech deviation over the 2–3
-  year build of a real tech bubble.
-* The historical calibration pins the dot-com peak (≈ 97) and GFC trough (≈ 12)
-  and interpolates linearly; all other levels are data-driven and will differ
-  from any illustrative reference (the live model's own values are what's plotted).
-* The strategy assumes cash (SHY) earns its prevailing yield; the conservative
-  default is 0 if SHY can't be fetched.
+* **F5 (tech froth)** uses the **20-year robust-Z of one consistent IXIC/SPX
+  ratio** (FRED `NASDAQCOM` / `SP500`, 1971+; QQQ/SPY fallback), pre-smoothed
+  with a 6-month EMA — capturing structural tech deviation with the dot-com
+  extreme as the long-term reference, without the old 3-year window's whipsaw.
+* The composite uses the **V3 fixed-gain calibration** (`score = 50 + 28 ×
+  blend_z`, clip [1, 99]) — deterministic and immune to feature availability;
+  all levels are data-driven and will differ from any illustrative reference
+  (the live model's own values are what's plotted).
+* The reserve-recycle strategy assumes cash (SHY / FRED 3M T-bill) earns its
+  prevailing yield; the conservative default is 0 if neither can be fetched.
 * This is a research/educational tool, **not investment advice**.

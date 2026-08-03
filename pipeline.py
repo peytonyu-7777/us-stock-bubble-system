@@ -131,8 +131,9 @@ CACHE_PATH = os.getenv("BUBBLE_CACHE", "bubble_cache.parquet")
 META_PATH = os.getenv("BUBBLE_META", "bubble_cache_meta.json")
 HF_DAILY_PATH = os.getenv("HF_DAILY_CACHE", "hf_daily.parquet")
 
-WINDOW_MONTHS = 240       # 20 years for the "trailing percentile" window
-WINDOW_TECH_MONTHS = 36   # 3-year (~156-week) window for the tech-froth feature (F8)
+WINDOW_MONTHS = 240       # 20 years for the trailing robust-Z window
+# (F5_tech formerly used a 36m recency window — removed: it made the index
+# whipsaw; every feature now measures against the same 20y reference.)
 
 # Concurrency / timeout controls (the heart of the perf refactor)
 # 8s per request: FRED/Stooq from a cold Render container (fresh DNS+TLS,
@@ -220,6 +221,22 @@ HIST_TROUGH_WINDOW = ("2007-10-01", "2009-12-31")  # GFC local min   -> 12
 HIST_PEAK_TARGET = 97.0
 HIST_TROUGH_TARGET = 12.0
 
+# --- V3 fixed-gain calibration ---------------------------------------------
+# The old data-anchored affine (historical_calibrate) re-derived its scale
+# from the dot-com window MAX on every run. When feature availability
+# depressed that anchor (e.g. CAPE missing locally), the whole scale
+# compressed and dozens of months clipped at 97-99 — the "always at max"
+# pathology. V3 replaces it with a DETERMINISTIC linear map on the module
+# blend Z-score: score = 50 + CALIB_Z_GAIN * blend_z, clipped to [1, 99].
+# It depends on NO data anchors, so it is immune to feature availability.
+# Gain chosen so the expected anchors land sensibly:
+#   blend +1.66σ -> ~97 (dot-com 2000, full CAPE data)
+#   blend +0.9σ  -> ~75 (2021 liquidity mania)
+#   blend +0.5σ  -> ~64 (COVID-pre 2020)
+#   blend  0.0   ->  50 (median risk)
+#   blend -1.5σ  ->  ~8 (GFC trough 2008-09)
+CALIB_Z_GAIN = 28.0
+
 # --- Stability layer (principle 1) -----------------------------------------
 # --- K-line style two-timescale stability filter ---------------------------
 # A slow EMA carries the mid/long-term macro trend; a damped fast component
@@ -228,9 +245,11 @@ HIST_TROUGH_TARGET = 12.0
 # never an over-smoothed flat line.
 TREND_SPAN = 75              # slow EMA on the daily series (≈ one quarter)
 OSC_SPAN = 8                 # fast EMA -> short-term component
-OSC_GAIN = 0.55              # fraction of (fast - trend) kept as visible wiggle
-OSC_MAX = 6.0                # hard cap on the short-term oscillation (points)
-DAILY_CLAMP = 1.2            # max |Δ| per day in normal regimes
+OSC_GAIN = 0.45              # fraction of (fast - trend) kept as visible wiggle
+OSC_MAX = 3.5                # hard cap on the short-term oscillation (points)
+# 0.6 pts/day: a 3-pt monthly step is absorbed over ~a week (calm stair-step
+# instead of a jump); was 1.2 which let the line drift ~6 pts/week.
+DAILY_CLAMP = 0.6            # max |Δ| per day in normal regimes
 STRESS_CLAMP = 6.0           # relaxed clamp under genuine stress
 STRESS_VIX = 40.0            # VIX > 40 -> stress
 STRESS_CREDIT_JUMP = 0.5     # BAA10Y MoM widen > 50 bps -> stress
@@ -249,8 +268,15 @@ RISK_BANDS = [
 # the date is NaN (gap, not spike). With all 5 modules live -> 1.0.
 MIN_VALID_WEIGHT = 0.70
 
-# Legacy toggle kept for API compatibility (controls valuation acceleration on/off)
+# Legacy toggle kept for API compatibility (valuation acceleration curve was
+# retired in V3 — see compute_modules; this flag is now a no-op)
 TAIL_BOOST_ON = True
+
+# Cache format marker written into bubble_cache_meta.json. "z" = feat_* cols
+# are robust Z-scores (V3). Anything else/missing = legacy V2 percentiles ->
+# the cache is ignored and rebuilt live (prevents silently misreading old
+# percentile caches as Z after a redeploy).
+FEAT_FORMAT = "z"
 
 FEATURE_LABELS = {
     "F1_valuation": "Valuation (CAPE / Buffett)",
@@ -338,14 +364,16 @@ def _http_get(url: str, timeout: int = FETCH_TIMEOUT) -> Optional[str]:
 
 
 def _fred_csv(series_id: str, start: str = HISTORY_START,
-              timeout: int = FETCH_TIMEOUT) -> Optional[pd.Series]:
-    """Fetch a FRED series as a monthly-end Series via the direct CSV endpoint.
+              timeout: int = FETCH_TIMEOUT,
+              monthly: bool = True) -> Optional[pd.Series]:
+    """Fetch a FRED series via the direct CSV endpoint.
 
     Uses the authenticated `api.stlouisfed.org` endpoint when FRED_API_KEY is
     set (reliable + server-side date filtering) and the keyless
     `fredgraph.csv` endpoint otherwise. Both honour `timeout` natively.
     Falls back to pandas_datareader (bounded by _run_with_timeout) only if the
-    CSV endpoints fail.
+    CSV endpoints fail. ``monthly=False`` keeps the native (daily) frequency —
+    used by the high-frequency VIX/SPX pre-smoothing layer.
     """
     if FRED_API_KEY:
         url = (f"https://api.stlouisfed.org/fred/series/observations"
@@ -356,16 +384,22 @@ def _fred_csv(series_id: str, start: str = HISTORY_START,
                f"?id={series_id}&cosd={start}")
     txt = _http_get(url, timeout=timeout)
     if txt:
-        s = _parse_fred_csv(txt, series_id)
+        s = _parse_fred_csv(txt, series_id, monthly=monthly)
         if s is not None and not s.empty:
             return s
 
     # ---- pandas_datareader fallback (bounded so it can't hang the batch) ---
-    return _run_with_timeout(
+    s = _run_with_timeout(
         lambda: _fred_pdr(series_id, start), timeout=FETCH_TIMEOUT)
+    if s is not None and not monthly:
+        # _fred_pdr resamples to ME; re-expand is lossy, so only monthly mode
+        # uses the pdr fallback meaningfully. Daily mode: return what we have.
+        return None
+    return s
 
 
-def _parse_fred_csv(txt: str, series_id: str) -> Optional[pd.Series]:
+def _parse_fred_csv(txt: str, series_id: str,
+                    monthly: bool = True) -> Optional[pd.Series]:
     try:
         df = pd.read_csv(StringIO(txt))
         if df.empty:
@@ -378,7 +412,8 @@ def _parse_fred_csv(txt: str, series_id: str) -> Optional[pd.Series]:
         s = pd.to_numeric(df[val_col], errors="coerce")
         s.index = pd.to_datetime(df[date_col], errors="coerce")
         s = s.dropna().sort_index()
-        s = s.resample("ME").last()          # monthly month-end
+        if monthly:
+            s = s.resample("ME").last()      # monthly month-end
         return s if not s.empty else None
     except Exception as exc:
         print(f"[fred] {series_id} parse failed: {exc}")
@@ -403,6 +438,20 @@ def _fred_pdr(series_id: str, start: str) -> Optional[pd.Series]:
 
 _STOOQ_MAP = {"^GSPC": "SPX.US", "SPY": "SPY.US", "QQQ": "QQQ.US",
               "^IXIC": "IXIC.US", "^VIX": "VIX.US"}
+
+# FRED price fallbacks — the anti-fragile price layer (user request):
+# Yahoo frequently 429s datacenter IPs and Stooq sits behind a JS proof-of-work
+# wall (confirmed 2026-08), so FRED is the ONLY price source that is both
+# keyless-friendly and API-stable.
+#   ^IXIC -> NASDAQCOM (daily, 1971+; full dot-com history — FRED-PRIMARY)
+#   ^VIX  -> VIXCLS    (daily, 1990+; FRED-PRIMARY, same series as vixcls spec)
+#   ^GSPC -> SP500     (daily, ~2013+; recent-tail fallback only, yf/Stooq
+#                        carry the deep history)
+#   SPY   -> SP500     (LAST RESORT for the backtest: price index, no divs;
+#                        benchmark & strategy use the same series -> fair)
+FRED_PRICE_MAP = {"^GSPC": "SP500", "^IXIC": "NASDAQCOM", "^VIX": "VIXCLS",
+                  "SPY": "SP500"}
+FRED_PRICE_PRIMARY = {"^IXIC", "^VIX"}
 
 
 def _yf_session() -> requests.Session:
@@ -442,11 +491,22 @@ def _stooq_daily(symbol: str, start: str = HISTORY_START) -> Optional[pd.Series]
 
 def _fetch_price(ticker: str, start: str = HISTORY_START,
                  timeout: int = FETCH_TIMEOUT) -> Optional[pd.Series]:
-    """Monthly-close via yfinance (timeout + bot-evading session), Stooq fallback.
+    """Monthly-close price with a three-layer anti-fragile chain.
 
-    Yahoo frequently 429s from cloud IPs; Stooq is keyless and server-friendly,
-    so prices stay REAL on deploy when Yahoo is blocked.
+    Order: [FRED (for FRED_PRICE_PRIMARY tickers)] -> yfinance -> Stooq ->
+    FRED (fallback). Yahoo frequently 429s cloud IPs; Stooq sits behind a JS
+    proof-of-work wall; FRED (SP500 / NASDAQCOM / VIXCLS) is the stable,
+    keyless-capable backbone that keeps prices REAL when both fail.
     """
+    fred_id = FRED_PRICE_MAP.get(ticker)
+
+    # Layer 0: FRED-primary tickers (Nasdaq Composite, VIX) — most reliable.
+    if fred_id and ticker in FRED_PRICE_PRIMARY:
+        s = _fred_csv(fred_id, start=start, timeout=timeout)
+        if s is not None and not s.empty:
+            return s
+
+    # Layer 1: yfinance (deep history, but datacenter-hostile).
     try:
         import yfinance as yf
         df = yf.download(ticker, start=start, auto_adjust=True, actions=False,
@@ -461,9 +521,19 @@ def _fetch_price(ticker: str, start: str = HISTORY_START,
                 return s.resample("ME").last()
     except Exception as exc:  # pragma: no cover - network dependent
         print(f"[yfinance] {ticker} failed: {exc}")
+
+    # Layer 2: Stooq (often behind a JS anti-bot wall — usually fails headless).
     st = _STOOQ_MAP.get(ticker)
     if st:
-        return _stooq_daily(st, start=start)
+        s = _stooq_daily(st, start=start)
+        if s is not None and not s.empty:
+            return s
+
+    # Layer 3: FRED fallback (SP500 for SPY/^GSPC is price-only, no dividends —
+    # acceptable for charts and for the benchmark-vs-strategy comparison,
+    # which uses the SAME series on both sides).
+    if fred_id:
+        return _fred_csv(fred_id, start=start, timeout=timeout)
     return None
 
 
@@ -490,7 +560,14 @@ def _fetch_daily_prices(ticker: str, start: str = HISTORY_START,
         print(f"[yfinance-daily] {ticker} failed: {exc}")
     st = _STOOQ_MAP.get(ticker)
     if st:
-        return _stooq_daily(st, start=start)
+        s = _stooq_daily(st, start=start)
+        if s is not None and not s.empty:
+            return s
+    # FRED daily fallback (^VIX->VIXCLS, ^GSPC->SP500): the anti-fragile layer
+    # for the 10d-SMA pre-smoothing inputs when Yahoo 429s and Stooq is walled.
+    fred_id = FRED_PRICE_MAP.get(ticker)
+    if fred_id:
+        return _fred_csv(fred_id, start=start, timeout=timeout, monthly=False)
     return None
 
 
@@ -598,6 +675,48 @@ def rolling_pct(series, window: int = WINDOW_MONTHS,
 
 
 # ---------------------------------------------------------------------------
+# Rolling ROBUST Z-score (the V3 anti-saturation transform)
+# ---------------------------------------------------------------------------
+def rolling_robust_z(series, window: int = WINDOW_MONTHS,
+                     min_periods: int = 60) -> pd.Series:
+    """Robust trailing Z-score: (x − median) / (1.4826·MAD) over a TRAILING
+    `window`, with a rolling-std fallback when the MAD collapses (flat series).
+
+    WHY THIS REPLACES THE TRAILING PERCENTILE (V2 saturation bug):
+    a trailing-window PERCENTILE pins every record-breaking reading at ~100
+    for as long as it remains the record — so CAPE/momentum/liquidity all sat
+    at pct≈100 for YEARS (2007, 2020, 2021, 2025-26), the module blend maxed
+    out, and the calibrated index clipped at 99 "经常处于最大值". The Z keeps
+    measuring HOW FAR beyond the window each observation is (2000 vs 2007 vs
+    2021 vs today stay differentiated), and the affine calibration maps that
+    spacing linearly onto the 0-100 scale — the top of the scale only binds
+    for genuinely beyond-dot-com extremes.
+
+    Output is clipped to ±4σ for outlier control; NaN-safe, no look-ahead.
+    """
+    s = pd.Series(series, dtype="float64")
+    med = s.rolling(window, min_periods=min_periods).median()
+    mad = (s - med).abs().rolling(window, min_periods=min_periods).median()
+    sd = s.rolling(window, min_periods=min_periods).std()
+    scale = 1.4826 * mad
+    scale = scale.where(scale > 1e-12, sd)   # MAD=0 (flat run) -> std fallback
+    scale = scale.replace(0, np.nan)
+    return ((s - med) / scale).clip(-4.0, 4.0)
+
+
+def z_display(z):
+    """Display mapping for a Z feature/module: 100·Φ(z) -> 0-100, 50 = neutral.
+
+    Used ONLY for presentation (feature cards, module cards). The composite
+    itself works on the raw Z scale, so the monotone squash cannot compress
+    the index's top-end differentiation.
+    """
+    if pd.isna(z):
+        return np.nan
+    return 100.0 * _norm_cdf(float(z))
+
+
+# ---------------------------------------------------------------------------
 # Standard-normal helpers (no scipy dependency)
 # ---------------------------------------------------------------------------
 def _norm_cdf(x: float) -> float:
@@ -683,48 +802,39 @@ def valuation_curve(p: float) -> float:
     return VAL_ACC_OUT + (VAL_MAX - VAL_ACC_OUT) * frac
 
 
-def compute_modules(feat_pct: pd.DataFrame,
+def compute_modules(feat_z: pd.DataFrame,
                     tail_boost: Optional[bool] = None) -> pd.DataFrame:
-    """Aggregate the granular percentile factors into the 5 V2 risk modules.
+    """Aggregate the granular Z features into the 5 V2 risk modules (Z scale).
 
-    Each module is the mean of its available sub-indicator percentiles. The
-    valuation module runs its inputs through ``valuation_curve`` (non-linear
-    froth acceleration) when ``tail_boost`` is ON; when OFF it uses the plain
-    percentile so the dashboard can show the "raw" valuation contribution.
-
-    A module with NO available sub-indicator is filled with neutral 50 (so a
-    single missing series can never swing the blend), and coverage is recorded
+    Each module is the mean of its available sub-indicator Z-scores. A module
+    with NO available sub-indicator is filled with neutral 0 (= median risk),
+    so a single missing series can never swing the blend; coverage is recorded
     for the global gate.
+
+    V3 NOTE: the old valuation acceleration curve (applied to saturated
+    trailing percentiles) was a major contributor to the index pinning at 99 —
+    on the Z scale the blend already differentiates extremes, so the curve is
+    gone. `tail_boost` is kept in the signature for API compatibility and is
+    now a no-op.
     """
-    if tail_boost is None:
-        tail_boost = TAIL_BOOST_ON
-    out = pd.DataFrame(index=feat_pct.index)
+    out = pd.DataFrame(index=feat_z.index)
     coverage = {}
     for mod, cols in MODULE_SUBINDICATORS.items():
-        present = [c for c in cols if c in feat_pct.columns
-                   and feat_pct[c].notna().any()]
+        present = [c for c in cols if c in feat_z.columns
+                   and feat_z[c].notna().any()]
         coverage[mod] = (len(present) / len(cols)) if cols else 0.0
         if not present:
-            out[mod] = 50.0
+            out[mod] = 0.0        # neutral Z (= median), was 50.0 on pct scale
             continue
-        sub = feat_pct[present]
-        if mod == "valuation" and tail_boost:
-            # apply the acceleration curve element-wise (vectorized).
-            # NOTE: DataFrame.applymap was REMOVED in pandas 3.0 — use
-            # DataFrame.map (element-wise, available since pandas 2.1).
-            # The old call threw AttributeError -> compute fell into the
-            # synthetic fallback on Render (the "刷新不出数据" root cause).
-            vals = sub.map(lambda v: valuation_curve(v)
-                           if pd.notna(v) else np.nan)
-            out[mod] = vals.mean(axis=1)
-        else:
-            out[mod] = sub.mean(axis=1)
+        out[mod] = feat_z[present].mean(axis=1)
     out.attrs["coverage"] = coverage
     return out
 
 
 def historical_calibrate(raw: pd.Series) -> pd.Series:
-    """Affine-calibrate the raw composite to the historical bubble scale.
+    """LEGACY (V2) — superseded by the V3 fixed-gain map in compute_composite.
+
+    Affine-calibrate the raw composite to the historical bubble scale.
 
     Pin the MAX raw reading inside ``HIST_PEAK_WINDOW`` (the dot-com episode)
     to ``HIST_PEAK_TARGET`` (97) and the MIN raw reading inside
@@ -732,6 +842,10 @@ def historical_calibrate(raw: pd.Series) -> pd.Series:
     Linear interpolation everywhere else preserves the relative macro wave and
     guarantees the index lands in a realistic [~12, ~97] band with today
     falling wherever the data puts it (no hard-coded "today" pin).
+
+    Kept for reference only: re-deriving the scale from data anchors made the
+    whole index fragile to feature availability — a depressed dot-com anchor
+    compressed the scale and pinned dozens of months at 97-99.
     """
     if raw is None or raw.dropna().empty:
         return raw
@@ -754,13 +868,18 @@ def historical_calibrate(raw: pd.Series) -> pd.Series:
 
 def compute_composite(feat_pct: pd.DataFrame, weights: dict = None,
                       tail_boost: Optional[bool] = None) -> pd.Series:
-    """V2 Bubble Risk Score (0-100) from the granular percentile factors.
+    """V3 Bubble Risk Score (0-100) from the granular robust-Z features.
 
     Pipeline (no look-ahead, fully vectorized):
-      1. Aggregate the 8 granular percentile factors into 5 risk MODULES.
+      1. Aggregate the 8 granular Z features into 5 risk MODULES (Z scale).
       2. Weighted blend the modules (MODULE_WEIGHTS); a module below the
-         coverage gate is neutralised (filled 50) so it can't distort.
-      3. Historical affine calibration -> realistic [12, 97] bubble scale.
+         coverage gate is neutralised (Z=0 = median) so it can't distort.
+      3. Fixed-gain calibration ON THE Z SCALE -> realistic bubble scale:
+         score = 50 + CALIB_Z_GAIN * blend_z, clipped to [1, 99].
+         Linear-in-Z preserves top-end spacing, so the index differentiates
+         2000 / 2007 / 2021 / today instead of clipping at 99. Being
+         data-anchor-free, it cannot be distorted by feature availability
+         (the failure mode that saturated the old affine at 99).
       4. Coverage gate: dates with < MIN_VALID_WEIGHT module coverage -> NaN
          (gap, not spike).
     """
@@ -784,21 +903,32 @@ def compute_composite(feat_pct: pd.DataFrame, weights: dict = None,
     if total_cov < MIN_VALID_WEIGHT:
         blended = pd.Series(np.nan, index=blended.index)
 
-    score = historical_calibrate(blended)
+    # V3 fixed-gain calibration: deterministic linear map on the blend Z.
+    # Robust to feature availability (unlike the old data-anchored affine,
+    # which compressed the scale and pinned 44 months at 97-99 when the
+    # dot-com anchor was depressed by missing features).
+    score = (50.0 + CALIB_Z_GAIN * blended).clip(1.0, 99.0)
     return score
 
 
 def contribution_factor(score: float) -> float:
-    """Monthly DCA multiplier from the Bubble Risk Score (per spec)."""
+    """Monthly DEPLOYMENT multiple from the Bubble Risk Score (V3 bands).
+
+    Kept in sync with backtest.DEFAULT_PARAMS for reference/display only
+    (the backtest engine in backtest.py is the authoritative implementation).
+    V3 semantics: the monthly outflow is constant; this factor describes how
+    much of the cash on hand gets DEPLOYED — >1 draws the reserve, <1
+    stockpiles it.
+    """
     if pd.isna(score):
         return 1.0
     if score < 40:
-        return 2.0
-    if score < 60:
+        return 3.0
+    if score < 50:
         return 1.5
     if score < 80:
         return 1.0
-    if score < 90:
+    if score < 95:
         return 0.5
     return 0.0
 
@@ -920,7 +1050,9 @@ def fetch_all_raw(incremental: bool) -> Tuple[pd.DataFrame, dict]:
 # Feature construction from the (cached) raw frame
 # ---------------------------------------------------------------------------
 def compute_features_from_raw(raw: pd.DataFrame) -> Tuple[pd.DataFrame, dict]:
-    """Turn the raw monthly frame into the 8 risk-percentile features.
+    """Turn the raw monthly frame into the 8 risk features as ROBUST Z-SCORES
+    (V3: replaces the V2 trailing percentiles that saturated at 100 for years
+    and pinned the composite at 99 — see rolling_robust_z).
 
     Factor matrix (weights live in WEIGHTS):
       F1 Valuation    CAPE / Buffett            — slow macro anchor
@@ -962,7 +1094,7 @@ def compute_features_from_raw(raw: pd.DataFrame) -> Tuple[pd.DataFrame, dict]:
     # never double-counts momentum — but it guarantees F1 is never blank.
     parts = []
     if cape is not None and cape.notna().any():
-        parts.append(rolling_pct(cape))
+        parts.append(rolling_robust_z(cape))
     if (wilshire is not None and gdp is not None
             and wilshire.notna().any() and gdp.notna().any()):
         # GDP is QUARTERLY; FRED returns it only at Mar/Jun/Sep/Dec. A naive
@@ -977,17 +1109,17 @@ def compute_features_from_raw(raw: pd.DataFrame) -> Tuple[pd.DataFrame, dict]:
         gdp_daily = gdp.resample("D").last().ffill()
         gdp_m = gdp_daily.resample("ME").last()
         buffett = (wilshire / gdp_m) * 1000.0   # scale-invariant ratio
-        parts.append(rolling_pct(buffett.dropna()))
+        parts.append(rolling_robust_z(buffett.dropna()))
 
     primary = np.nanmean(parts, axis=0) if parts else None
 
     # Zero-fail fallback proxy: S&P 500 distance above its ~200-week MA.
-    # A fat premium = expensive market = high risk (positive percentile).
+    # A fat premium = expensive market = high risk (positive Z).
     ma_pct = None
     if spx is not None and spx.notna().sum() >= 60:
         ma_long = spx.rolling(46).mean()        # 46 months ~ 200 weeks
         prem = (spx / ma_long - 1.0) * 100.0
-        ma_pct = rolling_pct(prem.dropna())
+        ma_pct = rolling_robust_z(prem.dropna())
 
     if primary is not None:
         # fill only the NaN gaps in the primary with the MA proxy
@@ -1004,7 +1136,7 @@ def compute_features_from_raw(raw: pd.DataFrame) -> Tuple[pd.DataFrame, dict]:
         # Last-resort tertiary proxy: inverse S&P 500 dividend yield.
         sp500div = g("sp500div")
         if sp500div is not None and sp500div.notna().sum() >= 12:
-            feat["F1_valuation"] = 100.0 - rolling_pct(sp500div)
+            feat["F1_valuation"] = -rolling_robust_z(sp500div)
             meta["F1_valuation"] = "SP500DIV inverse (last resort)"
         else:
             feat["F1_valuation"] = np.nan
@@ -1019,9 +1151,9 @@ def compute_features_from_raw(raw: pd.DataFrame) -> Tuple[pd.DataFrame, dict]:
         log_cape = np.log(cape.replace(0, np.nan))
         mu = log_cape.rolling(120, min_periods=60).mean()
         sd = log_cape.rolling(120, min_periods=60).std()
-        z = (log_cape - mu) / sd.replace(0, np.nan)
-        cape_z = rolling_pct(z.clip(-4, 4))
-        meta["F1b_cape_z"] = "CAPE z vs 10y (pct)"
+        # already a Z vs the trailing 10y — used directly (no re-percentiling)
+        cape_z = ((log_cape - mu) / sd.replace(0, np.nan)).clip(-4.0, 4.0)
+        meta["F1b_cape_z"] = "CAPE z vs 10y"
     if cape_z is None:
         feat["F1b_cape_z"] = np.nan
         meta["F1b_cape_z"] = "N"
@@ -1043,10 +1175,10 @@ def compute_features_from_raw(raw: pd.DataFrame) -> Tuple[pd.DataFrame, dict]:
         if spx is not None and spx.notna().any():
             mg_ratio = (mg / spx).replace([np.inf, -np.inf], np.nan)
             mg_ratio = mg_ratio.interpolate().ffill().bfill()
-            pct_ratio = rolling_pct(mg_ratio)
+            pct_ratio = rolling_robust_z(mg_ratio)
         else:
             pct_ratio = None
-        pct_yoy = rolling_pct(mg_yoy)
+        pct_yoy = rolling_robust_z(mg_yoy)
         comps = [c for c in (pct_yoy, pct_ratio) if c is not None]
         mg_primary = np.nanmean(comps, axis=0) if comps else None
         meta["F2_leverage"] = "FINRA MGDTE (YoY + debt/SPX)"
@@ -1058,8 +1190,8 @@ def compute_features_from_raw(raw: pd.DataFrame) -> Tuple[pd.DataFrame, dict]:
     if (spx is not None and spx.notna().any()
             and baa10y is not None and baa10y.notna().any()):
         spx_ret12 = spx.pct_change(12) * 100.0
-        credit_ease = 100.0 - rolling_pct(baa10y)   # loose credit = high ease
-        r1 = rolling_pct(spx_ret12)
+        credit_ease = -rolling_robust_z(baa10y)     # loose credit = high ease
+        r1 = rolling_robust_z(spx_ret12)
         mg_fallback = r1 * 0.6 + credit_ease * 0.4
         meta["F2_leverage"] += " + SPX12m/BAA proxy"
 
@@ -1083,11 +1215,11 @@ def compute_features_from_raw(raw: pd.DataFrame) -> Tuple[pd.DataFrame, dict]:
         spx_m = spx_sma.resample("ME").last().dropna()
         if len(spx_m) >= 6:
             mom6 = (spx_m / spx_m.shift(6)) ** (12.0 / 6.0) - 1.0
-            f6_src = rolling_pct(mom6)
+            f6_src = rolling_robust_z(mom6)
             meta["F6_momentum"] = "SPX 10d-SMA -> 6m ann."
     if f6_src is None and spx is not None and spx.notna().any():
         mom6 = (spx / spx.shift(6)) ** (12.0 / 6.0) - 1.0
-        f6_src = rolling_pct(mom6)
+        f6_src = rolling_robust_z(mom6)
         meta["F6_momentum"] = "SPX monthly (SMA fallback)"
     feat["F6_momentum"] = f6_src if f6_src is not None else np.nan
     if meta.get("F6_momentum") is None:
@@ -1101,12 +1233,12 @@ def compute_features_from_raw(raw: pd.DataFrame) -> Tuple[pd.DataFrame, dict]:
         vix_sma = hf["vix"].rolling(10).mean().dropna()
         vix_m = vix_sma.resample("ME").last().dropna()
         if not vix_m.empty:
-            f7_src = 100.0 - rolling_pct(vix_m)
+            f7_src = -rolling_robust_z(vix_m)
             meta["F7_volatility"] = "VIX 10d-SMA (inv)"
     if f7_src is None:
         v = vix if (vix is not None and vix.notna().any()) else vixcls
         if v is not None and v.notna().any():
-            f7_src = 100.0 - rolling_pct(v)
+            f7_src = -rolling_robust_z(v)
             meta["F7_volatility"] = "VIX/VIXCLS monthly (inv)"
     feat["F7_volatility"] = f7_src if f7_src is not None else np.nan
     if meta.get("F7_volatility") is None:
@@ -1116,7 +1248,7 @@ def compute_features_from_raw(raw: pd.DataFrame) -> Tuple[pd.DataFrame, dict]:
     # A compressed spread (blind risk-chasing, ultra-loose credit) is a bubble
     # signal; a wide spread marks panic (2008, 2020-03) — the opposite of froth.
     if baa10y is not None and baa10y.notna().any():
-        feat["F3_credit"] = 100.0 - rolling_pct(baa10y)
+        feat["F3_credit"] = -rolling_robust_z(baa10y)
         meta["F3_credit"] = "Credit(inv)=Y"
     else:
         feat["F3_credit"] = np.nan
@@ -1128,8 +1260,8 @@ def compute_features_from_raw(raw: pd.DataFrame) -> Tuple[pd.DataFrame, dict]:
     if ffr is not None and cpi is not None and ffr.notna().any() and cpi.notna().any():
         cpi_yoy = cpi.pct_change(12) * 100.0
         rr = (ffr - cpi_yoy).replace([np.inf, -np.inf], np.nan)
-        real_rate = rolling_pct(rr)
-        meta["F3b_realrate"] = "FedFunds-CPI (pct)"
+        real_rate = rolling_robust_z(rr)   # high real rate = late-cycle tightening risk
+        meta["F3b_realrate"] = "FedFunds-CPI (z)"
     if real_rate is None:
         feat["F3b_realrate"] = np.nan
         meta["F3b_realrate"] = "N"
@@ -1138,23 +1270,27 @@ def compute_features_from_raw(raw: pd.DataFrame) -> Tuple[pd.DataFrame, dict]:
 
     # ---- F3c Yield Curve (10Y-3M spread, INVERTED) -----------------------
     # An inverted / flat curve is a classic late-cycle risk signal.
+    # SIGN FIX: the old percentile version used +pct(spread) — which reads HIGH
+    # when the curve is STEEP, the exact opposite of the documented intent
+    # (this is part of why 2000/2007 showed no macro-module risk). Now:
+    # Z of the NEGATED spread -> inverted curve = high risk.
     yc = None
     if dgs10 is not None and dgs3mo is not None and dgs10.notna().any() and dgs3mo.notna().any():
         spread = (dgs10 - dgs3mo).replace([np.inf, -np.inf], np.nan)
-        yc = rolling_pct(spread)
-        meta["F3c_yield"] = "10Y-3M (pct)"
+        yc = -rolling_robust_z(spread)
+        meta["F3c_yield"] = "10Y-3M (inv, z)"
     if yc is None:
         feat["F3c_yield"] = np.nan
         meta["F3c_yield"] = "N"
     else:
-        feat["F3c_yield"] = yc                      # already inverted (high = flat/inverted)
+        feat["F3c_yield"] = yc
 
     # ---- F8 Liquidity (M2 YoY + Fed BS YoY) ------------------------------
     parts = []
     if m2 is not None and m2.notna().any():
-        parts.append(rolling_pct(m2.pct_change(12) * 100.0))
+        parts.append(rolling_robust_z(m2.pct_change(12) * 100.0))
     if walcl is not None and walcl.notna().any():
-        parts.append(rolling_pct(walcl.pct_change(12) * 100.0))
+        parts.append(rolling_robust_z(walcl.pct_change(12) * 100.0))
     feat["F8_liquidity"] = np.nanmean(parts, axis=0) if parts else np.nan
     meta["F8_liquidity"] = (f"M2={'Y' if m2 is not None and m2.notna().any() else 'N'} "
                             f"FedBS={'Y' if walcl is not None and walcl.notna().any() else 'N'}")
@@ -1164,24 +1300,47 @@ def compute_features_from_raw(raw: pd.DataFrame) -> Tuple[pd.DataFrame, dict]:
     # FRED_API_KEY it is as stable as every other macro feature. Only if it is
     # entirely missing do we fall back to the keyless AAII bullish survey.
     if emv is not None and emv.notna().sum() >= 12:
-        feat["F4_business"] = 100.0 - rolling_pct(emv)
+        feat["F4_business"] = -rolling_robust_z(emv)
         meta["F4_business"] = "EMVMACROBUS (FRED, inv)"
     else:
         aaii = _aaii_sentiment()
         if aaii is not None and aaii.notna().sum() >= 6:
-            # High bullish (complacency) = risk -> positive percentile.
-            feat["F4_business"] = rolling_pct(aaii)
+            # High bullish (complacency) = risk -> positive Z.
+            feat["F4_business"] = rolling_robust_z(aaii)
             meta["F4_business"] = "AAII bullish (EMV fallback)"
         else:
             feat["F4_business"] = np.nan
             meta["F4_business"] = "N"
 
-    # ---- F5 Tech froth (QQQ/SPY, 3-year (~156-week) rolling percentile) -
-    if (qqq is not None and spy is not None
+    # ---- F5 Tech froth (3-year window) ----------------------------------
+    # ONE consistent ratio — never splice different-scale pairs (the earlier
+    # qqq/spy + ixic/spx combine_first created a level discontinuity that the
+    # Z-score read as a fake ±4σ crash/spike, corrupting the dot-com anchor).
+    # PRIMARY: NASDAQ Composite / S&P 500 — BOTH FRED-backed (NASDAQCOM 1971+,
+    # SP500), full dot-com coverage, survives a total Yahoo+Stooq outage.
+    # FALLBACK: QQQ/SPY (NDX froth; only from 1999).
+    ixic = g("ixic")
+    ratio, ratio_src = None, None
+    if (ixic is not None and spx is not None
+            and ixic.notna().any() and spx.notna().any()):
+        ratio = (ixic / spx).dropna()
+        ratio_src = "IXIC/SPX (FRED-backed)"
+    elif (qqq is not None and spy is not None
             and qqq.notna().any() and spy.notna().any()):
-        ratio = qqq / spy
-        feat["F5_tech"] = rolling_pct(ratio, window=WINDOW_TECH_MONTHS)
-        meta["F5_tech"] = "Y"
+        ratio = (qqq / spy).dropna()
+        ratio_src = "QQQ/SPY"
+    if ratio is not None and ratio.notna().any():
+        # Measure divergence against the LONG 20y window (like every other
+        # feature), NOT the old 3y recency window: a 36-month trailing
+        # median/MAD made F5 a fast momentum gauge whose z whipsawed
+        # (1.2 -> 3.4 -> 1.2 within weeks) and jerked the whole composite
+        # around. A 6-month EMA pre-smooth kills one-month ratio spikes;
+        # with the 20y window the dot-com extreme stays the reference max,
+        # so later readings are calm and comparable across eras.
+        ratio_sm = ratio.ewm(span=6, min_periods=3).mean()
+        feat["F5_tech"] = rolling_robust_z(
+            ratio_sm, window=WINDOW_MONTHS, min_periods=60)
+        meta["F5_tech"] = ratio_src
     else:
         feat["F5_tech"] = np.nan
         meta["F5_tech"] = "N"
@@ -1203,6 +1362,11 @@ def _save_cache(raw: pd.DataFrame, feat: pd.DataFrame, score: pd.Series,
     except Exception:
         pass
     try:
+        # Cache-format marker: feat_* columns are ROBUST Z-SCORES (V3). Readers
+        # must reject caches without this marker (they hold V2 percentiles and
+        # would be silently misread as Z, producing garbage scores).
+        meta = dict(meta)
+        meta["feat_format"] = FEAT_FORMAT
         with open(META_PATH, "w") as f:
             json.dump(meta, f, default=str)
     except Exception:
@@ -1291,6 +1455,10 @@ def _cached_scores(tail_boost: Optional[bool] = None
     if not (os.path.exists(CACHE_PATH) and os.path.exists(META_PATH)):
         return None
     try:
+        # Reject legacy percentile caches (see FEAT_FORMAT).
+        _m = json.load(open(META_PATH))
+        if _m.get("feat_format") != FEAT_FORMAT:
+            return None
         cached = pd.read_parquet(CACHE_PATH)
         fcols = [c for c in cached.columns if c.startswith("feat_")]
         if not fcols:
@@ -1513,7 +1681,9 @@ def _assemble_state(score_series: pd.Series, feat: pd.DataFrame,
     latest_date = score_series.index[-1]
     latest_score = float(score_series.iloc[-1])
 
-    # granular factor detail (for the expandable breakdown)
+    # granular factor detail (for the expandable breakdown). feat holds raw
+    # Z-scores (V3); the dashboard cards expect a 0-100 percentile-style
+    # reading, so we convert via z_display (100·Φ(z)) at the boundary.
     features = {}
     nonempty_feat = feat if feat is not None and not feat.empty else None
     for col in WEIGHTS:
@@ -1522,33 +1692,36 @@ def _assemble_state(score_series: pd.Series, feat: pd.DataFrame,
         else:
             val = np.nan
         features[col] = {
-            "score": None if pd.isna(val) else float(val),
+            "score": None if pd.isna(val) else float(z_display(val)),
             "weight": WEIGHTS[col],
             "label": FEATURE_LABELS.get(col, col),
             "available": not pd.isna(val),
         }
 
-    # ---- 5 module scores at the latest date -------------------------------
+    # ---- 5 module scores at the latest date (Z -> display 0-100) ----------
     modules = {}
+    mod_df = None
     if nonempty_feat is not None:
         mod_df = compute_modules(nonempty_feat, tail_boost=meta.get("_tb"))
         for m in MODULE_WEIGHTS:
             v = mod_df[m].get(latest_date, np.nan)
-            modules[m] = None if pd.isna(v) else float(v)
+            modules[m] = None if pd.isna(v) else float(z_display(v))
 
     # ---- historical percentile of the current reading --------------------
     hist_pct = float((score_series <= latest_score).mean() * 100.0)
 
     # ---- month-over-month drivers (which modules moved the score) ---------
+    # Deltas are computed on the DISPLAY scale (0-100) so the panel reads in
+    # the same units as the module cards.
     drivers = []
-    if nonempty_feat is not None and len(score_series) >= 2:
+    if mod_df is not None and len(score_series) >= 2:
         prev_date = score_series.index[-2]
-        prev_mod = compute_modules(nonempty_feat, tail_boost=meta.get("_tb"))
         for m in MODULE_WEIGHTS:
             cur = mod_df[m].get(latest_date, np.nan)
-            prv = prev_mod[m].get(prev_date, np.nan)
+            prv = mod_df[m].get(prev_date, np.nan)
             if pd.notna(cur) and pd.notna(prv):
-                drivers.append({"module": m, "delta": float(cur - prv),
+                drivers.append({"module": m,
+                                "delta": float(z_display(cur) - z_display(prv)),
                                 "weight": MODULE_WEIGHTS[m]})
         drivers.sort(key=lambda d: abs(d["delta"] * d["weight"]), reverse=True)
 
@@ -1569,7 +1742,16 @@ def get_latest_state(refresh: bool = False,
     tb = TAIL_BOOST_ON if tail_boost is None else tail_boost
     if os.path.exists(CACHE_PATH):
         try:
-            cached = pd.read_parquet(CACHE_PATH)
+            _fmt_ok = True
+            if os.path.exists(META_PATH):
+                try:
+                    _fmt_ok = (json.load(open(META_PATH)).get("feat_format")
+                               == FEAT_FORMAT)
+                except Exception:
+                    _fmt_ok = False
+            else:
+                _fmt_ok = False
+            cached = pd.read_parquet(CACHE_PATH) if _fmt_ok else pd.DataFrame()
             fcols = [c for c in cached.columns if c.startswith("feat_")]
             if fcols:
                 feat = cached[fcols].copy()

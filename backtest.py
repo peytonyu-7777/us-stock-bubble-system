@@ -32,6 +32,7 @@ Run:
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from typing import Optional, Tuple
 
@@ -51,23 +52,46 @@ WEEKLY_BUY = MONTHLY_BUY * 12.0 / 52.0   # ~ $230.77/wk -> same annual flow
 # cash modelled off the real SHY short-bond return since cash_yield defaults 0).
 DEFAULT_PARAMS = {
     "base_monthly": 1000.0,    # base contribution per rebalance period
-    "low_mult": 2.0,           # multiplier when score < 40
-    "high_mult": 0.5,          # multiplier when 80 <= score < de-risk threshold
-    "derisk_threshold": 90.0,  # score at/above which contribution -> 0x + de-risk
-    "derisk_cash": 0.20,       # fraction of portfolio moved to cash on de-risk
+    "low_mult": 3.0,           # deep-value deploy cap: base + up to (low_mult-1)x from reserve
+    "mid_mult": 1.5,           # value deploy cap: base + up to (mid_mult-1)x from reserve
+    "high_mult": 0.5,          # taper fraction at band_high <= score < de-risk threshold
+    "band_low": 40.0,          # deep-value threshold (crash readings)
+    "band_mid": 50.0,          # value threshold (below-median risk)
+    "band_high": 80.0,         # neutral cap (above -> taper, stockpile reserve)
+    "derisk_threshold": 95.0,  # score at/above which deploy -> 0 + de-risk fires
+    "derisk_cash": 0.15,       # target cash-sleeve fraction on de-risk
     "cash_yield": 0.0,         # annualized cash return (%); 0 => use SHY return
+    "recycle": True,           # reserve-recycle DCA: same outflow as plain DCA,
+                               # the index only decides WHEN cash is deployed
 }
 
 
 # ---------------------------------------------------------------------------
 # Data
 # ---------------------------------------------------------------------------
+def _fred_cash_returns(idx: pd.DatetimeIndex, ppy: int) -> Optional[pd.Series]:
+    """Per-period cash return from FRED DGS3MO (3-month T-bill), read from the
+    pipeline parquet cache (no network). Last-resort for when SHY cannot be
+    fetched at all (Yahoo 429 + Stooq anti-bot wall).
+    """
+    try:
+        if not os.path.exists(pipe.CACHE_PATH):
+            return None
+        d = pd.read_parquet(pipe.CACHE_PATH).get("dgs3mo")
+        if d is None or not d.notna().any():
+            return None
+        r = (d.dropna() / 100.0) / float(ppy)      # yield% -> per-period return
+        return r.reindex(idx, method="ffill").fillna(0.0)
+    except Exception:
+        return None
+
+
 def _load_prices(freq: str = "W") -> Tuple[pd.Series, pd.Series]:
     """Return (SPY, SHY) rebalanced to `freq` ('W' = W-FRI, 'M' = month-end)."""
     spy = pipe.get_price_series("SPY", start="1999-06-01")
     shy = pipe.get_price_series("SHY", start="1999-06-01")
     if spy is None:
-        raise RuntimeError("Could not fetch SPY price history (yfinance/Stooq).")
+        raise RuntimeError("Could not fetch SPY price history (yfinance/Stooq/FRED).")
     if shy is None:
         shy = pd.Series(0.0, index=spy.index)   # no short-bond proxy -> 0% cash
 
@@ -177,20 +201,32 @@ def _simulate(price: pd.Series, shy_ret: pd.Series, scores: pd.Series,
     """
     Walk `dates`, buying SPY with `base_contrib` each period.
 
-    timing=True  -> scale contribution by the Bubble Risk Score band and
-                    rebalance toward a cash sleeve when score >= de-risk
-                    threshold (idempotent target: re-deploys to equity when
-                    risk fades).
+    timing=True  -> deploy according to the Bubble Risk Score band. Two modes:
+                    - recycle=True (default): the investor ALWAYS puts the same
+                      base amount in (identical cash outflow to plain DCA); the
+                      index only decides how much of the cash on hand to DEPLOY.
+                      High risk -> taper & stockpile a cash reserve; low risk ->
+                      deploy base + draw the reserve down; extreme -> de-risk
+                      toward a cash sleeve (idempotent target: re-deploys when
+                      risk fades). Total invested == DCA, so the IRR comparison
+                      isolates the index's TIMING skill.
+                    - recycle=False (legacy): the contribution itself is scaled
+                      by the band multiplier.
     timing=False -> pure buy & hold benchmark (fixed contribution, no de-risk).
 
-    Returns (equity_series, derisk_dates).
+    Returns (equity_series, contribution_series, derisk_dates).
     """
     p = params or DEFAULT_PARAMS
     low_mult = float(p["low_mult"])
+    mid_mult = float(p.get("mid_mult", 1.5))
     high_mult = float(p["high_mult"])
+    b_low = float(p.get("band_low", 40.0))      # deep-value band: score < b_low -> low_mult
+    b_mid = float(p.get("band_mid", 50.0))      # value band:      score < b_mid -> mid_mult
+    b_high = float(p.get("band_high", 80.0))    # neutral band:    score < b_high -> 1.0
     thr = float(p["derisk_threshold"])
     cash_frac = float(p["derisk_cash"])
     cash_yield = float(p["cash_yield"])
+    recycle = bool(p.get("recycle", False))
     fixed_growth = (1.0 + cash_yield / 100.0 / ppy) if cash_yield > 0 else None
 
     shares = 0.0
@@ -213,30 +249,63 @@ def _simulate(price: pd.Series, shy_ret: pd.Series, scores: pd.Series,
         if timing:
             if pd.isna(sc):
                 mult, derisk = 1.0, False
-            elif sc < 40:
+            elif sc < b_low:
                 mult, derisk = low_mult, False
-            elif sc < 60:
-                mult, derisk = 1.5, False
-            elif sc < 80:
+            elif sc < b_mid:
+                mult, derisk = mid_mult, False
+            elif sc < b_high:
                 mult, derisk = 1.0, False
             elif sc < thr:
                 mult, derisk = high_mult, False
             else:
                 mult, derisk = 0.0, True
-            shares += base_contrib * mult / price_d
-            if derisk:
-                total = shares * price_d + cash
-                desired_cash = cash_frac * total
-                if desired_cash > cash:
-                    move = desired_cash - cash
-                    shares -= move / price_d
-                    cash += move
-                elif desired_cash < cash:
-                    move = cash - desired_cash
-                    cash -= move
-                    shares += move / price_d
-                derisk_dates.append(d)
-            contribs.append(base_contrib * mult)
+            if recycle:
+                # RESERVE-RECYCLE mode: the investor always contributes the
+                # same base amount (identical cash outflow to plain DCA), the
+                # index only decides how much of the cash on hand to DEPLOY.
+                #   high risk  -> deploy less, stockpile the rest (earns SHY)
+                #   low risk   -> deploy the base AND draw the stockpile down
+                # so total invested == DCA invested and the IRR comparison is
+                # a pure measure of the index's timing skill.
+                pocket = base_contrib
+                if derisk:
+                    deploy = 0.0
+                elif mult < 1.0:
+                    deploy = pocket * mult
+                elif mult > 1.0:
+                    deploy = pocket + min((mult - 1.0) * pocket, cash)
+                else:
+                    deploy = pocket
+                shares += deploy / price_d
+                cash += pocket - deploy
+                if derisk:
+                    total = shares * price_d + cash
+                    desired_cash = cash_frac * total
+                    if desired_cash > cash:
+                        move = desired_cash - cash
+                        shares -= move / price_d
+                        cash += move
+                    elif desired_cash < cash:
+                        move = cash - desired_cash
+                        cash -= move
+                        shares += move / price_d
+                    derisk_dates.append(d)
+                contribs.append(pocket)
+            else:
+                shares += base_contrib * mult / price_d
+                if derisk:
+                    total = shares * price_d + cash
+                    desired_cash = cash_frac * total
+                    if desired_cash > cash:
+                        move = desired_cash - cash
+                        shares -= move / price_d
+                        cash += move
+                    elif desired_cash < cash:
+                        move = cash - desired_cash
+                        cash -= move
+                        shares += move / price_d
+                    derisk_dates.append(d)
+                contribs.append(base_contrib * mult)
         else:
             shares += base_contrib / price_d
             contribs.append(base_contrib)
@@ -298,10 +367,14 @@ def run_backtest(scores: Optional[pd.Series], spy_df: Optional[pd.Series],
 
     # SHY cash return (or fixed money-market if cash_yield > 0)
     shy = pipe.get_price_series("SHY", start="1999-06-01")
+    shy_ret = None
     if shy is not None and prm["cash_yield"] <= 0:
         shy = shy.reindex(spy.index).ffill()
         shy_ret = shy.pct_change().fillna(0.0)
-    else:
+    elif prm["cash_yield"] <= 0:
+        # SHY unavailable (Yahoo 429 + Stooq wall) -> FRED 3M T-bill from cache
+        shy_ret = _fred_cash_returns(spy.index, ppy)
+    if shy_ret is None:
         shy_ret = pd.Series(0.0, index=spy.index)
 
     bench, bench_cf, _ = _simulate(spy, shy_ret, sc, dates, base, ppy,

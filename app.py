@@ -352,28 +352,31 @@ def guidance_panel(state: dict, daily: pd.Series):
         return
     if score < 35:
         posture, color, note = (
-            "ACCUMULATE AGGRESSIVELY · 2.0x DCA", "#1a9850",
+            "ACCUMULATE AGGRESSIVELY · base + max reserve draw", "#1a9850",
             "Deep-fear zone — historically the STRONGEST forward 12–24m return "
-            "window (2002-09, 2009-03, 2020-03, 2022-10).")
+            "window (2002-09, 2009-03, 2020-03, 2022-10). Deploy the stockpiled "
+            "reserve here.")
     elif score < 40:
         posture, color, note = (
-            "ACCUMULATE · 2.0x DCA", "#1a9850",
-            "Cheap / fear zone — risk is below median; keep buying the dip.")
-    elif score < 60:
+            "ACCUMULATE · base + reserve draw (up to 2x)", "#1a9850",
+            "Cheap / fear zone — risk is below median; deploy base plus the "
+            "stockpiled reserve.")
+    elif score < 50:
         posture, color, note = (
-            "STEADY ACCUMULATION · 1.5x DCA", "#2166ac",
-            "Balanced zone — no speculative excess; stay on plan.")
-    elif score < 75:
+            "STEADY ACCUMULATION · base + 0.5x reserve draw", "#2166ac",
+            "Below-median risk — keep buying, plus a moderate reserve top-up.")
+    elif score < 80:
         posture, color, note = (
             "BASE PACE · 1.0x DCA", "#f4a01c",
-            "Valuation elevated — no new aggression, no panic either.")
-    elif score < 90:
+            "Valuation elevated — deploy the base amount only, no new aggression.")
+    elif score < 95:
         posture, color, note = (
-            "TRIM / RAISE CASH · 0.5x DCA", "#e4572e",
-            "Bubble-risk zone — risk is accumulating; scale down exposure.")
+            "TAPER / BUILD RESERVE · 0.5x deploy", "#e4572e",
+            "Bubble-risk zone — deploy half, stockpile half as a cash reserve "
+            "for the next deep-fear window.")
     else:
         posture, color, note = (
-            "DE-RISK · 0x DCA + cash sleeve", "#c1121f",
+            "DE-RISK · 0x deploy + cash sleeve", "#c1121f",
             "Extreme-bubble zone — prioritise capital preservation.")
 
     # Last detected risk climax + accumulation window from the daily series.
@@ -403,9 +406,10 @@ def guidance_panel(state: dict, daily: pd.Series):
       </table>
       <div class="status-note" style="margin-top:6px">When the index falls into
       the deep-fear zone (≤35) it has historically marked the best accumulation
-      windows — e.g. the <b>late-2022 bear bottom</b>. When it pushes above 75 it
-      has preceded every major drawdown. This is risk-accumulation guidance,
-      not a crash prediction.</div>
+      windows — e.g. the <b>late-2022 bear bottom</b>. When it pushes above 80 it
+      has preceded every major drawdown. The plan keeps your monthly outflow
+      constant and only re-times deployment: stockpile at highs, deploy at lows.
+      This is risk-accumulation guidance, not a crash prediction.</div>
     </div>
     """, unsafe_allow_html=True)
 
@@ -539,10 +543,18 @@ def backtest_panel(scores: pd.Series, params: dict, meta: dict = None):
                 "available (fix `FRED_API_KEY` on Render and redeploy).")
         return
 
-    st.caption("Benchmark: fixed ${:,}/mo into SPY (buy & hold). Strategy: scales "
-               "the same contrib. by the Bubble Index band and de-risks to cash when "
-               "the index is extreme. Tune the sliders — table & curve recompute live."
-               .format(int(params["base_monthly"])))
+    if params.get("recycle"):
+        st.caption("Benchmark: fixed ${:,}/mo into SPY (buy & hold). Strategy: the "
+                   "SAME ${:,}/mo outflow — the index only decides deployment: "
+                   "taper & stockpile cash at high risk (≥80), deploy the reserve "
+                   "at low readings (<40/50), de-risk at extremes (≥95). Same "
+                   "total invested, so IRR isolates pure timing skill."
+                   .format(int(params["base_monthly"]), int(params["base_monthly"])))
+    else:
+        st.caption("Benchmark: fixed ${:,}/mo into SPY (buy & hold). Strategy: scales "
+                   "the contribution by the Bubble Index band and de-risks to cash "
+                   "when the index is extreme (legacy multiplier mode)."
+                   .format(int(params["base_monthly"])))
 
     try:
         spy = load_spy()
@@ -672,16 +684,28 @@ def main():
     with st.sidebar.expander("🎛️ Backtest Parameters", expanded=False):
         base_monthly = st.number_input("Base Monthly DCA ($)", min_value=0,
                                        max_value=10000, value=1000, step=100)
-        low_mult = st.slider("Low-Risk Multiplier (Score < 40)", 1.0, 3.0, 2.0, 0.1)
-        high_mult = st.slider("High-Risk Multiplier (60 ≤ Score < thr)",
-                              0.0, 1.0, 0.5, 0.05)
-        derisk_threshold = st.slider("De-Risk Threshold Score", 75, 95, 90, 1)
-        derisk_cash = st.slider("De-Risk Cash Allocation", 0.0, 0.5, 0.20, 0.05)
+        recycle = st.checkbox(
+            "Reserve-recycle mode (same $ outflow as DCA)", value=True,
+            help="ON: you always invest the same monthly amount — at high risk "
+                 "part of it is stockpiled as a cash reserve, at low risk the "
+                 "reserve is deployed. Total invested == plain DCA, so the IRR "
+                 "comparison isolates the index's timing skill. OFF: legacy "
+                 "multiplier mode (contribution itself is scaled).")
+        low_mult = st.slider("Deep-Value Deploy Cap (Score < 40)", 1.0, 4.0, 3.0, 0.1,
+                             help="At deep-value readings deploy the base amount "
+                                  "PLUS up to this multiple drawn from the reserve.")
+        high_mult = st.slider("Taper Fraction (80 ≤ Score < 95)",
+                              0.0, 1.0, 0.5, 0.05,
+                              help="Fraction of the monthly amount deployed at "
+                                   "high risk; the rest is stockpiled.")
+        derisk_threshold = st.slider("De-Risk Threshold Score", 85, 99, 95, 1)
+        derisk_cash = st.slider("De-Risk Cash Allocation", 0.0, 0.5, 0.15, 0.05)
         cash_yield = st.number_input("Cash Yield (Annualized %)", min_value=0.0,
                                      max_value=10.0, value=4.0, step=0.5)
     params = dict(base_monthly=base_monthly, low_mult=low_mult,
                   high_mult=high_mult, derisk_threshold=derisk_threshold,
-                  derisk_cash=derisk_cash, cash_yield=cash_yield)
+                  derisk_cash=derisk_cash, cash_yield=cash_yield,
+                  recycle=recycle)
 
     # ---- Single data pass (cache-first; the pipeline never raises, but keep
     #      a last-resort guard so the page can never hard-crash) -------------
@@ -724,6 +748,25 @@ def main():
         if feats:
             st.caption("Raw series / feature availability (Y = data present):")
             st.json(feats)
+        # Episode calibration readout — verifies the V3 fixed-gain calibration
+        # against the named episodes with whatever data this container has.
+        try:
+            _s, _ = load_scores(refresh=False, tail_boost=tail_boost)
+            bm = pipe.historical_benchmarks(_s)
+            _last = _s.dropna()
+            _today = ({"date": _last.index[-1].strftime("%Y-%m"),
+                       "score": float(_last.iloc[-1])} if not _last.empty else {})
+            st.caption("Episode calibration (peak score inside each window):")
+            st.json({
+                label: {"date": d["date"], "score": round(d["score"], 1)}
+                for label, d in [("dotcom_2000", bm.get("dotcom_2000", {})),
+                                 ("gfc_2007", bm.get("gfc_2007", {})),
+                                 ("covid_pre_2020", bm.get("covid_pre", {})),
+                                 ("bubble_2021", bm.get("bubble_2021", {})),
+                                 ("latest", _today)]
+                if d})
+        except Exception:
+            pass
         if st.button("🌐 Run connectivity probe (FRED / Stooq / Yahoo)"):
             with st.spinner("Probing upstream endpoints from this container..."):
                 probe = pipe.probe_connectivity()
