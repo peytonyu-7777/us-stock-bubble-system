@@ -537,91 +537,40 @@ def history_fig(scores: pd.Series, spx, ndx, log_scale: bool = True,
     fig.update_yaxes(title_text="Nasdaq", type=ytype, row=1, col=1,
                      secondary_y=True)
 
-    # Row 2: smoothed score with risk-zone background shading + canonical
-    # event markers (dot-com / GFC / 2021 / COVID / etc.). Markers carry
-    # VERTICAL text labels INSIDE the chart at their actual dates, so the
-    # right axis stays clean — no more crammed legend.
+    # Row 2: smoothed score with risk-zone background shading. Clean layout:
+    # score line + coloured bands only — no dashed reference lines, no event
+    # markers, no right-side text — purely the Bubble Index wave.
     if not sc.empty:
         fig.add_trace(go.Scatter(x=sc.index, y=sc.values, name="Bubble Index",
-                                 line={"color": "#c1121f", "width": 2},
-                                 fill="tozeroy", fillcolor="rgba(193,18,31,0.06)"),
+                                 line={"color": "#c1121f", "width": 2.2},
+                                 fill="tozeroy", fillcolor="rgba(193,18,31,0.05)"),
                       row=2, col=1)
-        # Stronger, more distinct zone colours (was 0.06-0.14 — invisible washes)
-        fig.add_hrect(y0=0, y1=40, fillcolor="rgba(16,185,129,0.22)",
+        # Distinct, evenly-weighted zone colours (no transparent washes)
+        fig.add_hrect(y0=0,  y1=40,  fillcolor="rgba(16,185,129,0.28)",
                       line_width=0, row=2, col=1, layer="below")
-        fig.add_hrect(y0=40, y1=60, fillcolor="rgba(59,130,246,0.10)",
+        fig.add_hrect(y0=40, y1=60,  fillcolor="rgba(59,130,246,0.16)",
                       line_width=0, row=2, col=1, layer="below")
-        fig.add_hrect(y0=60, y1=75, fillcolor="rgba(245,158,11,0.18)",
+        fig.add_hrect(y0=60, y1=75,  fillcolor="rgba(245,158,11,0.22)",
                       line_width=0, row=2, col=1, layer="below")
-        fig.add_hrect(y0=75, y1=90, fillcolor="rgba(239,68,68,0.18)",
+        fig.add_hrect(y0=75, y1=90,  fillcolor="rgba(239,68,68,0.22)",
                       line_width=0, row=2, col=1, layer="below")
-        fig.add_hrect(y0=90, y1=100, fillcolor="rgba(153,27,27,0.26)",
+        fig.add_hrect(y0=90, y1=100, fillcolor="rgba(153,27,27,0.30)",
                       line_width=0, row=2, col=1, layer="below")
-        fig.add_hline(y=75, line_dash="dash", line_color="#ef4444",
-                      annotation_text="Bubble Risk > 75",
-                      annotation_position="top left", row=2, col=1)
+        # No dashed hline, no event markers, no right-side annotations — the
+        # user asked for a clean Bubble Index view with bands only.
 
-        # Canonical events with INLINE vertical labels below each marker
-        try:
-            bm = pipe.historical_benchmarks(sc)
-            opp = pipe.opportunity_benchmarks(sc)
-            risk_evts = [
-                ("Dot-com '00", bm.get("dotcom_2000", {})),
-                ("GFC '07", bm.get("gfc_2007", {})),
-                ("COVID-pre '20", bm.get("covid_pre", {})),
-                ("Bubble '21", bm.get("bubble_2021", {})),
-            ]
-            opp_evts = [
-                ("Dot-com bottom '02", opp.get("dotcom_trough_2002", {})),
-                ("GFC bottom '09", opp.get("gfc_trough_2009", {})),
-                ("COVID bottom '20", opp.get("covid_trough_2020", {})),
-                ("Bear bottom '22", opp.get("bear_trough_2022", {})),
-            ]
-            rx = []; ry = []; rt = []
-            for label, d in risk_evts:
-                if d:
-                    rx.append(pd.Timestamp(d["date"]))
-                    ry.append(float(d["score"])); rt.append(label)
-            ox = []; oy = []; ot = []
-            for label, d in opp_evts:
-                if d:
-                    ox.append(pd.Timestamp(d["date"]))
-                    oy.append(float(d["score"])); ot.append(label)
-
-            if rx:
-                fig.add_trace(go.Scatter(
-                    x=rx, y=ry, mode="markers+text",
-                    name="Risk climax (▼ label)",
-                    text=rt,
-                    textposition="bottom center", textangle=-90,
-                    textfont=dict(size=10, color="#7f1d1d"),
-                    cliponaxis=False,
-                    marker={"color": "#c1121f", "size": 10, "symbol": "triangle-down",
-                            "line": {"color": "white", "width": 1}},
-                    hovertemplate="%{text}: %{x|%Y-%m} · score %{y:.0f}<extra></extra>"),
-                    row=2, col=1)
-            if ox:
-                fig.add_trace(go.Scatter(
-                    x=ox, y=oy, mode="markers+text",
-                    name="Buying zone (▲ label)",
-                    text=ot,
-                    textposition="bottom center", textangle=-90,
-                    textfont=dict(size=10, color="#14532d"),
-                    cliponaxis=False,
-                    marker={"color": "#1a9850", "size": 10, "symbol": "triangle-up",
-                            "line": {"color": "white", "width": 1}},
-                    hovertemplate="%{text}: %{x|%Y-%m} · score %{y:.0f}<extra></extra>"),
-                    row=2, col=1)
-        except Exception:
-            pass
-
-    fig.update_layout(height=660, hovermode="x unified", showlegend=True,
-                      margin={"t": 50, "b": 30, "l": 62, "r": 62},
-                      legend=dict(orientation="h", y=1.05, x=0),
+    fig.update_layout(height=620, hovermode="x unified", showlegend=False,
+                      margin={"t": 40, "b": 30, "l": 56, "r": 24},
                       plot_bgcolor="white", paper_bgcolor="white")
+    # No gridlines anywhere — pure coloured bands carry the scale meaning.
+    fig.update_xaxes(showgrid=False, showline=True, linecolor="#e2e8f0",
+                     ticks="outside", row=2, col=1)
+    fig.update_yaxes(showgrid=False, showline=True, linecolor="#e2e8f0",
+                     ticks="outside", row=2, col=1, range=[0, 100],
+                     title_text="Bubble Index", title_font=dict(size=11))
+    fig.update_xaxes(showgrid=False, row=1, col=1)
+    fig.update_yaxes(showgrid=False, row=1, col=1)
     if view == "3y":
-        # Clean presentation window: lock the score axis to 0-100 so the near-3y
-        # wave reads as a crisp macro oscillator (matches the reference chart).
         fig.update_yaxes(range=[0, 100], row=2, col=1)
     return fig
 
@@ -1037,13 +986,42 @@ def main():
         horizontal=True,
         help="All = full 2000-present macro cycle; 3-Year = zoomed 2023-07-31 → "
              "today window with a fixed 0-100 score axis.")
-    daily = _daily_for_guidance
+
+    # --- User-selectable year range for the chart (independent of backtest) -
+    daily_for_chart = _daily_for_guidance
+    if not daily_for_chart.empty:
+        years = sorted({int(d.year) for d in daily_for_chart.index})
+        if years:
+            c1, c2, c3 = st.columns([1, 1, 1.2])
+            hist_start = c1.select_slider(
+                "Chart start year", options=years,
+                value=st.session_state.get("hist_start", min(years)),
+                key="hist_start_widget",
+                help="历史趋势图起始年份")
+            hist_end = c2.select_slider(
+                "Chart end year", options=years,
+                value=st.session_state.get("hist_end", max(years)),
+                key="hist_end_widget",
+                help="历史趋势图结束年份")
+            if hist_start > hist_end:
+                hist_start, hist_end = hist_end, hist_start
+            st.session_state["hist_start"] = hist_start
+            st.session_state["hist_end"] = hist_end
+            daily_for_chart = daily_for_chart.loc[
+                (daily_for_chart.index.year >= hist_start)
+                & (daily_for_chart.index.year <= hist_end)]
+            c3.markdown(
+                f"<div style='font-size:12px;color:#475569;padding-top:1.6rem'>"
+                f"📅 显示区间: <b>{hist_start}–{hist_end}</b> "
+                f"({len(daily_for_chart)} 个交易日)</div>",
+                unsafe_allow_html=True)
+
     try:
         spx, ndx = load_prices()
     except Exception:
         spx, ndx = None, None
-    st.plotly_chart(history_fig(daily if not daily.empty else scores, spx, ndx,
-                                log_scale=log_scale, view=view),
+    st.plotly_chart(history_fig(daily_for_chart if not daily_for_chart.empty else scores,
+                                spx, ndx, log_scale=log_scale, view=view),
                     use_container_width=True)
 
     # ---- Strategy backtest (interactive) --------------------------------
