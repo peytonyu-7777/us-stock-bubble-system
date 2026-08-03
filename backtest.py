@@ -352,14 +352,17 @@ def run_backtest(scores: Optional[pd.Series], spy_df: Optional[pd.Series],
     # Uses the SAME V2 risk-band shading as the history view so the backtest
     # reads with the rest of the dashboard instead of looking like a stray plot.
     fig = make_subplots(specs=[[{"secondary_y": True}]])
+    # NOTE: secondary_y is an add_trace() argument, NOT a go.Scatter property —
+    # passing it inside go.Scatter(...) raises "Invalid property" in Plotly's
+    # _process_kwargs (this is what crashed the backtest panel on Render).
     fig.add_trace(go.Scatter(x=bench.index, y=bench.values,
                              name="Benchmark (Buy & Hold DCA)",
-                             line={"color": "#1f4e79", "width": 2},
-                             secondary_y=False), 0, 0)
+                             line={"color": "#1f4e79", "width": 2}),
+                  secondary_y=False)
     fig.add_trace(go.Scatter(x=strat.index, y=strat.values,
                              name="Bubble Risk-Adjusted DCA",
-                             line={"color": "#c1121f", "width": 2},
-                             secondary_y=False), 0, 0)
+                             line={"color": "#c1121f", "width": 2}),
+                  secondary_y=False)
 
     # V2 risk-band horizontal shading + labels on the score (right) axis.
     band_tints = ["#e8f0fe", "#e6f4ea", "#fef6e0", "#fde7d3", "#fbe2e2"]
@@ -376,7 +379,8 @@ def run_backtest(scores: Optional[pd.Series], spy_df: Optional[pd.Series],
     fig.add_trace(go.Scatter(x=sc.index, y=sc.values,
                              name="Bubble Risk Score",
                              line={"color": "#888888", "width": 1, "dash": "dot"},
-                             opacity=0.65, secondary_y=True), 0, 0)
+                             opacity=0.65),
+                  secondary_y=True)
 
     if derisk_dates:
         dm = pd.Series([strat.get(d, np.nan) for d in derisk_dates],
@@ -387,7 +391,7 @@ def run_backtest(scores: Optional[pd.Series], spy_df: Optional[pd.Series],
                                      marker={"color": "#e4572e", "size": 7,
                                              "symbol": "triangle-down"},
                                      hovertemplate="De-risk @ %{x|%Y-%m}<extra></extra>"),
-                          0, 0)
+                          secondary_y=False)
 
     fig.update_layout(height=460, hovermode="x unified",
                       margin={"t": 30, "b": 30, "l": 75, "r": 95},

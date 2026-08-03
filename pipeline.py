@@ -32,7 +32,7 @@ PERFORMANCE DESIGN (production refactor)
   per-request timeout (`FETCH_TIMEOUT = 5s`) and the whole batch is bounded by a
   total wall-clock deadline (`FETCH_DEADLINE`). A request that times out or
   errors is set to None and never blocks the other 7 — the system returns in
-  ~3-9 seconds with whatever subset is live.
+  ~3-14 seconds with whatever subset is live.
 * INCREMENTAL CACHE: the first successful run pulls 1990->today and persists the
   raw monthly series + derived features to `bubble_cache.parquet`. On a later
   refresh we only re-fetch the last ~30 days (INCREMENTAL_DAYS), append and
@@ -136,7 +136,12 @@ WINDOW_TECH_MONTHS = 36   # 3-year (~156-week) window for the tech-froth feature
 
 # Concurrency / timeout controls (the heart of the perf refactor)
 FETCH_TIMEOUT = 5         # hard per-request timeout (seconds)
-FETCH_DEADLINE = 9        # total wall-clock deadline for the whole batch
+# Total wall-clock deadline for the whole batch. 19 series / 8 workers = 3
+# waves; a cold Render container (fresh DNS+TLS, slow disk) can make each
+# wave take ~4-5s, so 9s was too tight and was a contributor to the
+# all-failed -> synthetic fallback seen in production. The 14s bound only
+# applies to the refresh path — the default page load is cache-first.
+FETCH_DEADLINE = 14       # total wall-clock deadline for the whole batch
 INCREMENTAL_DAYS = 30     # on refresh: only re-fetch the last ~30 days
 
 # ===========================================================================

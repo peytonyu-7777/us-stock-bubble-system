@@ -520,20 +520,38 @@ def history_fig(scores: pd.Series, spx, ndx, log_scale: bool = True,
     return fig
 
 
-def backtest_panel(scores: pd.Series, params: dict):
+def backtest_panel(scores: pd.Series, params: dict, meta: dict = None):
     """Interactive Bubble-DCA vs Buy&Hold backtest. Delegates to the crash-proof
     engine in backtest.py (run_backtest returns (metrics_df, chart_fig) or None).
     Metrics are HONEST for a DCA (money-weighted return / total invested /
     final value / max drawdown) — never a naive end/start equity ratio.
+    Never raises: any engine error degrades to a friendly warning so the rest
+    of the dashboard keeps rendering.
     """
     st.subheader("📊 Strategy Backtest — Bubble-Risk DCA vs Buy & Hold (2000-Present)")
+
+    # Synthetic score series would produce a meaningless backtest — skip it
+    # explicitly instead of rendering numbers that look authoritative.
+    if meta and meta.get("source") == "synthetic":
+        st.info("⏸️ Backtest is paused while the score series is in **synthetic** "
+                "fallback mode — a DCA backtest against fabricated risk data would "
+                "be misleading. It resumes automatically once real FRED data is "
+                "available (fix `FRED_API_KEY` on Render and redeploy).")
+        return
+
     st.caption("Benchmark: fixed ${:,}/mo into SPY (buy & hold). Strategy: scales "
                "the same contrib. by the Bubble Index band and de-risks to cash when "
                "the index is extreme. Tune the sliders — table & curve recompute live."
                .format(int(params["base_monthly"])))
 
-    spy = load_spy()
-    res = bt.run_backtest(scores, spy, params)
+    try:
+        spy = load_spy()
+        res = bt.run_backtest(scores, spy, params)
+    except Exception as exc:
+        st.warning(f"Backtest engine hit an error (rest of dashboard unaffected): "
+                   f"`{exc!r}`")
+        return
+
     if res is None:
         st.warning("Backtest needs SPY price history + a scored series (cache). "
                    "Run the scoring first / ensure network connectivity.")
@@ -680,8 +698,11 @@ def main():
     src_label = {"live": "Real-time", "cache": "Cached", "synthetic": "Synthetic"}.get(src, src)
     if src == "synthetic":
         st.warning("⚠️ Live data unavailable — showing a **deterministic synthetic** "
-                   "series for layout/demo only. Set `FRED_API_KEY` and uncheck the "
-                   "cache to fetch real data.")
+                   "series for layout/demo only. On Render, set `FRED_API_KEY` as an "
+                   "**environment variable for BOTH build and runtime** (Dashboard → "
+                   "Environment → Add, no quotes), then trigger **Manual Deploy → "
+                   "Clear build cache & deploy** so the baked parquet cache is rebuilt "
+                   "with real FRED data.")
     elif src == "cache":
         st.info("ℹ️ Showing cached data (set refresh to pull live).")
 
@@ -734,7 +755,7 @@ def main():
                     use_container_width=True)
 
     # ---- Strategy backtest (interactive) --------------------------------
-    backtest_panel(scores, params)
+    backtest_panel(scores, params, meta)
 
 
 if __name__ == "__main__":
