@@ -706,6 +706,31 @@ def main():
     elif src == "cache":
         st.info("ℹ️ Showing cached data (set refresh to pull live).")
 
+    # ---- Data diagnostics (auto-open when in synthetic fallback) ----------
+    # Turns the "刷新不出数据" black box into concrete answers: which upstream
+    # endpoints are reachable from THIS container, whether FRED_API_KEY is
+    # present, and which raw series / features came back. No log access needed.
+    with st.expander("🔧 数据诊断 (Data diagnostics)",
+                     expanded=(src == "synthetic")):
+        feats = meta.get("features", {}) or {}
+        diag = {
+            "source": src,
+            "available_features": meta.get("available_count"),
+            "FRED_API_KEY set (runtime)": bool(os.getenv("FRED_API_KEY")),
+            "fetch deadline (s)": pipe.FETCH_DEADLINE,
+            "per-request timeout (s)": pipe.FETCH_TIMEOUT,
+        }
+        st.json(diag)
+        if feats:
+            st.caption("Raw series / feature availability (Y = data present):")
+            st.json(feats)
+        if st.button("🌐 Run connectivity probe (FRED / Stooq / Yahoo)"):
+            with st.spinner("Probing upstream endpoints from this container..."):
+                probe = pipe.probe_connectivity()
+            st.write(f"FRED_API_KEY set: **{probe['fred_api_key_set']}**")
+            st.dataframe(pd.DataFrame(probe["targets"]),
+                         use_container_width=True, hide_index=True)
+
     # ---- Top: gauge (left) + status card (right) -------------------------
     c1, c2 = st.columns([1, 1.15])
     with c1:

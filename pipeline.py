@@ -1223,6 +1223,50 @@ def _synthetic_scores(start: str = LIVE_START) -> pd.Series:
 
 
 # ---------------------------------------------------------------------------
+# Connectivity probe (for the on-page diagnostics panel)
+# ---------------------------------------------------------------------------
+def probe_connectivity(timeout: int = 6) -> dict:
+    """Probe each upstream endpoint and report per-target status + latency.
+
+    Used by the dashboard's diagnostics expander so a failing deploy (e.g.
+    blocked egress, rate-limited shared IP, missing FRED_API_KEY) is visible
+    from the page itself instead of needing Render shell/log access.
+    NEVER raises.
+    """
+    import time
+    out: dict = {"fred_api_key_set": bool(FRED_API_KEY), "targets": []}
+
+    def _probe(name: str, url: str, expect: Optional[str] = None) -> None:
+        t0 = time.time()
+        txt = _http_get(url, timeout=timeout)
+        dt = int((time.time() - t0) * 1000)
+        if txt is None:
+            out["targets"].append({"target": name, "ok": False, "ms": dt,
+                                   "detail": "request failed (timeout/blocked)"})
+            return
+        ok = (expect in txt) if expect else bool(txt.strip())
+        detail = f"{len(txt)} bytes" if ok else \
+            f"unexpected payload ({txt[:60]!r})"
+        out["targets"].append({"target": name, "ok": ok, "ms": dt,
+                               "detail": detail})
+
+    _probe("FRED keyless CSV (fredgraph.csv)",
+           "https://fred.stlouisfed.org/graph/fredgraph.csv?id=VIXCLS",
+           expect="VIXCLS")
+    if FRED_API_KEY:
+        _probe("FRED API (with key)",
+               f"https://api.stlouisfed.org/fred/series/observations"
+               f"?series_id=VIXCLS&api_key={FRED_API_KEY}&file_type=csv",
+               expect="VIXCLS")
+    _probe("Stooq daily CSV (SPX.US)",
+           "https://stooq.com/q/d/l/?s=SPX.US&i=d", expect="Close")
+    _probe("Yahoo Finance chart API (^GSPC)",
+           "https://query1.finance.yahoo.com/v8/finance/chart/"
+           "%5EGSPC?range=5d&interval=1d", expect="chart")
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 def _cached_scores(tail_boost: Optional[bool] = None
