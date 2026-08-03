@@ -498,20 +498,23 @@ def run_backtest(scores: Optional[pd.Series], spy_df: Optional[pd.Series],
                           row=1, col=1, secondary_y=False)
 
     fig.update_layout(height=620, hovermode="x unified",
-                      margin={"t": 50, "b": 50, "l": 80, "r": 80},
-                      legend=dict(orientation="h", y=1.08, x=0,
-                                  xanchor="left", yanchor="bottom",
+                      margin={"t": 55, "b": 50, "l": 80, "r": 80},
+                      legend=dict(orientation="h", y=1.10, x=1,
+                                  xanchor="right", yanchor="bottom",
                                   bgcolor="rgba(255,255,255,0.6)",
                                   bordercolor="#e2e8f0", borderwidth=0),
                       plot_bgcolor="white", paper_bgcolor="white",
                       font=dict(size=11))
-    # Shorter, non-overlapping axis titles + side margins so labels breathe
+    # Shorter, non-overlapping axis titles + side margins so labels breathe.
+    # Explicit autorange so the chart auto-stretches to the selected time
+    # window (the user asked for auto-rescale after changing the range).
     fig.update_yaxes(title_text="USD", row=1, col=1, secondary_y=False,
-                     title_font=dict(size=11))
+                     title_font=dict(size=11), autorange=True)
     fig.update_yaxes(title_text="Score", row=1, col=1, secondary_y=True,
                      title_font=dict(size=11), range=[0, 100])
-    fig.update_xaxes(title_text="", row=1, col=1)
-    fig.update_xaxes(title_text="Date", row=2, col=1,
+    fig.update_yaxes(autorange=True, row=2, col=1)
+    fig.update_xaxes(title_text="", row=1, col=1, autorange=True)
+    fig.update_xaxes(title_text="Date", row=2, col=1, autorange=True,
                      title_font=dict(size=11))
 
     return metrics_df, fig

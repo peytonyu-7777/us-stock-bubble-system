@@ -498,8 +498,9 @@ def history_fig(scores: pd.Series, spx, ndx, log_scale: bool = True,
     #               a linear rebased right axis that already makes log moot.
 
     sc = scores.dropna()
-    # Rebase SPX/NDX to 100 at the FIRST common date so both start from the
-    # same baseline — makes their relative runs directly comparable.
+    # Rebase SPX/NDX to 100 at the FIRST date of the (already sliced) window so
+    # both indices start from the same baseline — makes their relative runs
+    # directly comparable.
     def _rebase(s: pd.Series) -> pd.Series:
         s = s.dropna()
         if s.empty:
@@ -509,21 +510,15 @@ def history_fig(scores: pd.Series, spx, ndx, log_scale: bool = True,
     spx_r = _rebase(spx) if spx is not None and not spx.empty else None
     ndx_r = _rebase(ndx) if ndx is not None and not ndx.empty else None
 
-    # Intersect on a common x-grid so the three lines align perfectly
-    common = sc.index
-    if spx_r is not None and not spx_r.empty:
-        common = common.intersection(spx_r.index)
-    if ndx_r is not None and not ndx_r.empty:
-        common = common.intersection(ndx_r.index)
-    common = common.sort_values()
-
-    sc_aligned = sc.reindex(common)
-    spx_aligned = spx_r.reindex(common) if spx_r is not None else None
-    ndx_aligned = ndx_r.reindex(common) if ndx_r is not None else None
-
+    # No forced common grid: Plotly overlays mixed frequencies fine, and the
+    # daily Bubble Index keeps its full daily detail.
     fig = make_subplots(specs=[[{"secondary_y": True}]])
 
-    # ---- Coloured risk bands (anchored to the LEFT 0-100 Bubble Index axis)
+    # ---- Coloured risk bands on the LEFT (Bubble Index) axis -------------
+    # add_hrect binds to the subplot's PRIMARY axis (yref="y" = the 0-100
+    # Bubble Index axis). exclude_empty_subplots=False is CRITICAL: the
+    # default True silently DROPS the shape when no trace exists yet
+    # (Plotly 6.x behaviour — this made the bands invisible).
     band_tints = [
         (0, 40,  "rgba(16,185,129,0.28)", "Cheap / Fear"),
         (40, 60, "rgba(59,130,246,0.16)", "Normal"),
@@ -533,38 +528,38 @@ def history_fig(scores: pd.Series, spx, ndx, log_scale: bool = True,
     ]
     for lo, hi, color, _ in band_tints:
         fig.add_hrect(y0=lo, y1=hi, fillcolor=color, line_width=0,
-                      layer="below", secondary_y=False)
+                      layer="below", exclude_empty_subplots=False)
 
     # ---- Rebased prices (right axis) ----
-    if spx_aligned is not None and not spx_aligned.dropna().empty:
+    if spx_r is not None and not spx_r.empty:
         fig.add_trace(go.Scatter(
-            x=spx_aligned.index, y=spx_aligned.values, name="S&P 500 (rebased=100)",
+            x=spx_r.index, y=spx_r.values, name="S&P 500 (rebased=100)",
             line={"color": "#1f4e79", "width": 2},
             hovertemplate="S&P 500 · %{y:.1f} (rebased)<extra></extra>",
         ), secondary_y=True)
-    if ndx_aligned is not None and not ndx_aligned.dropna().empty:
+    if ndx_r is not None and not ndx_r.empty:
         fig.add_trace(go.Scatter(
-            x=ndx_aligned.index, y=ndx_aligned.values, name="Nasdaq (rebased=100)",
+            x=ndx_r.index, y=ndx_r.values, name="Nasdaq (rebased=100)",
             line={"color": "#6a1b9a", "width": 2},
             hovertemplate="Nasdaq · %{y:.1f} (rebased)<extra></extra>",
         ), secondary_y=True)
 
     # ---- Bubble Index (left axis) ----
-    if not sc_aligned.dropna().empty:
+    if not sc.empty:
         fig.add_trace(go.Scatter(
-            x=sc_aligned.index, y=sc_aligned.values,
+            x=sc.index, y=sc.values,
             name="Bubble Index", line={"color": "#c1121f", "width": 2.6},
             fill="tozeroy", fillcolor="rgba(193,18,31,0.05)",
             hovertemplate="Bubble Index · %{y:.1f}<extra></extra>",
         ), secondary_y=False)
 
     # ---- Layout ----
-    if view == "3y":
-        fig.update_yaxes(range=[0, 100], row=1, col=1, secondary_y=False)
+    # Title top-left, legend top-right — they never collide. The x/y ranges
+    # autorange to the sliced data so the chart auto-stretches on range change.
     fig.update_layout(
         height=520, hovermode="x unified", showlegend=True,
         margin={"t": 50, "b": 50, "l": 70, "r": 90},
-        legend=dict(orientation="h", y=1.10, x=0, xanchor="left",
+        legend=dict(orientation="h", y=1.12, x=1, xanchor="right",
                     bgcolor="rgba(255,255,255,0.6)", bordercolor="#e2e8f0"),
         plot_bgcolor="white", paper_bgcolor="white",
         title=dict(text="Bubble Index (left) · S&P 500 / Nasdaq rebased to 100 (right)",
@@ -572,12 +567,14 @@ def history_fig(scores: pd.Series, spx, ndx, log_scale: bool = True,
         font=dict(size=11),
     )
     fig.update_xaxes(showgrid=False, showline=True, linecolor="#e2e8f0",
-                     ticks="outside", row=1, col=1)
+                     ticks="outside", row=1, col=1,
+                     autorange=True)
     fig.update_yaxes(showgrid=False, range=[0, 100],
                      title_text="Bubble Index (0-100)",
                      row=1, col=1, secondary_y=False, title_font=dict(size=11))
     fig.update_yaxes(showgrid=False, title_text="Index (100 = window start)",
-                     row=1, col=1, secondary_y=True, title_font=dict(size=11))
+                     row=1, col=1, secondary_y=True, title_font=dict(size=11),
+                     autorange=True)
     return fig
 
 
@@ -777,42 +774,16 @@ def historical_comparison(scores: pd.Series, state: dict):
     </div>
     """, unsafe_allow_html=True)
 
-    # overlay chart: live history + horizontal reference lines at episode peaks
-    fig = go.Figure()
-    s = scores.dropna()
-    if not s.empty:
-        fig.add_trace(go.Scatter(x=s.index, y=s.values, name="Bubble Index",
-                                 line={"color": "#c1121f", "width": 2},
-                                 fill="tozeroy", fillcolor="rgba(193,18,31,0.06)"))
-        for label, d in bm.items():
-            fig.add_hline(y=d["score"], line_dash="dot", line_color="#94a3b8",
-                          annotation_text=f"{label} ≈ {d['score']:.0f}",
-                          annotation_position="right")
-        for label, d in opp.items():
-            fig.add_hline(y=d["score"], line_dash="dot", line_color="#1a9850",
-                          annotation_text=f"{label} ≈ {d['score']:.0f}",
-                          annotation_position="right")
-        # risk bands as background
-        fig.add_hrect(y0=75, y1=100, fillcolor="rgba(239,68,68,0.08)", line_width=0)
-        fig.add_hrect(y0=60, y1=75, fillcolor="rgba(245,158,11,0.07)", line_width=0)
-        fig.add_hrect(y0=0, y1=40, fillcolor="rgba(26,152,80,0.08)", line_width=0)
-    fig.update_layout(height=380, hovermode="x unified",
-                      yaxis_title="Bubble Index", yaxis_range=[0, 100],
-                      margin={"t": 20, "b": 30, "l": 55, "r": 55},
-                      legend=dict(orientation="h", y=1.08, x=0),
-                      plot_bgcolor="white", paper_bgcolor="white")
-    st.plotly_chart(fig, use_container_width=True)
-
 
 def main():
     st.title("📈 US Equity Bubble Risk Index")
-    st.caption("Professional 5-module macro framework · Valuation 30% · Sentiment 20% "
+    st.caption("5-module macro framework · Valuation 30% · Sentiment 20% "
                "· Leverage 20% · Structure 15% · Macro 15% · every indicator is a "
-               "trailing-historical PERCENTILE (0-100) · weighted blend → historical "
-               "affine calibration (dot-com peak ≈ 97, GFC trough ≈ 12) → K-line "
-               "stability filter (slow-EMA trend + small bounded oscillation + "
-               "stress-aware daily clamp) · cache-first, crash-proof loading · "
-               "free/open data (FRED, yfinance/Stooq)")
+               "trailing robust-Z score (20y MAD, no look-ahead) → weighted module "
+               "blend → fixed-gain calibration (0-100) → K-line stability filter "
+               "(slow-EMA trend + small bounded oscillation + stress-aware daily "
+               "clamp) · confirmation-style buy/sell signals grounded in history · "
+               "cache-first, crash-proof loading · free/open data (FRED, yfinance/Stooq)")
 
     # ---- Sidebar: refresh controls ---------------------------------------
     refresh = st.sidebar.checkbox("Force refresh live data", value=False)
@@ -828,8 +799,9 @@ def main():
     # ---- Sidebar: valuation acceleration toggle -------------------------
     tail_boost = st.sidebar.checkbox(
         "Valuation acceleration curve", value=pipe.TAIL_BOOST_ON,
-        help="When ON, the Valuation module uses the non-linear froth-acceleration "
-             "curve (percentile 80-95 escalates convexly). When OFF, plain percentile.")
+        help="Legacy toggle: the V3 robust-Z scoring no longer applies a "
+             "separate acceleration curve, so this switch has no effect on "
+             "current scores (kept for dashboard compatibility).")
 
     # ---- Sidebar: interactive backtest parameters (applied on button) -----
     # Widgets live in a FORM so tweaking them does NOT recompute the whole
