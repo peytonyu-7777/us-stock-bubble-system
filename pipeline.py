@@ -32,7 +32,7 @@ PERFORMANCE DESIGN (production refactor)
   per-request timeout (`FETCH_TIMEOUT = 5s`) and the whole batch is bounded by a
   total wall-clock deadline (`FETCH_DEADLINE`). A request that times out or
   errors is set to None and never blocks the other 7 — the system returns in
-  ~3-14 seconds with whatever subset is live.
+  ~5-20 seconds with whatever subset is live.
 * INCREMENTAL CACHE: the first successful run pulls 1990->today and persists the
   raw monthly series + derived features to `bubble_cache.parquet`. On a later
   refresh we only re-fetch the last ~30 days (INCREMENTAL_DAYS), append and
@@ -135,13 +135,15 @@ WINDOW_MONTHS = 240       # 20 years for the "trailing percentile" window
 WINDOW_TECH_MONTHS = 36   # 3-year (~156-week) window for the tech-froth feature (F8)
 
 # Concurrency / timeout controls (the heart of the perf refactor)
-FETCH_TIMEOUT = 5         # hard per-request timeout (seconds)
+# 8s per request: FRED/Stooq from a cold Render container (fresh DNS+TLS,
+# shared egress IP, possible rate-limit backoff) can take 4-6s each — 5s was
+# tight enough to contribute to the all-failed -> synthetic fallback.
+FETCH_TIMEOUT = 8         # hard per-request timeout (seconds)
 # Total wall-clock deadline for the whole batch. 19 series / 8 workers = 3
-# waves; a cold Render container (fresh DNS+TLS, slow disk) can make each
-# wave take ~4-5s, so 9s was too tight and was a contributor to the
-# all-failed -> synthetic fallback seen in production. The 14s bound only
-# applies to the refresh path — the default page load is cache-first.
-FETCH_DEADLINE = 14       # total wall-clock deadline for the whole batch
+# waves; worst case 3 x 8s = 24s, bounded here at 20s (stragglers are
+# cancelled and treated as missing, never raise). This bound only applies to
+# the refresh path — the default page load is cache-first and instant.
+FETCH_DEADLINE = 20       # total wall-clock deadline for the whole batch
 INCREMENTAL_DAYS = 30     # on refresh: only re-fetch the last ~30 days
 
 # ===========================================================================
