@@ -108,7 +108,7 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-from pipeline import RISK_BANDS as BANDS  # V2 risk-level bands (0-40 .. 90-100)
+from pipeline import RISK_BANDS as BANDS  # risk-level bands (0-40 .. 90-100)
 from pipeline import MODULE_WEIGHTS       # 5-module weights for the radar/labels
 
 
@@ -122,7 +122,7 @@ def band_color(score: float) -> str:
 
 
 def status_action(score: float):
-    """Return (badge_text, badge_color, note) for the Status Card (V2 bands)."""
+    """Return (badge_text, badge_color, note) for the Status Card (risk bands)."""
     if pd.isna(score):
         return ("UNKNOWN", "#64748b", "No data")
     if score < 40:
@@ -191,7 +191,7 @@ def gauge_fig(score: float) -> go.Figure:
     R_out, R_in = 1.0, 0.70     # outer / inner arc radii
     R_needle = 0.55             # needle length (< R_in -> tip inside the band)
 
-    # --- 5-step color bands aligned with the V2 risk-level bands -----------
+    # --- 5-step color bands aligned with the risk-level bands ---------------
     STEPS = [
         (0, 40, "#10b981", "Cheap / Fear"),
         (40, 60, "#3b82f6", "Normal"),
@@ -486,92 +486,98 @@ def guidance_panel(state: dict, daily: pd.Series, monthly: pd.Series = None):
 
 def history_fig(scores: pd.Series, spx, ndx, log_scale: bool = True,
                 view: str = "all") -> go.Figure:
-    if view == "3y":
-        START = pd.Timestamp("2023-07-31")
-    else:
-        START = pd.Timestamp("2000-01-01")
-    ytype = "log" if log_scale else "linear"
+    """Combined Bubble Index chart.
 
-    # --- strict alignment: crop to >=START, then intersect the two prices so
-    #     the dual axis shares an identical x-grid (no 2001-vs-1995 drift), and
-    #     force the score onto that same intersection so zoom/hover link. ---
-    if spx is not None:
-        spx = spx[spx.index >= START]
-    if ndx is not None:
-        ndx = ndx[ndx.index >= START]
-    if spx is not None and ndx is not None and not spx.empty and not ndx.empty:
-        common = spx.index.intersection(ndx.index)
-        spx = spx.reindex(common)
-        ndx = ndx.reindex(common)
-
-    price_lo = None
-    if spx is not None and not spx.empty:
-        price_lo = spx.index.min()
-    elif ndx is not None and not ndx.empty:
-        price_lo = ndx.index.min()
+    Single canvas: Bubble Index (left axis, 0-100 with coloured risk bands)
+    overlaid on S&P 500 and Nasdaq Composite (right axis, rebased to 100 at
+    the START of the selected window so both indices are directly
+    comparable). Time range is supplied pre-sliced by the caller — this
+    function does NOT add its own period selector.
+    """
+    _ = log_scale  # kept in signature for API stability; the combined view uses
+    #               a linear rebased right axis that already makes log moot.
 
     sc = scores.dropna()
-    sc = sc[sc.index >= START]
-    if price_lo is not None:
-        sc = sc[sc.index >= price_lo]   # keep the hover line aligned with prices
+    # Rebase SPX/NDX to 100 at the FIRST common date so both start from the
+    # same baseline — makes their relative runs directly comparable.
+    def _rebase(s: pd.Series) -> pd.Series:
+        s = s.dropna()
+        if s.empty:
+            return s
+        return s / float(s.iloc[0]) * 100.0
 
-    fig = make_subplots(
-        rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.06,
-        row_heights=[0.65, 0.35],
-        subplot_titles=("S&P 500 (left axis)  ·  Nasdaq (right axis)",
-                        "Bubble Risk Index (stability-filtered)"),
-        specs=[[{"secondary_y": True}], [{}]],
-    )
+    spx_r = _rebase(spx) if spx is not None and not spx.empty else None
+    ndx_r = _rebase(ndx) if ndx is not None and not ndx.empty else None
 
-    if spx is not None and not spx.empty:
-        fig.add_trace(go.Scatter(x=spx.index, y=spx.values, name="S&P 500",
-                                 line={"color": "#1f4e79", "width": 1.5}),
-                      row=1, col=1, secondary_y=False)
-    if ndx is not None and not ndx.empty:
-        fig.add_trace(go.Scatter(x=ndx.index, y=ndx.values, name="Nasdaq",
-                                 line={"color": "#6a1b9a", "width": 1.5}),
-                      row=1, col=1, secondary_y=True)
+    # Intersect on a common x-grid so the three lines align perfectly
+    common = sc.index
+    if spx_r is not None and not spx_r.empty:
+        common = common.intersection(spx_r.index)
+    if ndx_r is not None and not ndx_r.empty:
+        common = common.intersection(ndx_r.index)
+    common = common.sort_values()
 
-    fig.update_yaxes(title_text="S&P 500", type=ytype, row=1, col=1,
-                     secondary_y=False)
-    fig.update_yaxes(title_text="Nasdaq", type=ytype, row=1, col=1,
-                     secondary_y=True)
+    sc_aligned = sc.reindex(common)
+    spx_aligned = spx_r.reindex(common) if spx_r is not None else None
+    ndx_aligned = ndx_r.reindex(common) if ndx_r is not None else None
 
-    # Row 2: smoothed score with risk-zone background shading. Clean layout:
-    # score line + coloured bands only — no dashed reference lines, no event
-    # markers, no right-side text — purely the Bubble Index wave.
-    if not sc.empty:
-        fig.add_trace(go.Scatter(x=sc.index, y=sc.values, name="Bubble Index",
-                                 line={"color": "#c1121f", "width": 2.2},
-                                 fill="tozeroy", fillcolor="rgba(193,18,31,0.05)"),
-                      row=2, col=1)
-        # Distinct, evenly-weighted zone colours (no transparent washes)
-        fig.add_hrect(y0=0,  y1=40,  fillcolor="rgba(16,185,129,0.28)",
-                      line_width=0, row=2, col=1, layer="below")
-        fig.add_hrect(y0=40, y1=60,  fillcolor="rgba(59,130,246,0.16)",
-                      line_width=0, row=2, col=1, layer="below")
-        fig.add_hrect(y0=60, y1=75,  fillcolor="rgba(245,158,11,0.22)",
-                      line_width=0, row=2, col=1, layer="below")
-        fig.add_hrect(y0=75, y1=90,  fillcolor="rgba(239,68,68,0.22)",
-                      line_width=0, row=2, col=1, layer="below")
-        fig.add_hrect(y0=90, y1=100, fillcolor="rgba(153,27,27,0.30)",
-                      line_width=0, row=2, col=1, layer="below")
-        # No dashed hline, no event markers, no right-side annotations — the
-        # user asked for a clean Bubble Index view with bands only.
+    fig = make_subplots(specs=[[{"secondary_y": True}]])
 
-    fig.update_layout(height=620, hovermode="x unified", showlegend=False,
-                      margin={"t": 40, "b": 30, "l": 56, "r": 24},
-                      plot_bgcolor="white", paper_bgcolor="white")
-    # No gridlines anywhere — pure coloured bands carry the scale meaning.
-    fig.update_xaxes(showgrid=False, showline=True, linecolor="#e2e8f0",
-                     ticks="outside", row=2, col=1)
-    fig.update_yaxes(showgrid=False, showline=True, linecolor="#e2e8f0",
-                     ticks="outside", row=2, col=1, range=[0, 100],
-                     title_text="Bubble Index", title_font=dict(size=11))
-    fig.update_xaxes(showgrid=False, row=1, col=1)
-    fig.update_yaxes(showgrid=False, row=1, col=1)
+    # ---- Coloured risk bands (anchored to the LEFT 0-100 Bubble Index axis)
+    band_tints = [
+        (0, 40,  "rgba(16,185,129,0.28)", "Cheap / Fear"),
+        (40, 60, "rgba(59,130,246,0.16)", "Normal"),
+        (60, 75, "rgba(245,158,11,0.22)", "Expensive"),
+        (75, 90, "rgba(239,68,68,0.22)",  "Bubble Risk"),
+        (90,100, "rgba(153,27,27,0.30)",  "Extreme Bubble"),
+    ]
+    for lo, hi, color, _ in band_tints:
+        fig.add_hrect(y0=lo, y1=hi, fillcolor=color, line_width=0,
+                      layer="below", secondary_y=False)
+
+    # ---- Rebased prices (right axis) ----
+    if spx_aligned is not None and not spx_aligned.dropna().empty:
+        fig.add_trace(go.Scatter(
+            x=spx_aligned.index, y=spx_aligned.values, name="S&P 500 (rebased=100)",
+            line={"color": "#1f4e79", "width": 2},
+            hovertemplate="S&P 500 · %{y:.1f} (rebased)<extra></extra>",
+        ), secondary_y=True)
+    if ndx_aligned is not None and not ndx_aligned.dropna().empty:
+        fig.add_trace(go.Scatter(
+            x=ndx_aligned.index, y=ndx_aligned.values, name="Nasdaq (rebased=100)",
+            line={"color": "#6a1b9a", "width": 2},
+            hovertemplate="Nasdaq · %{y:.1f} (rebased)<extra></extra>",
+        ), secondary_y=True)
+
+    # ---- Bubble Index (left axis) ----
+    if not sc_aligned.dropna().empty:
+        fig.add_trace(go.Scatter(
+            x=sc_aligned.index, y=sc_aligned.values,
+            name="Bubble Index", line={"color": "#c1121f", "width": 2.6},
+            fill="tozeroy", fillcolor="rgba(193,18,31,0.05)",
+            hovertemplate="Bubble Index · %{y:.1f}<extra></extra>",
+        ), secondary_y=False)
+
+    # ---- Layout ----
     if view == "3y":
-        fig.update_yaxes(range=[0, 100], row=2, col=1)
+        fig.update_yaxes(range=[0, 100], row=1, col=1, secondary_y=False)
+    fig.update_layout(
+        height=520, hovermode="x unified", showlegend=True,
+        margin={"t": 50, "b": 50, "l": 70, "r": 90},
+        legend=dict(orientation="h", y=1.10, x=0, xanchor="left",
+                    bgcolor="rgba(255,255,255,0.6)", bordercolor="#e2e8f0"),
+        plot_bgcolor="white", paper_bgcolor="white",
+        title=dict(text="Bubble Index (left) · S&P 500 / Nasdaq rebased to 100 (right)",
+                   x=0.01, xanchor="left", font=dict(size=13, color="#0f172a")),
+        font=dict(size=11),
+    )
+    fig.update_xaxes(showgrid=False, showline=True, linecolor="#e2e8f0",
+                     ticks="outside", row=1, col=1)
+    fig.update_yaxes(showgrid=False, range=[0, 100],
+                     title_text="Bubble Index (0-100)",
+                     row=1, col=1, secondary_y=False, title_font=dict(size=11))
+    fig.update_yaxes(showgrid=False, title_text="Index (100 = window start)",
+                     row=1, col=1, secondary_y=True, title_font=dict(size=11))
     return fig
 
 
@@ -786,7 +792,7 @@ def historical_comparison(scores: pd.Series, state: dict):
             fig.add_hline(y=d["score"], line_dash="dot", line_color="#1a9850",
                           annotation_text=f"{label} ≈ {d['score']:.0f}",
                           annotation_position="right")
-        # V2 risk bands as background
+        # risk bands as background
         fig.add_hrect(y0=75, y1=100, fillcolor="rgba(239,68,68,0.08)", line_width=0)
         fig.add_hrect(y0=60, y1=75, fillcolor="rgba(245,158,11,0.07)", line_width=0)
         fig.add_hrect(y0=0, y1=40, fillcolor="rgba(26,152,80,0.08)", line_width=0)
@@ -799,7 +805,7 @@ def historical_comparison(scores: pd.Series, state: dict):
 
 
 def main():
-    st.title("📈 US Equity Bubble Risk Index — V2")
+    st.title("📈 US Equity Bubble Risk Index")
     st.caption("Professional 5-module macro framework · Valuation 30% · Sentiment 20% "
                "· Leverage 20% · Structure 15% · Macro 15% · every indicator is a "
                "trailing-historical PERCENTILE (0-100) · weighted blend → historical "
@@ -814,7 +820,10 @@ def main():
         st.cache_data.clear()
         refresh = True
 
-    log_scale = st.sidebar.checkbox("Log price scale", value=True)
+    log_scale = st.sidebar.checkbox("Log scale (price chart)", value=False,
+                                    help="Only affects the standalone price sub-chart "
+                                         "in the V2/V3 layout. The combined view "
+                                         "below always rebases prices to 100.")
 
     # ---- Sidebar: valuation acceleration toggle -------------------------
     tail_boost = st.sidebar.checkbox(
@@ -902,7 +911,7 @@ def main():
         if feats:
             st.caption("Raw series / feature availability (Y = data present):")
             st.json(feats)
-        # Episode calibration readout — verifies the V3 fixed-gain calibration
+        # Episode calibration readout — verifies the fixed-gain calibration
         # against the named episodes with whatever data this container has.
         try:
             _s, _ = load_scores(refresh=False, tail_boost=tail_boost)
@@ -976,43 +985,35 @@ def main():
     # ---- Historical comparison ------------------------------------------
     historical_comparison(scores, state)
 
-    # ---- History (dual-axis, linked zoom) --------------------------------
-    st.subheader("Historical Trend")
-    view = st.radio(
-        "Historical view",
-        options=["all", "3y"],
-        format_func=lambda v: ("All (2000 - Present)"
-                               if v == "all" else "3-Year Trend (近3年历史走势)"),
-        horizontal=True,
-        help="All = full 2000-present macro cycle; 3-Year = zoomed 2023-07-31 → "
-             "today window with a fixed 0-100 score axis.")
+    # ---- Combined chart: Bubble Index + rebased S&P 500 / Nasdaq ------------
+    st.subheader("Bubble Index vs Market (S&P 500 / Nasdaq rebased to 100)")
 
-    # --- User-selectable year range for the chart (independent of backtest) -
+    # --- User-selectable year range (controls the combined chart) ----------
     daily_for_chart = _daily_for_guidance
     if not daily_for_chart.empty:
         years = sorted({int(d.year) for d in daily_for_chart.index})
         if years:
             c1, c2, c3 = st.columns([1, 1, 1.2])
-            hist_start = c1.select_slider(
+            chart_start = c1.select_slider(
                 "Chart start year", options=years,
-                value=st.session_state.get("hist_start", min(years)),
-                key="hist_start_widget",
-                help="历史趋势图起始年份")
-            hist_end = c2.select_slider(
+                value=st.session_state.get("chart_start", min(years)),
+                key="chart_start_widget",
+                help="图表起始年份")
+            chart_end = c2.select_slider(
                 "Chart end year", options=years,
-                value=st.session_state.get("hist_end", max(years)),
-                key="hist_end_widget",
-                help="历史趋势图结束年份")
-            if hist_start > hist_end:
-                hist_start, hist_end = hist_end, hist_start
-            st.session_state["hist_start"] = hist_start
-            st.session_state["hist_end"] = hist_end
+                value=st.session_state.get("chart_end", max(years)),
+                key="chart_end_widget",
+                help="图表结束年份")
+            if chart_start > chart_end:
+                chart_start, chart_end = chart_end, chart_start
+            st.session_state["chart_start"] = chart_start
+            st.session_state["chart_end"] = chart_end
             daily_for_chart = daily_for_chart.loc[
-                (daily_for_chart.index.year >= hist_start)
-                & (daily_for_chart.index.year <= hist_end)]
+                (daily_for_chart.index.year >= chart_start)
+                & (daily_for_chart.index.year <= chart_end)]
             c3.markdown(
                 f"<div style='font-size:12px;color:#475569;padding-top:1.6rem'>"
-                f"📅 显示区间: <b>{hist_start}–{hist_end}</b> "
+                f"📅 显示区间: <b>{chart_start}–{chart_end}</b> "
                 f"({len(daily_for_chart)} 个交易日)</div>",
                 unsafe_allow_html=True)
 
@@ -1020,8 +1021,15 @@ def main():
         spx, ndx = load_prices()
     except Exception:
         spx, ndx = None, None
+    # Slice price series to the same range so the rebase start aligns
+    if not daily_for_chart.empty and spx is not None and not spx.empty:
+        spx = spx.loc[(spx.index.year >= int(daily_for_chart.index[0].year))
+                     & (spx.index.year <= int(daily_for_chart.index[-1].year))]
+    if not daily_for_chart.empty and ndx is not None and not ndx.empty:
+        ndx = ndx.loc[(ndx.index.year >= int(daily_for_chart.index[0].year))
+                     & (ndx.index.year <= int(daily_for_chart.index[-1].year))]
     st.plotly_chart(history_fig(daily_for_chart if not daily_for_chart.empty else scores,
-                                spx, ndx, log_scale=log_scale, view=view),
+                                spx, ndx, log_scale=False, view="all"),
                     use_container_width=True)
 
     # ---- Strategy backtest (interactive) --------------------------------
