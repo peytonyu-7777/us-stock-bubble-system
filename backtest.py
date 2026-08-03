@@ -429,9 +429,9 @@ def run_backtest(scores: Optional[pd.Series], spy_df: Optional[pd.Series],
     # Row 2 lets you SEE the recycle-mode stockpile/drawdown cycle; in multiplier
     # mode the cash balance is essentially zero (all dollars go to SPY each month).
     fig = make_subplots(
-        rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.08,
-        row_heights=[0.70, 0.30],
-        subplot_titles=("Portfolio Value (Strategy vs Benchmark, dual axis)",
+        rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.14,
+        row_heights=[0.68, 0.32],
+        subplot_titles=("Portfolio Value (Strategy vs Benchmark)",
                         "Strategy Cash Reserve ($)"),
         specs=[[{"secondary_y": True}], [{}]],
     )
@@ -470,9 +470,13 @@ def run_backtest(scores: Optional[pd.Series], spy_df: Optional[pd.Series],
                       yref="y2", y0=lo, y1=hi,
                       fillcolor=band_tints[i], opacity=0.30, line_width=0,
                       layer="below", row=1, col=1)
-        fig.add_annotation(xref="paper", x=0.998, yref="y2", y=(lo + hi) / 2,
+        # label slightly inset (paper-x 0.985), tiny font, no border — won't
+        # collide with the score line or the secondary-y axis.
+        fig.add_annotation(xref="paper", x=0.985, yref="y2", y=(lo + hi) / 2,
                            text=label, showarrow=False, xanchor="right",
-                           xshift=-6, font={"size": 9, "color": "#555"},
+                           yanchor="middle", xshift=-4,
+                           font={"size": 8, "color": "#6b7280"},
+                           bgcolor="rgba(255,255,255,0.0)",
                            row=1, col=1)
 
     # Bubble Risk Score context line (right axis) — explains the de-risk calls.
@@ -494,15 +498,21 @@ def run_backtest(scores: Optional[pd.Series], spy_df: Optional[pd.Series],
                           row=1, col=1, secondary_y=False)
 
     fig.update_layout(height=620, hovermode="x unified",
-                      margin={"t": 30, "b": 30, "l": 75, "r": 95},
-                      legend=dict(orientation="h", y=1.06, x=0),
-                      plot_bgcolor="white", paper_bgcolor="white")
-    fig.update_yaxes(title_text="Portfolio Value (USD)", row=1, col=1,
-                     secondary_y=False)
-    fig.update_yaxes(title_text="Bubble Risk Score", range=[0, 100],
-                     row=1, col=1, secondary_y=True)
+                      margin={"t": 50, "b": 50, "l": 80, "r": 80},
+                      legend=dict(orientation="h", y=1.08, x=0,
+                                  xanchor="left", yanchor="bottom",
+                                  bgcolor="rgba(255,255,255,0.6)",
+                                  bordercolor="#e2e8f0", borderwidth=0),
+                      plot_bgcolor="white", paper_bgcolor="white",
+                      font=dict(size=11))
+    # Shorter, non-overlapping axis titles + side margins so labels breathe
+    fig.update_yaxes(title_text="USD", row=1, col=1, secondary_y=False,
+                     title_font=dict(size=11))
+    fig.update_yaxes(title_text="Score", row=1, col=1, secondary_y=True,
+                     title_font=dict(size=11), range=[0, 100])
     fig.update_xaxes(title_text="", row=1, col=1)
-    fig.update_xaxes(title_text="Date", row=2, col=1)
+    fig.update_xaxes(title_text="Date", row=2, col=1,
+                     title_font=dict(size=11))
 
     return metrics_df, fig
 

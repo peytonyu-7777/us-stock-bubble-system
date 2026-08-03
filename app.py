@@ -40,14 +40,34 @@ st.set_page_config(page_title="US Equity Bubble Risk", page_icon="📈",
 # --- Modern finance-terminal styling (soft-shadow cards, responsive) --------
 st.markdown("""
 <style>
-/* fluid main container */
-.main .block-container{max-width:1280px;padding-top:1.4rem;padding-bottom:2rem}
+/* fluid main container (caps at 1320 on wide desktops, shrinks on mobile) */
+.main .block-container{max-width:1320px;padding-top:1.4rem;padding-bottom:2rem}
 
-/* stack horizontal column blocks on small screens */
+/* ----- responsive layout for small / mid screens ----- */
 @media (max-width:720px){
   .stHorizontalBlock{flex-direction:column !important}
   .stHorizontalBlock>div{width:100% !important;min-width:0 !important}
+  .main .block-container{padding-left:.5rem;padding-right:.5rem}
+  .status-card{padding:14px 14px}
+  .feat-grid{grid-template-columns:repeat(2,1fr)}
 }
+@media (max-width:480px){
+  .feat-grid{grid-template-columns:1fr 1fr}
+  .feat-card{padding:10px 6px}
+  .feat-val{font-size:24px}
+}
+
+/* Trim oversized Plotly tooltips/menus on touch devices */
+@media (max-width:720px){
+  .modebar-group{display:none}
+  .js-plotly-plot .plotly .main-svg{font-size:11px}
+}
+
+/* Scrollable tables on mobile (backtest metrics can be wide) */
+.stDataFrame>div{overflow-x:auto}
+
+/* Make sure legend / modebar don't collide with the chart on small viewports */
+.legend{font-size:11px}
 
 /* 8 feature cards: rounded, soft shadow, hover lift */
 .feat-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));
@@ -517,51 +537,83 @@ def history_fig(scores: pd.Series, spx, ndx, log_scale: bool = True,
     fig.update_yaxes(title_text="Nasdaq", type=ytype, row=1, col=1,
                      secondary_y=True)
 
-    # Row 2: smoothed score with V2 risk-zone background shading
+    # Row 2: smoothed score with risk-zone background shading + canonical
+    # event markers (dot-com / GFC / 2021 / COVID / etc.). Markers carry
+    # VERTICAL text labels INSIDE the chart at their actual dates, so the
+    # right axis stays clean — no more crammed legend.
     if not sc.empty:
         fig.add_trace(go.Scatter(x=sc.index, y=sc.values, name="Bubble Index",
                                  line={"color": "#c1121f", "width": 2},
                                  fill="tozeroy", fillcolor="rgba(193,18,31,0.06)"),
                       row=2, col=1)
-        fig.add_hrect(y0=0, y1=40, fillcolor="rgba(16,185,129,0.10)", line_width=0,
-                      row=2, col=1)
-        fig.add_hrect(y0=40, y1=60, fillcolor="rgba(59,130,246,0.08)", line_width=0,
-                      row=2, col=1)
-        fig.add_hrect(y0=60, y1=75, fillcolor="rgba(245,158,11,0.10)", line_width=0,
-                      row=2, col=1)
-        fig.add_hrect(y0=75, y1=90, fillcolor="rgba(239,68,68,0.10)", line_width=0,
-                      row=2, col=1)
-        fig.add_hrect(y0=90, y1=100, fillcolor="rgba(153,27,27,0.14)", line_width=0,
-                      row=2, col=1)
+        # Stronger, more distinct zone colours (was 0.06-0.14 — invisible washes)
+        fig.add_hrect(y0=0, y1=40, fillcolor="rgba(16,185,129,0.22)",
+                      line_width=0, row=2, col=1, layer="below")
+        fig.add_hrect(y0=40, y1=60, fillcolor="rgba(59,130,246,0.10)",
+                      line_width=0, row=2, col=1, layer="below")
+        fig.add_hrect(y0=60, y1=75, fillcolor="rgba(245,158,11,0.18)",
+                      line_width=0, row=2, col=1, layer="below")
+        fig.add_hrect(y0=75, y1=90, fillcolor="rgba(239,68,68,0.18)",
+                      line_width=0, row=2, col=1, layer="below")
+        fig.add_hrect(y0=90, y1=100, fillcolor="rgba(153,27,27,0.26)",
+                      line_width=0, row=2, col=1, layer="below")
         fig.add_hline(y=75, line_dash="dash", line_color="#ef4444",
                       annotation_text="Bubble Risk > 75",
                       annotation_position="top left", row=2, col=1)
 
-        # --- Event markers: risk climaxes (red ▼) + accumulation troughs (green ▲)
-        #     Data-driven from the plotted series — highlights each risk episode
-        #     and the deep-fear buying windows (e.g. the late-2022 bottom).
+        # Canonical events with INLINE vertical labels below each marker
         try:
-            events = pipe.detect_events(sc)
+            bm = pipe.historical_benchmarks(sc)
+            opp = pipe.opportunity_benchmarks(sc)
+            risk_evts = [
+                ("Dot-com '00", bm.get("dotcom_2000", {})),
+                ("GFC '07", bm.get("gfc_2007", {})),
+                ("COVID-pre '20", bm.get("covid_pre", {})),
+                ("Bubble '21", bm.get("bubble_2021", {})),
+            ]
+            opp_evts = [
+                ("Dot-com bottom '02", opp.get("dotcom_trough_2002", {})),
+                ("GFC bottom '09", opp.get("gfc_trough_2009", {})),
+                ("COVID bottom '20", opp.get("covid_trough_2020", {})),
+                ("Bear bottom '22", opp.get("bear_trough_2022", {})),
+            ]
+            rx = []; ry = []; rt = []
+            for label, d in risk_evts:
+                if d:
+                    rx.append(pd.Timestamp(d["date"]))
+                    ry.append(float(d["score"])); rt.append(label)
+            ox = []; oy = []; ot = []
+            for label, d in opp_evts:
+                if d:
+                    ox.append(pd.Timestamp(d["date"]))
+                    oy.append(float(d["score"])); ot.append(label)
+
+            if rx:
+                fig.add_trace(go.Scatter(
+                    x=rx, y=ry, mode="markers+text",
+                    name="Risk climax (▼ label)",
+                    text=rt,
+                    textposition="bottom center", textangle=-90,
+                    textfont=dict(size=10, color="#7f1d1d"),
+                    cliponaxis=False,
+                    marker={"color": "#c1121f", "size": 10, "symbol": "triangle-down",
+                            "line": {"color": "white", "width": 1}},
+                    hovertemplate="%{text}: %{x|%Y-%m} · score %{y:.0f}<extra></extra>"),
+                    row=2, col=1)
+            if ox:
+                fig.add_trace(go.Scatter(
+                    x=ox, y=oy, mode="markers+text",
+                    name="Buying zone (▲ label)",
+                    text=ot,
+                    textposition="bottom center", textangle=-90,
+                    textfont=dict(size=10, color="#14532d"),
+                    cliponaxis=False,
+                    marker={"color": "#1a9850", "size": 10, "symbol": "triangle-up",
+                            "line": {"color": "white", "width": 1}},
+                    hovertemplate="%{text}: %{x|%Y-%m} · score %{y:.0f}<extra></extra>"),
+                    row=2, col=1)
         except Exception:
-            events = {"risk": [], "opportunity": []}
-        risk_pts = events.get("risk", [])
-        opp_pts = events.get("opportunity", [])
-        if risk_pts:
-            fig.add_trace(go.Scatter(
-                x=[d for d, _ in risk_pts], y=[v for _, v in risk_pts],
-                mode="markers", name="Risk event (trim)",
-                marker={"color": "#c1121f", "size": 9, "symbol": "triangle-down",
-                        "line": {"color": "white", "width": 1}},
-                hovertemplate="Risk climax %{x|%Y-%m} · score %{y:.0f}<extra></extra>"),
-                row=2, col=1)
-        if opp_pts:
-            fig.add_trace(go.Scatter(
-                x=[d for d, _ in opp_pts], y=[v for _, v in opp_pts],
-                mode="markers", name="Buying opportunity",
-                marker={"color": "#1a9850", "size": 9, "symbol": "triangle-up",
-                        "line": {"color": "white", "width": 1}},
-                hovertemplate="Accumulation zone %{x|%Y-%m} · score %{y:.0f}<extra></extra>"),
-                row=2, col=1)
+            pass
 
     fig.update_layout(height=660, hovermode="x unified", showlegend=True,
                       margin={"t": 50, "b": 30, "l": 62, "r": 62},
@@ -582,7 +634,7 @@ def backtest_panel(scores: pd.Series, params: dict, meta: dict = None):
     Never raises: any engine error degrades to a friendly warning so the rest
     of the dashboard keeps rendering.
     """
-    st.subheader("📊 Strategy Backtest — Bubble-Risk DCA vs Buy & Hold (2000-Present)")
+    st.subheader("📊 Strategy Backtest — Bubble-Risk DCA vs Buy & Hold")
 
     # Synthetic score series would produce a meaningless backtest — skip it
     # explicitly instead of rendering numbers that look authoritative.
@@ -592,6 +644,31 @@ def backtest_panel(scores: pd.Series, params: dict, meta: dict = None):
                 "be misleading. It resumes automatically once real FRED data is "
                 "available (fix `FRED_API_KEY` on Render and redeploy).")
         return
+
+    # --- User-selectable time range (years) -----------------------------------
+    valid_years = sorted({int(d.year) for d in scores.dropna().index})
+    if valid_years:
+        c1, c2 = st.columns([1, 1])
+        start_year = c1.select_slider(
+            "Backtest start", options=valid_years,
+            value=st.session_state.get("bt_start", min(valid_years)),
+            key="bt_start_widget",
+            help="Backtest begins in January of this year.")
+        end_year = c2.select_slider(
+            "Backtest end", options=valid_years,
+            value=st.session_state.get("bt_end", max(valid_years)),
+            key="bt_end_widget",
+            help="Backtest ends in December of this year.")
+        if start_year > end_year:
+            st.warning("Start year must be ≤ end year — auto-swapped.")
+            start_year, end_year = end_year, start_year
+        st.session_state["bt_start"] = start_year
+        st.session_state["bt_end"] = end_year
+        mask = scores.dropna().index
+        mask = mask[(mask.year >= start_year) & (mask.year <= end_year)]
+        scores_bt = scores.loc[mask]
+    else:
+        scores_bt = scores
 
     if params.get("recycle"):
         st.caption("Benchmark: fixed ${:,}/mo into SPY (buy & hold). Strategy: the "
@@ -612,15 +689,20 @@ def backtest_panel(scores: pd.Series, params: dict, meta: dict = None):
                    "mode — dollars go straight to SPY)."
                    .format(int(params["base_monthly"])))
 
-    # Recompute ONLY when the apply button changed the params (or first load):
-    # unrelated widget reruns do NOT re-run the backtest.
-    key = json.dumps({k: round(v, 4) if isinstance(v, float) else v
-                      for k, v in params.items()}, sort_keys=True)
+    # Recompute ONLY when the apply button changed the params or the time range
+    # (or first load): unrelated widget reruns do NOT re-run the backtest.
+    key = json.dumps({"p": {k: round(v, 4) if isinstance(v, float) else v
+                            for k, v in params.items()},
+                      "rng": [start_year, end_year]}, sort_keys=True)
     if st.session_state.get("bt_result_key") != key:
-        with st.spinner("Running backtest (recycle simulation)..."):
+        with st.spinner("Running backtest ({}–{})...".format(start_year, end_year)):
             try:
                 spy = load_spy()
-                res = bt.run_backtest(scores, spy, params)
+                # Slice SPY to the same range so the inner-join doesn't lose data
+                spy_bt = spy.loc[(spy.index.year >= start_year)
+                                  & (spy.index.year <= end_year)] \
+                    if spy is not None else None
+                res = bt.run_backtest(scores_bt, spy_bt, params)
                 if res is None:
                     st.session_state["bt_error"] = (
                         "Backtest engine returned no result — need SPY price "

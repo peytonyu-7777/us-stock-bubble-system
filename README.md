@@ -66,6 +66,21 @@ only the timing of deployment changes. Use it to study pure timing alpha
 (IRR comparison) — in this mode the equity curve hugs DCA by construction and
 the cash reserve subplot visualises the stockpiling/deploying cycle.
 
+The panel accepts a **user-selectable backtest time range** (start year / end
+year) so you can study how the strategy performs over any sub-period
+(e.g. 2008–2015 for the GFC recovery, or 2010–2026 for a mostly-bull sample).
+
+### UI / responsiveness
+
+* **Responsive layout** — the dashboard adapts to phone / tablet / desktop.
+  On small viewports horizontal blocks stack vertically, font and chart sizes
+  shrink, and the Plotly modebar is hidden to give the data more room.
+* **Inline event labels** on the Bubble Index chart (Dot-com '00 / GFC '07 /
+  Bubble '21 etc.) — rotated −90° below each marker at its actual date, so
+  the right axis stays clean.
+* **Distinct risk-zone colours** (deeper green / amber / red) so the band
+  boundaries are visible at a glance.
+
 ### Scoring refinements (V3)
 
 * **Fixed-gain calibration, not data-anchored affine.** The module blend Z is
