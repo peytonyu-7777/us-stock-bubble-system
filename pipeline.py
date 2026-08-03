@@ -826,7 +826,17 @@ def compute_modules(feat_z: pd.DataFrame,
         if not present:
             out[mod] = 0.0        # neutral Z (= median), was 50.0 on pct scale
             continue
-        out[mod] = feat_z[present].mean(axis=1)
+        if mod == "sentiment":
+            # SENTIMENT = MIN, not mean (V3 fix). The sub-indicators are BOTH
+            # complacency gauges (VIX-inverted, EMV/AAII-inverted): a spike in
+            # VIX (fear) while EMV stays calm is still a fear event — averaging
+            # let the calm series CANCEL the fear (e.g. 2026-03: F7=-1.41,
+            # F4=+0.92 -> mean -0.24, hiding a real VIX spike). Taking the
+            # minimum means EITHER fear gauge flashing de-risks the module;
+            # both must be complacent for the module to read frothy.
+            out[mod] = feat_z[present].min(axis=1)
+        else:
+            out[mod] = feat_z[present].mean(axis=1)
     out.attrs["coverage"] = coverage
     return out
 
@@ -1880,6 +1890,168 @@ def detect_events(score: pd.Series) -> dict:
                 res["opportunity"].append((d, float(v)))
                 last_opp = d
     return res
+
+
+# --- Confirmation-style BUY / SELL signals (V3.1) ---------------------------
+# The user asked for signals with DURATION or SPEED confirmation instead of
+# single-month spikes, grounded in historical behaviour:
+#   SELL  = score stays ABOVE sell_level for >= sell_dur consecutive months
+#           (sustained bubble zone — "连续超过一个区间多久")
+#   BUY   = (a) score stays BELOW buy_level for >= buy_dur months (sustained
+#           fear), OR (b) score collapses >= rapid_drop pts within
+#           rapid_span months AND the trough is below rapid_end_level
+#           ("从一个点短时间内快速下滑")
+# A single continuous episode emits ONE signal at its CONFIRMATION month, so
+# guidance is not spammed month after month. Dates are month-ends (no
+# look-ahead: only past readings decide each signal).
+SIGNAL_SELL_LEVEL = 78.0     # sustained above this -> de-risk confirmation
+SIGNAL_SELL_DUR = 3          # consecutive months above -> sell signal
+SIGNAL_BUY_LEVEL = 45.0      # sustained below this -> accumulate confirmation
+SIGNAL_BUY_DUR = 2           # consecutive months below -> buy signal
+SIGNAL_RAPID_DROP = 15.0     # |fall| >= this within the window -> rapid decline
+SIGNAL_RAPID_SPAN = 3        # months
+SIGNAL_RAPID_END = 60.0      # ...and the trough must be below this
+
+
+def detect_signals(score: pd.Series) -> dict:
+    """Confirmation-style buy/sell signals on the MONTHLY score series.
+
+    Returns {"sell": [(date, score), ...], "buy": [(date, score, kind), ...]}
+    where kind is "sustained" (extended fear) or "rapid" (fast collapse).
+    Causal (a signal at month t uses readings <= t only) — safe to quote as
+    "as of today" guidance, unlike detect_events which annotates history.
+    """
+    s = score.dropna()
+    if len(s) < 6:
+        return {"sell": [], "buy": []}
+    vals = s.to_numpy(dtype=float)
+    idx = s.index
+    out_sell, out_buy = [], []
+
+    # SELL: runs of score > SELL_LEVEL lasting >= SELL_DUR months
+    run = 0
+    for i, v in enumerate(vals):
+        if v > SIGNAL_SELL_LEVEL:
+            run += 1
+            if run == SIGNAL_SELL_DUR:
+                out_sell.append((idx[i], float(v)))
+        else:
+            run = 0
+
+    # BUY (sustained): runs of score < BUY_LEVEL lasting >= BUY_DUR months
+    run = 0
+    for i, v in enumerate(vals):
+        if v < SIGNAL_BUY_LEVEL:
+            run += 1
+            if run == SIGNAL_BUY_DUR:
+                out_buy.append((idx[i], float(v), "sustained"))
+        else:
+            run = 0
+
+    # BUY (rapid): |fall over <= RAPID_SPAN months| >= RAPID_DROP, trough < END
+    if len(vals) >= SIGNAL_RAPID_SPAN:
+        hi = pd.Series(vals, index=idx).rolling(SIGNAL_RAPID_SPAN).max()
+        lo = pd.Series(vals, index=idx).rolling(SIGNAL_RAPID_SPAN).min()
+        for i in range(SIGNAL_RAPID_SPAN - 1, len(vals)):
+            d = idx[i]
+            if hi.iloc[i] - lo.iloc[i] >= SIGNAL_RAPID_DROP and lo.iloc[i] < SIGNAL_RAPID_END:
+                # trough date within the window
+                win = vals[i - SIGNAL_RAPID_SPAN + 1: i + 1]
+                tj = int(np.argmin(win))
+                tdate = idx[i - SIGNAL_RAPID_SPAN + 1 + tj]
+                out_buy.append((tdate, float(win[tj]), "rapid"))
+
+    # ONE signal per episode: merge triggers closer than SIGNAL_MERGE_DAYS into
+    # a single event (sell keeps the strongest peak, buy the deepest trough).
+    out_sell = _merge_signals(out_sell, keep="max")
+    out_buy = _merge_signals(out_buy, keep="min")
+    return {"sell": out_sell, "buy": out_buy}
+
+
+def _merge_signals(events, keep: str = "min", gap_days: int = 200):
+    """Merge (date, score[, kind]) tuples closer than gap_days into one event,
+    keeping the strongest reading ('min' = deepest trough, 'max' = highest
+    peak). One continuous episode -> ONE signal, so guidance isn't spammed."""
+    if not events:
+        return events
+    events = sorted(events, key=lambda x: x[0])
+    merged = [list(events[0])]
+    for e in events[1:]:
+        if (e[0] - merged[-1][0]).days <= gap_days:
+            if (keep == "min" and e[1] < merged[-1][1]) or \
+               (keep == "max" and e[1] > merged[-1][1]):
+                merged[-1] = list(e)
+        else:
+            merged.append(list(e))
+    return [tuple(m) for m in merged]
+
+
+def signal_stats(score: pd.Series, spx: Optional[pd.Series] = None) -> dict:
+    """Historical grounding for the buy/sell signals: forward S&P returns after
+    each signal vs the unconditional benchmark. Used by the guidance panel to
+    show *why* the thresholds exist ("结合市场过往表现设定")."""
+
+    def _fwd_ret(px: pd.Series, date, months: int) -> Optional[float]:
+        try:
+            a = px.asof(pd.Timestamp(date))
+        except Exception:
+            return None
+        if a is None or pd.isna(a):
+            return None
+        end_dt = pd.Timestamp(date) + pd.DateOffset(months=months)
+        tail = px[px.index <= end_dt]
+        if tail.empty:
+            return None
+        b = float(tail.iloc[-1])
+        return b / a - 1.0 if a else None
+
+    px = spx
+    if px is None:
+        try:
+            raw = _load_raw_cache()
+            px = raw["spx"].dropna() if raw is not None and "spx" in raw else None
+        except Exception:
+            px = None
+    base = {"sell": [], "buy_sustained": [], "buy_rapid": []}
+    out = {k: {"count": 0, "fwd12": [], "fwd24": []} for k in base}
+    if px is None or px.empty:
+        out["_note"] = "SPX series unavailable for forward-return stats"
+        return out
+    sig = detect_signals(score)
+    for d, _ in sig["sell"]:
+        out["sell"]["count"] += 1
+        for m in (12, 24):
+            r = _fwd_ret(px, d, m)
+            if r is not None:
+                out["sell"][f"fwd{m}"].append(r)
+    for d, _, kind in sig["buy"]:
+        k = "buy_sustained" if kind == "sustained" else "buy_rapid"
+        out[k]["count"] += 1
+        for m in (12, 24):
+            r = _fwd_ret(px, d, m)
+            if r is not None:
+                out[k][f"fwd{m}"].append(r)
+
+    # unconditional benchmark: average forward returns across all months
+    dates = list(score.dropna().index)
+    bench = {12: [], 24: []}
+    for d in dates[::3]:                       # sample every 3rd month (cheap)
+        for m in (12, 24):
+            r = _fwd_ret(px, d, m)
+            if r is not None:
+                bench[m].append(r)
+    out["_benchmark"] = {
+        f"fwd{m}": (float(np.mean(bench[m])) if bench[m] else None)
+        for m in (12, 24)}
+
+    def _sum(k):
+        for m in (12, 24):
+            v = out[k][f"fwd{m}"]
+            out[k][f"fwd{m}"] = (round(float(np.mean(v)), 4) if v else None)
+        out[k]["count"] = int(out[k]["count"])
+    for k in ("sell", "buy_sustained", "buy_rapid"):
+        _sum(k)
+    return out
 
 
 def get_price_series(ticker: str, start: str = LIVE_START,

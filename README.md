@@ -119,6 +119,26 @@ bands above.)*
   container's real data) and a live connectivity probe — so a failing deploy is
   diagnosable from the page itself.
 
+### Signal refinements (V3.1)
+
+* **Sentiment module = MIN, not mean.** Both sub-indicators are complacency
+  gauges (VIX-inverted, EMV-inverted): a VIX spike while EMV stays calm is
+  still a fear event, but averaging let the calm series cancel the fear
+  (2026-03: F7 −1.41 + F4 +0.92 → mean −0.24 hid a real VIX spike). The module
+  now takes the element-wise minimum — EITHER fear gauge flashing de-risks it.
+  Staged corrections now read meaningfully lower (2026-03: 61.9 → 55.3;
+  2025-04: 42.9 → 36.0).
+* **Confirmation-style BUY/SELL signals, grounded in history.** Instead of
+  single-month spikes:
+  - **SELL** — score > 78 for ≥ 3 consecutive months (sustained bubble zone);
+  - **BUY** — score < 45 for ≥ 2 months (sustained fear), *or* a ≥ 15-point
+    collapse within ≤ 3 months ending below 60 (rapid decline).
+  One signal per episode (200-day merge). Historical grounding (`signal_stats`,
+  shown on the page): forward 12m S&P after sell signals ≈ **−10.6%** vs a
+  **+10.0%** unconditional benchmark; after sustained-buy ≈ **+27.8%**, after
+  rapid-decline-buy ≈ **+16.7%**. Signals appear in the guidance panel and the
+  diagnostics readout.
+
 ---
 
 ## 2. Files

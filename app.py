@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import os
 import math
+import json
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
@@ -69,15 +70,16 @@ st.markdown("""
 /* status card */
 .status-card{border:1px solid #e2e8f0;border-radius:14px;padding:18px 20px;
   background:linear-gradient(135deg,#ffffff,#f8fafc);
-  box-shadow:0 6px 20px rgba(15,23,42,0.08);height:100%}
+  box-shadow:0 6px 20px rgba(15,23,42,0.08);height:100%;
+  line-height:1.55}
 .status-head{font-size:12px;text-transform:uppercase;letter-spacing:.08em;
   color:#64748b;font-weight:700}
 .badge{display:inline-block;margin:10px 0;padding:11px 16px;border-radius:11px;
   color:#fff;font-weight:800;font-size:18px;letter-spacing:.01em;
   box-shadow:0 4px 12px rgba(15,23,42,0.18)}
-.status-score{font-size:15px;color:#0f172a;margin-top:2px}
-.status-note{font-size:13px;color:#475569;margin-top:6px}
-.status-cov{font-size:12px;color:#94a3b8;margin-top:10px}
+.status-score{font-size:17px;color:#0f172a;font-weight:700}
+.status-note{font-size:13px;color:#475569;margin-top:8px;line-height:1.6}
+.status-cov{font-size:12px;color:#94a3b8;margin-top:8px}
 .status-elev{font-size:12px;color:#c1121f;font-weight:700;margin-top:8px}
 
 /* gauge wrapper */
@@ -133,7 +135,20 @@ def load_prices():
 
 @st.cache_data(ttl=3600)
 def load_spy():
-    return pipe.get_price_series("SPY", start=pipe.LIVE_START)
+    """SPY monthly close for the backtest — CACHE-ONLY (never triggers network
+    from a user request). Falls back to the S&P 500 index level from the same
+    cache (FRED-backed) when the SPY column is absent, so the backtest panel
+    stays usable even during a total Yahoo/Stooq outage."""
+    try:
+        s = pipe.get_price_series("SPY", start=pipe.LIVE_START)
+        if s is not None and not s.dropna().empty:
+            return s
+        s = pipe.get_price_series("^GSPC", start=pipe.LIVE_START)
+        if s is not None and not s.dropna().empty:
+            return s
+    except Exception:
+        pass
+    return None
 
 
 def gauge_fig(score: float) -> go.Figure:
@@ -244,21 +259,27 @@ def status_card(state: dict, meta: dict, src_label: str, tail_boost: bool = True
     hist_pct = state.get("hist_pct", np.nan)
     # Top contributing modules (for the "Compared with history" callout)
     mod_rank = sorted(((m, v) for m, v in modules.items() if v is not None),
-                     key=lambda x: x[1], reverse=True)
+                      key=lambda x: x[1], reverse=True)
     mod_html = " · ".join(
         f"{m.capitalize()} {v:.0f}" for m, v in mod_rank[:3])
-    hist_txt = (f"Higher than {hist_pct:.0f}% of history"
+    hist_txt = (f"higher than {hist_pct:.0f}% of history"
                 if pd.notna(hist_pct) else "n/a")
     asof = (pd.Timestamp(state["as_of"]).date() if state.get("as_of") else "n/a")
     st.markdown(f"""
     <div class="status-card">
       <div class="status-head">Current Bubble Risk Index</div>
-      <div class="badge" style="background:{color}">{action}</div>
-      <div class="status-score">Score <b>{score:.1f}</b> / 100 &nbsp;·&nbsp; as of {asof}</div>
+      <div style="display:flex;align-items:center;gap:12px;margin:4px 0 2px">
+        <div class="badge" style="background:{color};margin:0">{action}</div>
+        <div class="status-score" style="margin:0"><b>{score:.1f}</b> / 100</div>
+      </div>
+      <div class="status-cov" style="margin-top:2px">as of {asof} · {src_label} data · coverage {avail}/8</div>
       <div class="status-note">{note}</div>
-      <div class="status-cov">Risk accumulation indicator — not a crash forecast</div>
-      <div class="status-cov">Data: {src_label} &nbsp;·&nbsp; coverage {avail}/8 &nbsp;·&nbsp; {hist_txt}</div>
-      <div class="status-cov">Top modules: {mod_html or 'n/a'}</div>
+      <table style="width:100%;font-size:12.5px;color:#475569;border-collapse:collapse;margin-top:6px">
+        <tr><td style="padding:3px 0">vs history</td>
+            <td style="padding:3px 0;text-align:right;font-weight:600">{hist_txt}</td></tr>
+        <tr><td style="padding:3px 0">top modules</td>
+            <td style="padding:3px 0;text-align:right;font-weight:600">{mod_html or 'n/a'}</td></tr>
+      </table>
     </div>
     """, unsafe_allow_html=True)
 
@@ -343,7 +364,7 @@ def drivers_panel(state: dict):
     """, unsafe_allow_html=True)
 
 
-def guidance_panel(state: dict, daily: pd.Series):
+def guidance_panel(state: dict, daily: pd.Series, monthly: pd.Series = None):
     """Actionable guidance: current zone -> posture, anchored to the detected
     historical risk climaxes and accumulation windows (the 'what do I do now'
     panel, incl. the late-2022-style deep-fear buying opportunity)."""
@@ -392,6 +413,37 @@ def guidance_panel(state: dict, daily: pd.Series):
     except Exception:
         pass
 
+    # Confirmation-style signals (sustained / rapid) + historical grounding.
+    sig_html = ""
+    try:
+        if monthly is not None and not monthly.dropna().empty:
+            sig = pipe.detect_signals(monthly.dropna())
+            sts = pipe.signal_stats(monthly.dropna())
+            _b = sts.get("_benchmark", {})
+            bench12 = _b.get("fwd12")
+            rows = []
+            if sig["sell"]:
+                d, v = sig["sell"][-1]
+                rows.append(("最近卖出信号", f"{pd.Timestamp(d).strftime('%Y-%m')} · {v:.0f}"))
+            if sig["buy"]:
+                d, v, k = sig["buy"][-1]
+                lbl = "快速下滑" if k == "rapid" else "持续低位"
+                rows.append(("最近买入信号", f"{pd.Timestamp(d).strftime('%Y-%m')} · {v:.0f} ({lbl})"))
+            def _pct(x):
+                return "—" if x is None else f"{x*100:+.1f}%"
+            stats_line = (f"历史回测: 卖出信号后12个月 {_pct(sts.get('sell',{}).get('fwd12'))} "
+                          f"(全期基准 {_pct(bench12)}) · 买入后12个月 "
+                          f"{_pct(sts.get('buy_sustained',{}).get('fwd12'))}~{_pct(sts.get('buy_rapid',{}).get('fwd12'))}")
+            rows.append(("信号历史统计", stats_line))
+            rows_html = "".join(
+                f'<tr><td style="padding:3px 10px">{k}</td>'
+                f'<td style="padding:3px 10px;text-align:right;font-weight:600">{v}</td></tr>'
+                for k, v in rows)
+            sig_html = (f'<table style="width:100%;font-size:12.5px;color:#0f172a;'
+                        f'border-collapse:collapse;margin-top:6px">{rows_html}</table>')
+    except Exception:
+        pass
+
     st.markdown(f"""
     <div class="status-card" style="margin-top:4px">
       <div class="status-head">🧭 Current Guidance 当前操作指引</div>
@@ -404,6 +456,7 @@ def guidance_panel(state: dict, daily: pd.Series):
         <tr><td style="padding:3px 10px">Last buying window 最近买入机会</td>
             <td style="padding:3px 10px;text-align:right">{last_opp or "—"}</td></tr>
       </table>
+      {sig_html}
       <div class="status-note" style="margin-top:6px">When the index falls into
       the deep-fear zone (≤35) it has historically marked the best accumulation
       windows — e.g. the <b>late-2022 bear bottom</b>. When it pushes above 80 it
@@ -543,27 +596,42 @@ def backtest_panel(scores: pd.Series, params: dict, meta: dict = None):
                 "available (fix `FRED_API_KEY` on Render and redeploy).")
         return
 
-    if params.get("recycle"):
-        st.caption("Benchmark: fixed ${:,}/mo into SPY (buy & hold). Strategy: the "
-                   "SAME ${:,}/mo outflow — the index only decides deployment: "
-                   "taper & stockpile cash at high risk (≥80), deploy the reserve "
-                   "at low readings (<40/50), de-risk at extremes (≥95). Same "
-                   "total invested, so IRR isolates pure timing skill."
-                   .format(int(params["base_monthly"]), int(params["base_monthly"])))
-    else:
-        st.caption("Benchmark: fixed ${:,}/mo into SPY (buy & hold). Strategy: scales "
-                   "the contribution by the Bubble Index band and de-risks to cash "
-                   "when the index is extreme (legacy multiplier mode)."
-                   .format(int(params["base_monthly"])))
+    st.caption("Benchmark: fixed ${:,}/mo into SPY (buy & hold). Strategy: the "
+               "SAME ${:,}/mo outflow — the index only decides deployment: "
+               "taper & stockpile cash at high risk (≥80), deploy the reserve "
+               "at low readings (<40/50), de-risk at extremes (≥95). Same "
+               "total invested, so IRR isolates pure timing skill."
+               .format(int(params["base_monthly"]), int(params["base_monthly"])))
 
-    try:
-        spy = load_spy()
-        res = bt.run_backtest(scores, spy, params)
-    except Exception as exc:
-        st.warning(f"Backtest engine hit an error (rest of dashboard unaffected): "
-                   f"`{exc!r}`")
+    # Recompute ONLY when the apply button changed the params (or first load):
+    # unrelated widget reruns do NOT re-run the backtest.
+    key = json.dumps({k: round(v, 4) if isinstance(v, float) else v
+                      for k, v in params.items()}, sort_keys=True)
+    if st.session_state.get("bt_result_key") != key:
+        with st.spinner("Running backtest (recycle simulation)..."):
+            try:
+                spy = load_spy()
+                res = bt.run_backtest(scores, spy, params)
+                if res is None:
+                    st.session_state["bt_error"] = (
+                        "Backtest engine returned no result — need SPY price "
+                        "history + a scored series. If you just deployed, the "
+                        "baked cache may still be building; the page shows "
+                        "cached data until the next refresh.")
+                else:
+                    st.session_state["bt_result"] = res
+                    st.session_state.pop("bt_error", None)
+            except Exception as exc:
+                st.session_state["bt_error"] = repr(exc)
+        st.session_state["bt_result_key"] = key
+
+    if st.session_state.get("bt_error"):
+        st.error(f"回测引擎报错（页面其余部分不受影响）：`{st.session_state['bt_error']}`\n\n"
+                 "请在侧边栏点击「✅ 应用参数并运行回测」重试；若持续失败，打开 "
+                 "🔧 数据诊断 确认数据源状态。")
         return
 
+    res = st.session_state.get("bt_result")
     if res is None:
         st.warning("Backtest needs SPY price history + a scored series (cache). "
                    "Run the scoring first / ensure network connectivity.")
@@ -680,32 +748,45 @@ def main():
         help="When ON, the Valuation module uses the non-linear froth-acceleration "
              "curve (percentile 80-95 escalates convexly). When OFF, plain percentile.")
 
-    # ---- Sidebar: interactive backtest sliders ---------------------------
+    # ---- Sidebar: interactive backtest parameters (applied on button) -----
+    # Widgets live in a FORM so tweaking them does NOT recompute the whole
+    # backtest on every keystroke — only the "应用参数并运行回测" submit runs it.
+    if "bt_params" not in st.session_state:
+        st.session_state["bt_params"] = dict(
+            base_monthly=1000, low_mult=3.0, high_mult=0.5,
+            derisk_threshold=95, derisk_cash=0.15, cash_yield=4.0, recycle=True)
     with st.sidebar.expander("🎛️ Backtest Parameters", expanded=False):
-        base_monthly = st.number_input("Base Monthly DCA ($)", min_value=0,
-                                       max_value=10000, value=1000, step=100)
-        recycle = st.checkbox(
-            "Reserve-recycle mode (same $ outflow as DCA)", value=True,
-            help="ON: you always invest the same monthly amount — at high risk "
-                 "part of it is stockpiled as a cash reserve, at low risk the "
-                 "reserve is deployed. Total invested == plain DCA, so the IRR "
-                 "comparison isolates the index's timing skill. OFF: legacy "
-                 "multiplier mode (contribution itself is scaled).")
-        low_mult = st.slider("Deep-Value Deploy Cap (Score < 40)", 1.0, 4.0, 3.0, 0.1,
-                             help="At deep-value readings deploy the base amount "
-                                  "PLUS up to this multiple drawn from the reserve.")
-        high_mult = st.slider("Taper Fraction (80 ≤ Score < 95)",
-                              0.0, 1.0, 0.5, 0.05,
-                              help="Fraction of the monthly amount deployed at "
-                                   "high risk; the rest is stockpiled.")
-        derisk_threshold = st.slider("De-Risk Threshold Score", 85, 99, 95, 1)
-        derisk_cash = st.slider("De-Risk Cash Allocation", 0.0, 0.5, 0.15, 0.05)
-        cash_yield = st.number_input("Cash Yield (Annualized %)", min_value=0.0,
-                                     max_value=10.0, value=4.0, step=0.5)
-    params = dict(base_monthly=base_monthly, low_mult=low_mult,
-                  high_mult=high_mult, derisk_threshold=derisk_threshold,
-                  derisk_cash=derisk_cash, cash_yield=cash_yield,
-                  recycle=recycle)
+        with st.form("bt_form"):
+            base_monthly = st.number_input("Base Monthly DCA ($)", min_value=0,
+                                           max_value=10000, value=1000, step=100)
+            recycle = st.checkbox(
+                "Reserve-recycle mode (same $ outflow as DCA)", value=True,
+                help="ON: you always invest the same monthly amount — at high "
+                     "risk part of it is stockpiled as a cash reserve, at low "
+                     "risk the reserve is deployed. Total invested == plain "
+                     "DCA, so the IRR comparison isolates the index's timing "
+                     "skill. OFF: legacy multiplier mode.")
+            low_mult = st.slider("Deep-Value Deploy Cap (Score < 40)", 1.0, 4.0, 3.0, 0.1,
+                                 help="At deep-value readings deploy the base "
+                                      "amount PLUS up to this multiple drawn "
+                                      "from the reserve.")
+            high_mult = st.slider("Taper Fraction (80 ≤ Score < 95)",
+                                  0.0, 1.0, 0.5, 0.05,
+                                  help="Fraction of the monthly amount deployed "
+                                       "at high risk; the rest is stockpiled.")
+            derisk_threshold = st.slider("De-Risk Threshold Score", 85, 99, 95, 1)
+            derisk_cash = st.slider("De-Risk Cash Allocation", 0.0, 0.5, 0.15, 0.05)
+            cash_yield = st.number_input("Cash Yield (Annualized %)", min_value=0.0,
+                                         max_value=10.0, value=4.0, step=0.5)
+            submitted = st.form_submit_button(
+                "✅ 应用参数并运行回测", use_container_width=True)
+            if submitted:
+                st.session_state["bt_params"] = dict(
+                    base_monthly=base_monthly, low_mult=low_mult,
+                    high_mult=high_mult, derisk_threshold=derisk_threshold,
+                    derisk_cash=derisk_cash, cash_yield=cash_yield,
+                    recycle=recycle)
+    params = st.session_state["bt_params"]
 
     # ---- Single data pass (cache-first; the pipeline never raises, but keep
     #      a last-resort guard so the page can never hard-crash) -------------
@@ -767,6 +848,25 @@ def main():
                 if d})
         except Exception:
             pass
+        # Buy/sell signals + historical grounding (grounded in real history)
+        try:
+            _s, _ = load_scores(refresh=False, tail_boost=tail_boost)
+            sig = pipe.detect_signals(_s.dropna())
+            sts = pipe.signal_stats(_s.dropna())
+            st.caption("Signals (sell: score >78 for ≥3m · buy: <45 for ≥2m or "
+                       "≥15pt fall in ≤3m) + forward-return stats:")
+            st.json({
+                "sell_signals": [f"{pd.Timestamp(d).strftime('%Y-%m')} ({v:.0f})"
+                                 for d, v in sig["sell"][-6:]],
+                "buy_signals": [f"{pd.Timestamp(d).strftime('%Y-%m')} ({v:.0f}, {k})"
+                                for d, v, k in sig["buy"][-6:]],
+                "fwd12m_after_sell": sts.get("sell", {}).get("fwd12"),
+                "fwd12m_after_buy": [sts.get("buy_sustained", {}).get("fwd12"),
+                                     sts.get("buy_rapid", {}).get("fwd12")],
+                "fwd12m_benchmark": sts.get("_benchmark", {}).get("fwd12"),
+            })
+        except Exception:
+            pass
         if st.button("🌐 Run connectivity probe (FRED / Stooq / Yahoo)"):
             with st.spinner("Probing upstream endpoints from this container..."):
                 probe = pipe.probe_connectivity()
@@ -789,7 +889,7 @@ def main():
                                                 tail_boost=tail_boost)
     except Exception:
         _daily_for_guidance = pd.Series(dtype=float)
-    guidance_panel(state, _daily_for_guidance)
+    guidance_panel(state, _daily_for_guidance, scores)
 
     # ---- Module radar + module cards -------------------------------------
     st.subheader("Five Risk Modules (current)")

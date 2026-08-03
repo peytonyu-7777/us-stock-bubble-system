@@ -437,16 +437,17 @@ def run_backtest(scores: Optional[pd.Series], spy_df: Optional[pd.Series],
                              line={"color": "#c1121f", "width": 2}),
                   secondary_y=False)
 
-    # V2 risk-band horizontal shading + labels on the score (right) axis.
+    # V2 risk-band horizontal shading + labels INSIDE the plot (right edge,
+    # anchored to the score axis) — outside labels got clipped/overlapped.
     band_tints = ["#e8f0fe", "#e6f4ea", "#fef6e0", "#fde7d3", "#fbe2e2"]
     for i, (lo, hi, _color, label) in enumerate(pipe.RISK_BANDS):
         fig.add_shape(type="rect", xref="paper", x0=0, x1=1,
                       yref="y2", y0=lo, y1=hi,
                       fillcolor=band_tints[i], opacity=0.30, line_width=0,
                       layer="below")
-        fig.add_annotation(xref="paper", x=1.012, yref="y2", y=(lo + hi) / 2,
-                           text=label, showarrow=False, xanchor="left",
-                           font={"size": 9, "color": "#555"})
+        fig.add_annotation(xref="paper", x=0.998, yref="y2", y=(lo + hi) / 2,
+                           text=label, showarrow=False, xanchor="right",
+                           xshift=-6, font={"size": 9, "color": "#555"})
 
     # Bubble Risk Score context line (right axis) — explains the de-risk calls.
     fig.add_trace(go.Scatter(x=sc.index, y=sc.values,
