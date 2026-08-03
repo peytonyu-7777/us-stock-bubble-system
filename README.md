@@ -44,26 +44,27 @@ unavailable its module weight is redistributed so the score always stays 0–100
 | 75–90 | Bubble Risk |
 | 90–100 | Extreme Bubble |
 
-### Bubble-DCA rule (backtest de-risk)
+### Bubble-DCA rule (default: multiplier mode)
 
-The strategy **never changes your monthly outflow** (same $ as plain DCA) — the
-index only decides how much of the cash on hand to *deploy* into SPY:
+The strategy **scales your monthly DCA** by the index band:
 
-| Score | Deployment action |
-|-------|-------------------|
-| < 40 | **Deploy base + draw the stockpiled reserve** (up to 2× base) |
-| 40–50 | Deploy base + up to 0.5× reserve |
-| 50–80 | Deploy the base amount only |
-| 80–95 | **Taper: deploy 0.5×, stockpile 0.5× as cash reserve** (earns SHY/FRED 3M yield) |
-| ≥ 95 | Deploy 0 × + move 15% of the portfolio to cash (true extremes only) |
+| Score | DCA multiplier |
+|-------|----------------|
+| < 40 | **3× base** |
+| 40–50 | **1.5× base** |
+| 50–80 | 1× base |
+| 80–95 | **0.5× base** (skip half) |
+| ≥ 95 | **0× + move 15% of portfolio to cash** |
 
-Total invested therefore equals plain DCA's exactly — the IRR comparison is a
-pure measure of the index's *timing* skill (stockpile at bubble highs, deploy at
-deep-fear lows). The legacy multiplier mode (scale the contribution itself) is
-still available in the sidebar.
+The result visibly diverges from plain DCA: more dollars at genuine fear
+windows, fewer at genuine bubbles, shallower drawdowns at every classic top.
+A new per-dollar-efficiency metric ($1 → $X) shows whether the strategy earned
+more on every invested dollar than DCA did.
 
-*(Band thresholds are strategy parameters, independent of the display risk
-bands above.)*
+An optional **reserve-recycle mode** is also available: same $ outflow as DCA,
+only the timing of deployment changes. Use it to study pure timing alpha
+(IRR comparison) — in this mode the equity curve hugs DCA by construction and
+the cash reserve subplot visualises the stockpiling/deploying cycle.
 
 ### Scoring refinements (V3)
 
@@ -146,7 +147,7 @@ bands above.)*
 | File | Purpose |
 |------|---------|
 | `pipeline.py` | **Crash-proof concurrent** data fetchers (ThreadPoolExecutor, per-request timeout, hard total deadline, `FuturesTimeoutError` caught + non-blocking shutdown) + vectorized robust-Z scoring (V3) + **FRED-backed price fallback chain** (`SP500`/`NASDAQCOM`/`VIXCLS`) + **incremental** parquet cache (`bubble_cache.parquet`, format-versioned) + **cache-first, never-raises** resolution (cache → live → synthetic). Includes the **K-line two-timescale daily filter** (`get_daily_scores()`), **event detection** (`detect_events()`), `historical_benchmarks()` / `opportunity_benchmarks()` and `probe_connectivity()`. Public API: `get_monthly_scores()`, `get_latest_state()`, `get_daily_scores()`. |
-| `backtest.py` | Buy-&-Hold vs Bubble-DCA (2000→today), monthly by default. Fully **parameterized** engine with a **reserve-recycle default mode** (same $ outflow as DCA — taper & stockpile at high risk, deploy the reserve at deep-fear lows; bands 40/50/80/95, de-risk ≥ 95). Prints **money-weighted return (IRR)**, total invested, final value, max drawdown, Sharpe + drawdown comparison for 2000/2008/2021. `run_backtest()` returns `(metrics_df, chart_fig)` for the dashboard; `main()` returns the per-side metric dicts for `report.py`. |
+| `backtest.py` | Buy-&-Hold vs Bubble-DCA (2000→today), monthly by default. Fully **parameterized** engine with a **multiplier default** (3× at score<40, 1.5× at 40–50, 0.5× at 80–95, 0× + 15% cash at ≥95) — visibly beats DCA in Final Value ($X per $1) and shallower drawdowns at every classic top (dot-com +4pp, GFC +3.5pp). An optional **reserve-recycle mode** (same $ outflow as DCA, index re-times deployment) is also available for pure-timing-alpha studies. `run_backtest()` returns `(metrics_df, chart_fig)` with a **2-row chart** (equity + cash reserve); `main()` returns the per-side metric dicts for `report.py`. |
 | `app.py` | Terminal-style Streamlit dashboard: gauge + status **badge card**, **🧭 current-guidance panel** (zone → posture, last risk climax / buying window), 5-module radar + monthly drivers, **historical comparison** (risk climaxes 🔴 vs accumulation troughs 🟢, incl. the late-2022 big-buy window), **dual-Y-axis** S&P/Nasdaq history with **event markers**, V3 risk-band shading, an **interactive backtest panel** (reserve-recycle default) with honest IRR metrics, an **on-page diagnostics panel** (source, feature availability, episode calibration, connectivity probe), and a sidebar *"Valuation acceleration"* toggle. All data loads are guarded — the page degrades to cache/synthetic with a notice instead of ever crashing. **Mobile-responsive**. |
 | `requirements.txt`, `Dockerfile`, `render.yaml` | Zero-cost deploy config. |
 

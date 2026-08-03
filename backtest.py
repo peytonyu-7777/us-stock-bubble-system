@@ -61,8 +61,9 @@ DEFAULT_PARAMS = {
     "derisk_threshold": 95.0,  # score at/above which deploy -> 0 + de-risk fires
     "derisk_cash": 0.15,       # target cash-sleeve fraction on de-risk
     "cash_yield": 0.0,         # annualized cash return (%); 0 => use SHY return
-    "recycle": True,           # reserve-recycle DCA: same outflow as plain DCA,
-                               # the index only decides WHEN cash is deployed
+    "recycle": False,          # True => reserve-recycle DCA (same outflow as DCA);
+                               # False => multiplier mode (default — more dollars at
+                               # lows, fewer at highs; visibly diverges from DCA)
 }
 
 
@@ -234,6 +235,7 @@ def _simulate(price: pd.Series, shy_ret: pd.Series, scores: pd.Series,
     vals = []
     contribs = []
     derisk_dates = []
+    cash_history = []           # per-period end-of-period cash reserve
     prev_p = None
     prev_total = 0.0
     for i, d in enumerate(dates):
@@ -312,11 +314,13 @@ def _simulate(price: pd.Series, shy_ret: pd.Series, scores: pd.Series,
 
         prev_total = shares * price_d + cash
         vals.append(prev_total)
+        cash_history.append(cash)
         prev_p = price_d
 
     return (pd.Series(vals, index=dates),
             pd.Series(contribs, index=dates),
-            derisk_dates)
+            derisk_dates,
+            pd.Series(cash_history, index=dates))
 
 
 # ---------------------------------------------------------------------------
@@ -377,10 +381,10 @@ def run_backtest(scores: Optional[pd.Series], spy_df: Optional[pd.Series],
     if shy_ret is None:
         shy_ret = pd.Series(0.0, index=spy.index)
 
-    bench, bench_cf, _ = _simulate(spy, shy_ret, sc, dates, base, ppy,
-                                    timing=False, params=prm)
-    strat, strat_cf, derisk_dates = _simulate(spy, shy_ret, sc, dates, base, ppy,
-                                              timing=True, params=prm)
+    bench, bench_cf, _, bench_cash = _simulate(spy, shy_ret, sc, dates, base, ppy,
+                                                timing=False, params=prm)
+    strat, strat_cf, derisk_dates, strat_cash = _simulate(spy, shy_ret, sc, dates, base, ppy,
+                                                          timing=True, params=prm)
 
     mb = metrics(bench, bench_cf, ppy=ppy)
     ms = metrics(strat, strat_cf, ppy=ppy)
@@ -421,21 +425,42 @@ def run_backtest(scores: Optional[pd.Series], spy_df: Optional[pd.Series],
     ]
     metrics_df = pd.DataFrame(rows)
 
-    # ---- Chart: equity curves + Bubble Risk Score (dual axis) ------------
-    # Uses the SAME V2 risk-band shading as the history view so the backtest
-    # reads with the rest of the dashboard instead of looking like a stray plot.
-    fig = make_subplots(specs=[[{"secondary_y": True}]])
+    # ---- Chart: equity curves (row 1, dual axis) + strategy cash reserve (row 2)
+    # Row 2 lets you SEE the recycle-mode stockpile/drawdown cycle; in multiplier
+    # mode the cash balance is essentially zero (all dollars go to SPY each month).
+    fig = make_subplots(
+        rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.08,
+        row_heights=[0.70, 0.30],
+        subplot_titles=("Portfolio Value (Strategy vs Benchmark, dual axis)",
+                        "Strategy Cash Reserve ($)"),
+        specs=[[{"secondary_y": True}], [{}]],
+    )
     # NOTE: secondary_y is an add_trace() argument, NOT a go.Scatter property —
     # passing it inside go.Scatter(...) raises "Invalid property" in Plotly's
     # _process_kwargs (this is what crashed the backtest panel on Render).
     fig.add_trace(go.Scatter(x=bench.index, y=bench.values,
                              name="Benchmark (Buy & Hold DCA)",
                              line={"color": "#1f4e79", "width": 2}),
-                  secondary_y=False)
+                  row=1, col=1, secondary_y=False)
     fig.add_trace(go.Scatter(x=strat.index, y=strat.values,
                              name="Bubble Risk-Adjusted DCA",
-                             line={"color": "#c1121f", "width": 2}),
-                  secondary_y=False)
+                             line={"color": "#c1121f", "width": 2.5}),
+                  row=1, col=1, secondary_y=False)
+
+    # Cash reserve (row 2): filled area, dashed zero line for reference.
+    if strat_cash is not None and strat_cash.abs().sum() > 0:
+        fig.add_trace(go.Scatter(x=strat_cash.index, y=strat_cash.values,
+                                 name="Strategy cash reserve",
+                                 line={"color": "#7c3aed", "width": 1.5,
+                                       "dash": "dot"},
+                                 fill="tozeroy",
+                                 fillcolor="rgba(124,58,237,0.10)",
+                                 hovertemplate="Reserve: $%{y:,.0f}<extra></extra>"),
+                      row=2, col=1)
+        fig.add_hline(y=0, line_dash="solid", line_color="#e2e8f0",
+                      row=2, col=1)
+        fig.update_yaxes(title_text="Reserve ($)", row=2, col=1,
+                         tickformat="$,.0f")
 
     # V2 risk-band horizontal shading + labels INSIDE the plot (right edge,
     # anchored to the score axis) — outside labels got clipped/overlapped.
@@ -444,17 +469,18 @@ def run_backtest(scores: Optional[pd.Series], spy_df: Optional[pd.Series],
         fig.add_shape(type="rect", xref="paper", x0=0, x1=1,
                       yref="y2", y0=lo, y1=hi,
                       fillcolor=band_tints[i], opacity=0.30, line_width=0,
-                      layer="below")
+                      layer="below", row=1, col=1)
         fig.add_annotation(xref="paper", x=0.998, yref="y2", y=(lo + hi) / 2,
                            text=label, showarrow=False, xanchor="right",
-                           xshift=-6, font={"size": 9, "color": "#555"})
+                           xshift=-6, font={"size": 9, "color": "#555"},
+                           row=1, col=1)
 
     # Bubble Risk Score context line (right axis) — explains the de-risk calls.
     fig.add_trace(go.Scatter(x=sc.index, y=sc.values,
                              name="Bubble Risk Score",
                              line={"color": "#888888", "width": 1, "dash": "dot"},
                              opacity=0.65),
-                  secondary_y=True)
+                  row=1, col=1, secondary_y=True)
 
     if derisk_dates:
         dm = pd.Series([strat.get(d, np.nan) for d in derisk_dates],
@@ -465,14 +491,18 @@ def run_backtest(scores: Optional[pd.Series], spy_df: Optional[pd.Series],
                                      marker={"color": "#e4572e", "size": 7,
                                              "symbol": "triangle-down"},
                                      hovertemplate="De-risk @ %{x|%Y-%m}<extra></extra>"),
-                          secondary_y=False)
+                          row=1, col=1, secondary_y=False)
 
-    fig.update_layout(height=460, hovermode="x unified",
+    fig.update_layout(height=620, hovermode="x unified",
                       margin={"t": 30, "b": 30, "l": 75, "r": 95},
-                      legend=dict(orientation="h", y=1.08, x=0),
+                      legend=dict(orientation="h", y=1.06, x=0),
                       plot_bgcolor="white", paper_bgcolor="white")
-    fig.update_yaxes(title_text="Portfolio Value (USD)", secondary_y=False)
-    fig.update_yaxes(title_text="Bubble Risk Score", range=[0, 100], secondary_y=True)
+    fig.update_yaxes(title_text="Portfolio Value (USD)", row=1, col=1,
+                     secondary_y=False)
+    fig.update_yaxes(title_text="Bubble Risk Score", range=[0, 100],
+                     row=1, col=1, secondary_y=True)
+    fig.update_xaxes(title_text="", row=1, col=1)
+    fig.update_xaxes(title_text="Date", row=2, col=1)
 
     return metrics_df, fig
 
@@ -507,11 +537,11 @@ def main(refresh: bool = False, freq: str = "W", params: dict = None) -> dict:
 
     # ---- Per-side metric dicts (honest) + drawdown comparison ------------
     # Reuse the same simulations so the CLI / report and the dashboard agree.
-    strat_eq, strat_cf, _ = _simulate(
+    strat_eq, strat_cf, _, _ = _simulate(
         spy, shy.pct_change().fillna(0.0), scores_ff, list(spy.index),
         base, ppy, timing=True, params=prm)
     # benchmark (no timing) for the metrics + trough comparison
-    bench_eq, bench_cf, _ = _simulate(
+    bench_eq, bench_cf, _, _ = _simulate(
         spy, shy.pct_change().fillna(0.0), scores_ff, list(spy.index),
         base, ppy, timing=False, params=prm)
     mb = metrics(bench_eq, bench_cf, ppy=ppy)

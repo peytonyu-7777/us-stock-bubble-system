@@ -373,31 +373,28 @@ def guidance_panel(state: dict, daily: pd.Series, monthly: pd.Series = None):
         return
     if score < 35:
         posture, color, note = (
-            "ACCUMULATE AGGRESSIVELY · base + max reserve draw", "#1a9850",
+            "ACCUMULATE AGGRESSIVELY · 3× base this month", "#1a9850",
             "Deep-fear zone — historically the STRONGEST forward 12–24m return "
-            "window (2002-09, 2009-03, 2020-03, 2022-10). Deploy the stockpiled "
-            "reserve here.")
+            "window (2002-09, 2009-03, 2020-03, 2022-10). Invest 3× your base.")
     elif score < 40:
         posture, color, note = (
-            "ACCUMULATE · base + reserve draw (up to 2x)", "#1a9850",
-            "Cheap / fear zone — risk is below median; deploy base plus the "
-            "stockpiled reserve.")
+            "ACCUMULATE · 3× base this month", "#1a9850",
+            "Cheap / fear zone — risk is below median; invest 3× your base.")
     elif score < 50:
         posture, color, note = (
-            "STEADY ACCUMULATION · base + 0.5x reserve draw", "#2166ac",
-            "Below-median risk — keep buying, plus a moderate reserve top-up.")
+            "STEADY ACCUMULATION · 1.5× base this month", "#2166ac",
+            "Below-median risk — keep buying, put in 1.5× your base.")
     elif score < 80:
         posture, color, note = (
-            "BASE PACE · 1.0x DCA", "#f4a01c",
-            "Valuation elevated — deploy the base amount only, no new aggression.")
+            "BASE PACE · 1.0× DCA", "#f4a01c",
+            "Valuation elevated — invest your base amount only, no new aggression.")
     elif score < 95:
         posture, color, note = (
-            "TAPER / BUILD RESERVE · 0.5x deploy", "#e4572e",
-            "Bubble-risk zone — deploy half, stockpile half as a cash reserve "
-            "for the next deep-fear window.")
+            "TAPER · 0.5× base this month", "#e4572e",
+            "Bubble-risk zone — invest half your base; skip the rest.")
     else:
         posture, color, note = (
-            "DE-RISK · 0x deploy + cash sleeve", "#c1121f",
+            "DE-RISK · 0× + 15% to cash sleeve", "#c1121f",
             "Extreme-bubble zone — prioritise capital preservation.")
 
     # Last detected risk climax + accumulation window from the daily series.
@@ -596,12 +593,24 @@ def backtest_panel(scores: pd.Series, params: dict, meta: dict = None):
                 "available (fix `FRED_API_KEY` on Render and redeploy).")
         return
 
-    st.caption("Benchmark: fixed ${:,}/mo into SPY (buy & hold). Strategy: the "
-               "SAME ${:,}/mo outflow — the index only decides deployment: "
-               "taper & stockpile cash at high risk (≥80), deploy the reserve "
-               "at low readings (<40/50), de-risk at extremes (≥95). Same "
-               "total invested, so IRR isolates pure timing skill."
-               .format(int(params["base_monthly"]), int(params["base_monthly"])))
+    if params.get("recycle"):
+        st.caption("Benchmark: fixed ${:,}/mo into SPY (buy & hold). Strategy: the "
+                   "SAME ${:,}/mo outflow — the index only decides deployment: "
+                   "taper & stockpile cash at high risk (≥80), deploy the reserve "
+                   "at low readings (<40/50), de-risk at extremes (≥95). Same "
+                   "total invested, so IRR isolates pure timing skill. The lower "
+                   "subplot shows the cash reserve accumulating/depleting."
+                   .format(int(params["base_monthly"]), int(params["base_monthly"])))
+    else:
+        st.caption("Benchmark: fixed ${:,}/mo into SPY (buy & hold). Strategy "
+                   "(default): scale the monthly contribution by the index band "
+                   "— 3× at score <40, 1.5× at 40–50, 1× at 50–80, 0.5× at "
+                   "80–95, 0× + 15% cash sleeve ≥95. Deploys more at lows and "
+                   "less at highs → visibly diverges from DCA, beats it in $ "
+                   "Final Value, IRR stays comparable. The lower subplot shows "
+                   "the strategy's cash sleeve (mostly empty in multiplier "
+                   "mode — dollars go straight to SPY)."
+                   .format(int(params["base_monthly"])))
 
     # Recompute ONLY when the apply button changed the params (or first load):
     # unrelated widget reruns do NOT re-run the backtest.
@@ -640,6 +649,40 @@ def backtest_panel(scores: pd.Series, params: dict, meta: dict = None):
     metrics_df, chart_fig = res
     st.dataframe(metrics_df, use_container_width=True, hide_index=True)
     st.plotly_chart(chart_fig, use_container_width=True)
+
+    # Per-dollar efficiency (Final Value / Total Invested) — the real measure
+    # of "alpha per $ deployed": > 1.0 = the strategy multiplies dollars better
+    # than DCA did; < 1.0 = DCA did. Together with the table above, this lets
+    # the user see whether the $ advantage came from "more shares at lower
+    # prices" (good) or just "more dollars" (neutral).
+    try:
+        ti_b = float(metrics_df.loc[metrics_df["Metric"] == "Total Invested",
+                                     "Benchmark (Buy & Hold DCA)"].iloc[0]
+                      .replace("$", "").replace(",", ""))
+        fv_b = float(metrics_df.loc[metrics_df["Metric"] == "Final Value",
+                                     "Benchmark (Buy & Hold DCA)"].iloc[0]
+                      .replace("$", "").replace(",", ""))
+        ti_s = float(metrics_df.loc[metrics_df["Metric"] == "Total Invested",
+                                     "Bubble-DCA Strategy"].iloc[0]
+                      .replace("$", "").replace(",", ""))
+        fv_s = float(metrics_df.loc[metrics_df["Metric"] == "Final Value",
+                                     "Bubble-DCA Strategy"].iloc[0]
+                      .replace("$", "").replace(",", ""))
+        eff_b = fv_b / ti_b
+        eff_s = fv_s / ti_s
+        delta = (eff_s / eff_b - 1) * 100
+        c1, c2 = st.columns(2)
+        c1.metric("DCA: $1 变成",
+                  f"${eff_b:.2f}",
+                  help="基准定投的每美元回报 (Final Value / Total Invested)")
+        c2.metric("策略: $1 变成",
+                  f"${eff_s:.2f}",
+                  delta=f"{delta:+.1f}% vs 定投",
+                  help="策略的每美元回报。**正值 = 策略在每一美元上比定投更高效** "
+                       "（同样投入，回报更高）。",
+                  delta_color=("normal" if delta >= 0 else "inverse"))
+    except Exception:
+        pass
 
 
 def historical_comparison(scores: pd.Series, state: dict):
@@ -754,18 +797,17 @@ def main():
     if "bt_params" not in st.session_state:
         st.session_state["bt_params"] = dict(
             base_monthly=1000, low_mult=3.0, high_mult=0.5,
-            derisk_threshold=95, derisk_cash=0.15, cash_yield=4.0, recycle=True)
+            derisk_threshold=95, derisk_cash=0.15, cash_yield=4.0, recycle=False)
     with st.sidebar.expander("🎛️ Backtest Parameters", expanded=False):
         with st.form("bt_form"):
             base_monthly = st.number_input("Base Monthly DCA ($)", min_value=0,
                                            max_value=10000, value=1000, step=100)
             recycle = st.checkbox(
-                "Reserve-recycle mode (same $ outflow as DCA)", value=True,
-                help="ON: you always invest the same monthly amount — at high "
-                     "risk part of it is stockpiled as a cash reserve, at low "
-                     "risk the reserve is deployed. Total invested == plain "
-                     "DCA, so the IRR comparison isolates the index's timing "
-                     "skill. OFF: legacy multiplier mode.")
+                "Reserve-recycle mode (same $ outflow as DCA)", value=False,
+                help="OFF (默认): 倍率模式 — 低风险多投、高风险少投，曲线明显与定投分离，"
+                     "最终收益在定投基础上叠加（但总投入更多）。"
+                     "ON: 资金回收模式 — 每月投入和定投相同，只在择时上优化，"
+                     "曲线几乎与定投重合（IRR 衡量纯择时 alpha）。")
             low_mult = st.slider("Deep-Value Deploy Cap (Score < 40)", 1.0, 4.0, 3.0, 0.1,
                                  help="At deep-value readings deploy the base "
                                       "amount PLUS up to this multiple drawn "
