@@ -61,11 +61,27 @@ risk bands above.)*
   interpolating linearly between — so the 2000 ≈ 95–100, 2007 ≈ 85–90, COVID-pre
   ≈ 60–70 and 2021 ≈ 75–85 targets fall out of the data, with no hard-coded
   current level.
-* **Stability layer (kills daily whipsaw).** A steady EMA (span 20 ≈ "70% current
-  + 30% 20-day average") smooths the series, then a **daily-change clamp**
-  (≤ 1.5 pts normally, ≤ 8 pts under a *stress flag*: VIX > 40 *or* a 21-day S&P
-  drop < −15% *or* a BAA10Y month-over-month jump > 0.5) is applied day-by-day
-  with no look-ahead. This restores the multi-year cycle feel the user asked for.
+* **K-line stability filter (trend + bounded oscillation).** The daily index is
+  decomposed into a slow-EMA trend (TREND_SPAN = 75d — the mid/long-term macro
+  wave) plus a small, hard-capped short-term oscillation (±6 pts) — like a stock
+  K-line: a clear medium-term trend with minor daily wiggle, never a violent
+  sawtooth, never an over-smoothed flat line. A **stress-aware daily clamp**
+  (≤ 1.2 pts normally, ≤ 6 pts under a *stress flag*: VIX > 40 *or* a 21-day S&P
+  drop < −15% *or* a BAA10Y month-over-month jump > 0.5) lets genuine risk
+  events break out fast. All steps are causal (no look-ahead).
+* **Event detection + guidance.** Local peaks ≥ 75 are flagged as risk climaxes
+  (trim); local troughs ≤ 35 as accumulation windows (buy) — the deep-fear zone
+  has historically marked the strongest forward 12–24m returns (2002-09,
+  2009-03, 2020-03, 2022-10). The dashboard renders these as chart markers and a
+  current-guidance panel.
+* **Crash-proof, cache-first loading.** `get_monthly_scores()` never raises:
+  fresh parquet cache is served instantly; a live incremental refresh is
+  attempted behind a hard deadline; any failure falls back to the cache, then to
+  a flagged synthetic series. The concurrent fetch catches
+  `concurrent.futures.TimeoutError` explicitly (a **distinct class** from the
+  builtin on Python ≤ 3.10 — the exact bug that crashed Render) and shuts the
+  executor down with `wait=False, cancel_futures=True` so a hung request can
+  never hold the page hostage.
 * **Honest backtest metrics.** The DCA backtest reports **money-weighted return
   (IRR)**, total invested, final value, max drawdown and a contribution-stripped
   Sharpe — *not* a naive end/start equity "Total Return", which would conflate
@@ -77,9 +93,9 @@ risk bands above.)*
 
 | File | Purpose |
 |------|---------|
-| `pipeline.py` | **Concurrent** data fetchers (ThreadPoolExecutor, 5s per-request timeout, hard total deadline) + vectorized rolling-percentile scoring + **incremental** parquet cache (`bubble_cache.parquet`) + synthetic fallback (only when all 8 APIs fail). Includes **EMA-smoothed daily score** (`get_daily_scores()`) and the **non-linear tail-risk escalation** switch (`TAIL_BOOST_ON`). Public API: `get_monthly_scores()`, `get_latest_state()`, `get_daily_scores()`. |
+| `pipeline.py` | **Crash-proof concurrent** data fetchers (ThreadPoolExecutor, 5s per-request timeout, hard total deadline, `FuturesTimeoutError` caught + non-blocking shutdown) + vectorized rolling-percentile scoring + **incremental** parquet cache (`bubble_cache.parquet`) + **cache-first, never-raises** resolution (cache → live → synthetic). Includes the **K-line two-timescale daily filter** (`get_daily_scores()`), **event detection** (`detect_events()`: risk climaxes ≥ 75, accumulation troughs ≤ 35) and `historical_benchmarks()` / `opportunity_benchmarks()`. Public API: `get_monthly_scores()`, `get_latest_state()`, `get_daily_scores()`. |
 | `backtest.py` | Buy-&-Hold vs Bubble-DCA (2000→today), **weekly rebalancing by default** (`--freq M` for monthly). Fully **parameterized** engine — CLI flags `--base`, `--low-mult`, `--high-mult`, `--derisk-thr`, `--derisk-cash`, `--cash-yield` (plus `--refresh`/`--freq`). Prints **money-weighted return (IRR)**, total invested, final value, max drawdown, Sharpe + drawdown comparison for 2000/2008/2021. `run_backtest()` returns `(metrics_df, chart_fig)` for the dashboard; `main()` returns the per-side metric dicts for `report.py`. |
-| `app.py` | Terminal-style Streamlit dashboard: gauge + status **badge card** (strategy action, elevated-feature callouts, live toggle state), 8 dynamic feature cards (green/amber/orange/crimson, ≥80 pulse), **dual-Y-axis** S&P (left) / Nasdaq (right) history with **log/linear toggle** + risk-zone shading (green 0–40 / amber 40–80 / red 80–100) + >80 line, an **interactive backtest panel** with live parameter sliders, and a sidebar *"Tail-risk amplification"* toggle. **Mobile-responsive**. |
+| `app.py` | Terminal-style Streamlit dashboard: gauge + status **badge card**, **🧭 current-guidance panel** (zone → posture, last risk climax / buying window), 5-module radar + monthly drivers, **historical comparison** (risk climaxes 🔴 vs accumulation troughs 🟢, incl. the late-2022 big-buy window), **dual-Y-axis** S&P/Nasdaq history with **event markers** (red ▼ risk, green ▲ opportunity), V2 risk-band shading, an **interactive backtest panel** with honest IRR metrics, and a sidebar *"Valuation acceleration"* toggle. All data loads are guarded — the page degrades to cache/synthetic with a notice instead of ever crashing. **Mobile-responsive**. |
 | `requirements.txt`, `Dockerfile`, `render.yaml` | Zero-cost deploy config. |
 
 ---

@@ -95,7 +95,8 @@ import json
 import math
 import threading
 import warnings
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import (ThreadPoolExecutor, as_completed,
+                                TimeoutError as FuturesTimeoutError)
 from typing import Callable, Optional, Tuple
 
 import numpy as np
@@ -213,9 +214,17 @@ HIST_PEAK_TARGET = 97.0
 HIST_TROUGH_TARGET = 12.0
 
 # --- Stability layer (principle 1) -----------------------------------------
-EMA_SPAN = 20                # steady EMA (~ "70% current + 30% 20d average")
-DAILY_CLAMP = 1.5            # max |Δ| per day in normal regimes
-STRESS_CLAMP = 8.0           # relaxed clamp under genuine stress
+# --- K-line style two-timescale stability filter ---------------------------
+# A slow EMA carries the mid/long-term macro trend; a damped fast component
+# adds a SMALL, bounded short-term oscillation on top — like a stock K-line:
+# a clear medium-term trend with minor daily wiggle. Never a violent sawtooth,
+# never an over-smoothed flat line.
+TREND_SPAN = 75              # slow EMA on the daily series (≈ one quarter)
+OSC_SPAN = 8                 # fast EMA -> short-term component
+OSC_GAIN = 0.55              # fraction of (fast - trend) kept as visible wiggle
+OSC_MAX = 6.0                # hard cap on the short-term oscillation (points)
+DAILY_CLAMP = 1.2            # max |Δ| per day in normal regimes
+STRESS_CLAMP = 6.0           # relaxed clamp under genuine stress
 STRESS_VIX = 40.0            # VIX > 40 -> stress
 STRESS_CREDIT_JUMP = 0.5     # BAA10Y MoM widen > 50 bps -> stress
 STRESS_DROP = -0.15          # trailing-21d S&P 500 drop < -15% -> stress
@@ -834,24 +843,39 @@ def fetch_all_raw(incremental: bool) -> Tuple[pd.DataFrame, dict]:
         start = HISTORY_START
 
     results: dict = {}
-    with ThreadPoolExecutor(max_workers=8) as ex:
-        future_to_key = {ex.submit(_fetch_one, spec, start): key
-                         for key, spec in RAW_SPECS.items()}
-        try:
-            for fut in as_completed(list(future_to_key.keys()),
-                                    timeout=FETCH_DEADLINE):
-                key = future_to_key[fut]
-                try:
-                    results[key] = fut.result()
-                except Exception:
-                    results[key] = None
-        except TimeoutError:
-            # Cancel whatever is still running and treat as missing.
-            for fut, key in future_to_key.items():
-                if not fut.done():
-                    fut.cancel()
-                    results[key] = None
-            fmeta["timeout"] = True
+    # ZERO-CRASH + NON-BLOCKING design:
+    #  * Do NOT use `with ThreadPoolExecutor(...)` — its __exit__ runs
+    #    shutdown(wait=True) and would BLOCK on the slowest hung request,
+    #    defeating FETCH_DEADLINE.
+    #  * `as_completed(timeout=...)` raises concurrent.futures.TimeoutError on
+    #    deadline. On Python <= 3.10 (Render's image) that class is DISTINCT
+    #    from the builtin TimeoutError (they were only unified in 3.11), so
+    #    `except TimeoutError` silently let it escape and crash Streamlit.
+    #    Catch FuturesTimeoutError explicitly (a tuple also covers 3.11+).
+    ex = ThreadPoolExecutor(max_workers=8)
+    future_to_key = {ex.submit(_fetch_one, spec, start): key
+                     for key, spec in RAW_SPECS.items()}
+    try:
+        for fut in as_completed(list(future_to_key.keys()),
+                                timeout=FETCH_DEADLINE):
+            key = future_to_key[fut]
+            try:
+                results[key] = fut.result()
+            except Exception:
+                results[key] = None
+    except (FuturesTimeoutError, TimeoutError):
+        # Deadline hit with stragglers: keep whatever finished, treat the rest
+        # as missing. NEVER raise to the caller (this is what crashed Render).
+        fmeta["timeout"] = True
+    finally:
+        for fut, key in future_to_key.items():
+            if not fut.done():
+                fut.cancel()
+                results.setdefault(key, None)
+        # cancel_futures=True (py3.9+) drops queued-but-unstarted work; any
+        # already-running thread still honours its own per-request
+        # FETCH_TIMEOUT, so the process is never held hostage by the network.
+        ex.shutdown(wait=False, cancel_futures=True)
 
     # Merge into the cached history (fresh tail wins on overlap).
     full_idx = pd.date_range(HISTORY_START, today, freq="ME")
@@ -1196,66 +1220,98 @@ def _synthetic_scores(start: str = LIVE_START) -> pd.Series:
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
+def _cached_scores(tail_boost: Optional[bool] = None
+                   ) -> Optional[Tuple[pd.Series, dict]]:
+    """(monthly_score_series, meta) rebuilt from the on-disk feature cache, or
+    None if the cache is missing/unusable. Pure local I/O — instant, no network.
+
+    The composite is always recomputed from the stored features with the CURRENT
+    tail_boost setting, so toggling the switch takes effect immediately on
+    cached data (no refetch needed).
+    """
+    if not (os.path.exists(CACHE_PATH) and os.path.exists(META_PATH)):
+        return None
+    try:
+        cached = pd.read_parquet(CACHE_PATH)
+        fcols = [c for c in cached.columns if c.startswith("feat_")]
+        if not fcols:
+            return None
+        feat = cached[fcols].copy()
+        feat.columns = [c[5:] for c in feat.columns]
+        score = compute_composite(feat, tail_boost=tail_boost).dropna()
+        if score.empty:
+            return None
+        meta = json.load(open(META_PATH))
+        meta["source"] = "cache"
+        latest = score.index[-1]
+        live_cols = [c for c in WEIGHTS
+                     if WEIGHTS[c] > 0 and c in feat.columns
+                     and not pd.isna(feat[c].get(latest, np.nan))]
+        meta["available_count"] = len(live_cols)
+        return score, meta
+    except Exception:
+        return None
+
+
+def _synthetic_result() -> Tuple[pd.Series, dict]:
+    return _synthetic_scores(), {
+        "source": "synthetic",
+        "available_count": 0,
+        "features": {},
+        "note": "All live APIs unavailable; showing deterministic synthetic series. Check network / FRED_API_KEY.",
+    }
+
+
 def get_monthly_scores(refresh: bool = False,
                         tail_boost: Optional[bool] = None) -> Tuple[pd.Series, dict]:
     """
-    Returns (monthly_score_series, meta).
-    Order of resolution: on-disk cache -> live fetch -> synthetic.
+    Returns (monthly_score_series, meta). NEVER raises — the dashboard must
+    always render, even with zero network.
+
+    Resolution order:
+      1. cache-first fast path (instant, no network) when refresh=False;
+      2. live INCREMENTAL fetch (last ~30 days) merged into the cache;
+      3. on ANY fetch/compute failure -> the on-disk cache (even if stale);
+      4. only if nothing real exists -> the flagged deterministic synthetic.
+
     `meta['source']` is one of 'live', 'cache', 'synthetic'.
-    `refresh=False` serves the cache (instant); `refresh=True` performs an
-    INCREMENTAL re-fetch (last ~30 days) and updates the cache.
-
-    Zero-crash rule: synthetic is returned ONLY when no feature has a valid
-    reading at the latest date (all 8 APIs failed). Otherwise the composite is
-    renormalized over whatever subset is live.
     """
-    meta: dict = {"source": "unknown"}
+    # 1) Instant path: serve the baked/on-disk cache without touching network.
+    if not refresh:
+        hit = _cached_scores(tail_boost)
+        if hit is not None:
+            return hit
 
-    if not refresh and os.path.exists(CACHE_PATH) and os.path.exists(META_PATH):
-        try:
-            cached = pd.read_parquet(CACHE_PATH)
-            fcols = [c for c in cached.columns if c.startswith("feat_")]
-            feat = cached[fcols].copy()
-            feat.columns = [c[5:] for c in feat.columns]
-            # Always recompute the composite from the stored features using the
-            # CURRENT tail_boost setting, so toggling the switch takes effect
-            # immediately on cached data (no refetch needed). The VIX level is
-            # pulled from the cached raw columns for the capitulation multiplier.
-            score = compute_composite(feat, tail_boost=tail_boost).dropna()
-            meta = json.load(open(META_PATH))
-            meta["source"] = "cache"
-            latest = score.index[-1] if not score.empty else None
-            live_cols = [c for c in WEIGHTS if WEIGHTS[c] > 0
-                         if latest is not None and not pd.isna(feat[c].get(latest, np.nan))]
-            meta["available_count"] = len(live_cols)
-            return score, meta
-        except Exception:
-            pass  # fall through to rebuild
-
-    incremental = os.path.exists(CACHE_PATH)
-    raw, fmeta = fetch_all_raw(incremental=incremental)
-    feat, fmeta_feat = compute_features_from_raw(raw)
-    score = compute_composite(feat, tail_boost=tail_boost).dropna()
+    # 2) Live path — wrapped so a network/compute failure can NEVER crash the
+    #    app (this whole block is what used to propagate the TimeoutError).
+    try:
+        incremental = os.path.exists(CACHE_PATH)
+        raw, fmeta = fetch_all_raw(incremental=incremental)
+        feat, fmeta_feat = compute_features_from_raw(raw)
+        score = compute_composite(feat, tail_boost=tail_boost).dropna()
+    except Exception as exc:
+        print(f"[score] live fetch/compute failed ({exc!r}); "
+              f"falling back to cache/synthetic")
+        hit = _cached_scores(tail_boost)
+        return hit if hit is not None else _synthetic_result()
 
     # ---- Live-feature accounting (features valid at the latest date) ------
     latest = score.index[-1] if not score.empty else None
-    live_cols = [c for c in WEIGHTS if WEIGHTS[c] > 0
-                 if latest is not None and not pd.isna(feat[c].get(latest, np.nan))]
+    live_cols = [c for c in WEIGHTS
+                 if WEIGHTS[c] > 0 and c in feat.columns
+                 and latest is not None and not pd.isna(feat[c].get(latest, np.nan))]
     available_count = len(live_cols)
     missing = [c for c in WEIGHTS if WEIGHTS[c] > 0 and c not in live_cols]
-    print(f"[score] {available_count}/8 features live at "
+    print(f"[score] {available_count} features live at "
           f"{latest.date() if latest is not None else 'n/a'}"
           f"  (missing: {missing or '-'})")
 
-    # Synthetic ONLY under the all-fail extreme case (W_valid == 0).
+    # All-fail extreme case: prefer REAL cached history over synthetic.
     if latest is None or available_count == 0:
-        synth = _synthetic_scores()
-        return synth, {
-            "source": "synthetic",
-            "available_count": 0,
-            "features": {**fmeta, **fmeta_feat},
-            "note": "All live APIs unavailable; showing deterministic synthetic series. Check network / FRED_API_KEY.",
-        }
+        hit = _cached_scores(tail_boost)
+        if hit is not None:
+            return hit
+        return _synthetic_result()
 
     meta_features = {**fmeta, **fmeta_feat}
     _save_cache(raw, feat, score, {
@@ -1291,20 +1347,33 @@ def _stress_flag(vix: pd.Series, spx: pd.Series, baa: pd.Series,
 
 def stability_filter(score: pd.Series, vix: pd.Series = None,
                      spx: pd.Series = None, baa: pd.Series = None) -> pd.Series:
-    """Stability layer (principle 1): steady EMA + hard daily-change clamp.
+    """K-line style two-timescale stability layer.
 
-    The published daily score cannot move more than ``DAILY_CLAMP`` points on a
-    normal day; under a genuine stress regime that limit is relaxed to
-    ``STRESS_CLAMP`` so the index can still react at a true crash onset. This is
-    what stops the "daily swings too large" problem — the clamp is applied
-    AFTER the steady EMA, day by day, on the realized series (no look-ahead).
+    Decompose the (monthly -> daily up-sampled) raw score into:
+
+      trend = slow EMA (TREND_SPAN)        -> mid/long-term macro wave
+      fast  = fast EMA (OSC_SPAN)          -> short-term information
+      osc   = clip((fast - trend) * OSC_GAIN, ±OSC_MAX)
+              -> a SMALL, bounded short-term oscillation (the "K-line wiggle")
+      x     = trend + osc
+
+    then run a stress-aware daily clamp on x: |Δ| <= DAILY_CLAMP on normal
+    days, relaxed to STRESS_CLAMP when a genuine stress regime fires (VIX
+    spike / 21-day crash drop / credit blowout), so real risk events still
+    break out quickly instead of being smoothed away.
+
+    Result: the index keeps its multi-year cycle amplitude (not over-smoothed),
+    shows only minor day-to-day movement (no violent whipsaw), yet reacts
+    decisively at true crash onsets and capitulation bottoms. Every step is
+    causal — no look-ahead.
     """
     if score is None or len(score) == 0:
         return score
     idx = score.index
-    # 1) steady EMA (smooth the monthly->daily step and any month-end revision)
-    ema = score.ewm(span=EMA_SPAN, adjust=False).mean()
-    vals = ema.to_numpy(dtype=float)
+    trend = score.ewm(span=TREND_SPAN, adjust=False).mean()
+    fast = score.ewm(span=OSC_SPAN, adjust=False).mean()
+    osc = ((fast - trend) * OSC_GAIN).clip(-OSC_MAX, OSC_MAX)
+    vals = (trend + osc).to_numpy(dtype=float)
     flag = _stress_flag(vix, spx, baa, idx).to_numpy(dtype=float)
 
     out = np.empty_like(vals)
@@ -1334,9 +1403,10 @@ def get_daily_scores(refresh: bool = False,
     The composite is computed MONTHLY (the percentile normalization needs a
     long trailing window). We up-sample it onto a daily calendar — forward
     filling the most recent month-end reading to every day — then run it through
-    the STABILITY layer: a steady EMA (span EMA_SPAN ≈ "70% current + 30% 20d
-    average") followed by a hard daily-change clamp (<= DAILY_CLAMP pts unless
-    genuinely stressed). The result is a calm macro wave that cannot whipsaw.
+    the K-line style stability layer: a slow-EMA trend + a small bounded
+    oscillation + a stress-aware daily clamp (<= DAILY_CLAMP pts unless
+    genuinely stressed). The result is a calm macro wave with a gentle
+    short-term wiggle that cannot whipsaw.
 
     Returns an empty Series if no monthly scores are available.
     """
@@ -1494,6 +1564,81 @@ def historical_benchmarks(score_series: pd.Series) -> dict:
             idx = seg.idxmax()
             out[name] = {"date": idx.strftime("%Y-%m"), "score": float(seg.max())}
     return out
+
+
+def opportunity_benchmarks(score_series: pd.Series) -> dict:
+    """Mirror of historical_benchmarks but for the great ACCUMULATION windows —
+    the local TROUGHS of the index inside each historical fear climax. These are
+    the moments (2002, 2009, 2020, late-2022) when forward 12–24m returns were
+    historically the strongest — the 'big buying opportunity' guidance.
+
+    Returns {episode: {"date":..., "score":...}} using the min reading inside
+    each window (data-driven, no hard-coded level).
+    """
+    out = {}
+    episodes = {
+        "dotcom_trough_2002": ("2002-07-01", "2003-05-31"),
+        "gfc_trough_2009": ("2008-11-01", "2009-05-31"),
+        "covid_trough_2020": ("2020-03-01", "2020-05-31"),
+        "bear_trough_2022": ("2022-09-01", "2022-12-31"),
+    }
+    s = score_series.dropna()
+    for name, (a, b) in episodes.items():
+        seg = s.loc[(s.index >= pd.Timestamp(a)) & (s.index <= pd.Timestamp(b))]
+        if not seg.empty:
+            idx = seg.idxmin()
+            out[name] = {"date": idx.strftime("%Y-%m"), "score": float(seg.min())}
+    return out
+
+
+# --- Event detection thresholds --------------------------------------------
+RISK_EVENT_LEVEL = 75.0    # local peak >= this -> a speculative-risk climax
+OPP_EVENT_LEVEL = 35.0     # local trough <= this -> an accumulation opportunity
+EVENT_WIN = 45             # half-window (days) for the local-peak/trough test
+EVENT_MIN_GAP = 150        # merge triggers closer than this into one event
+
+
+def detect_events(score: pd.Series) -> dict:
+    """Data-driven event flags on the (smoothed) score series.
+
+    Returns {"risk": [(Timestamp, score), ...],
+             "opportunity": [(Timestamp, score), ...]} where:
+      * risk        = local maxima >= RISK_EVENT_LEVEL (risk climaxes to trim),
+      * opportunity = local minima <= OPP_EVENT_LEVEL (fear climaxes to buy).
+
+    The neighbourhood test uses the full window (past AND future) because these
+    markers annotate HISTORY on the chart — they are context for the viewer,
+    not a live trading signal. Triggers closer than EVENT_MIN_GAP days are
+    merged so a single episode renders as one marker.
+    """
+    res = {"risk": [], "opportunity": []}
+    s = score.dropna()
+    if len(s) < 2 * EVENT_WIN + 5:
+        return res
+    vals = s.to_numpy(dtype=float)
+    idx = s.index
+    last_risk = None
+    last_opp = None
+    for i in range(len(vals)):
+        v = vals[i]
+        if np.isnan(v):
+            continue
+        lo = max(0, i - EVENT_WIN)
+        hi = min(len(vals), i + EVENT_WIN + 1)
+        seg = vals[lo:hi]
+        seg = seg[~np.isnan(seg)]
+        if seg.size == 0:
+            continue
+        d = idx[i]
+        if v >= RISK_EVENT_LEVEL and v >= np.nanmax(seg):
+            if last_risk is None or (d - last_risk).days > EVENT_MIN_GAP:
+                res["risk"].append((d, float(v)))
+                last_risk = d
+        if v <= OPP_EVENT_LEVEL and v <= np.nanmin(seg):
+            if last_opp is None or (d - last_opp).days > EVENT_MIN_GAP:
+                res["opportunity"].append((d, float(v)))
+                last_opp = d
+    return res
 
 
 def get_price_series(ticker: str, start: str = LIVE_START,

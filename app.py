@@ -343,6 +343,73 @@ def drivers_panel(state: dict):
     """, unsafe_allow_html=True)
 
 
+def guidance_panel(state: dict, daily: pd.Series):
+    """Actionable guidance: current zone -> posture, anchored to the detected
+    historical risk climaxes and accumulation windows (the 'what do I do now'
+    panel, incl. the late-2022-style deep-fear buying opportunity)."""
+    score = state.get("score", np.nan)
+    if pd.isna(score):
+        return
+    if score < 35:
+        posture, color, note = (
+            "ACCUMULATE AGGRESSIVELY · 2.0x DCA", "#1a9850",
+            "Deep-fear zone — historically the STRONGEST forward 12–24m return "
+            "window (2002-09, 2009-03, 2020-03, 2022-10).")
+    elif score < 40:
+        posture, color, note = (
+            "ACCUMULATE · 2.0x DCA", "#1a9850",
+            "Cheap / fear zone — risk is below median; keep buying the dip.")
+    elif score < 60:
+        posture, color, note = (
+            "STEADY ACCUMULATION · 1.5x DCA", "#2166ac",
+            "Balanced zone — no speculative excess; stay on plan.")
+    elif score < 75:
+        posture, color, note = (
+            "BASE PACE · 1.0x DCA", "#f4a01c",
+            "Valuation elevated — no new aggression, no panic either.")
+    elif score < 90:
+        posture, color, note = (
+            "TRIM / RAISE CASH · 0.5x DCA", "#e4572e",
+            "Bubble-risk zone — risk is accumulating; scale down exposure.")
+    else:
+        posture, color, note = (
+            "DE-RISK · 0x DCA + cash sleeve", "#c1121f",
+            "Extreme-bubble zone — prioritise capital preservation.")
+
+    # Last detected risk climax + accumulation window from the daily series.
+    last_risk = last_opp = None
+    try:
+        ev = pipe.detect_events(daily) if daily is not None else {"risk": [], "opportunity": []}
+        if ev.get("risk"):
+            d, v = ev["risk"][-1]
+            last_risk = f"{pd.Timestamp(d).strftime('%Y-%m')} · score {v:.0f}"
+        if ev.get("opportunity"):
+            d, v = ev["opportunity"][-1]
+            last_opp = f"{pd.Timestamp(d).strftime('%Y-%m')} · score {v:.0f}"
+    except Exception:
+        pass
+
+    st.markdown(f"""
+    <div class="status-card" style="margin-top:4px">
+      <div class="status-head">🧭 Current Guidance 当前操作指引</div>
+      <div style="font-size:20px;font-weight:800;color:{color};
+                  margin:6px 0 4px">{posture}</div>
+      <div class="status-note">{note}</div>
+      <table style="width:100%;font-size:13px;color:#0f172a;margin-top:8px">
+        <tr><td style="padding:3px 10px">Last risk climax 最近风险事件</td>
+            <td style="padding:3px 10px;text-align:right">{last_risk or "—"}</td></tr>
+        <tr><td style="padding:3px 10px">Last buying window 最近买入机会</td>
+            <td style="padding:3px 10px;text-align:right">{last_opp or "—"}</td></tr>
+      </table>
+      <div class="status-note" style="margin-top:6px">When the index falls into
+      the deep-fear zone (≤35) it has historically marked the best accumulation
+      windows — e.g. the <b>late-2022 bear bottom</b>. When it pushes above 75 it
+      has preceded every major drawdown. This is risk-accumulation guidance,
+      not a crash prediction.</div>
+    </div>
+    """, unsafe_allow_html=True)
+
+
 def history_fig(scores: pd.Series, spx, ndx, log_scale: bool = True,
                 view: str = "all") -> go.Figure:
     if view == "3y":
@@ -416,6 +483,32 @@ def history_fig(scores: pd.Series, spx, ndx, log_scale: bool = True,
                       annotation_text="Bubble Risk > 75",
                       annotation_position="top left", row=2, col=1)
 
+        # --- Event markers: risk climaxes (red ▼) + accumulation troughs (green ▲)
+        #     Data-driven from the plotted series — highlights each risk episode
+        #     and the deep-fear buying windows (e.g. the late-2022 bottom).
+        try:
+            events = pipe.detect_events(sc)
+        except Exception:
+            events = {"risk": [], "opportunity": []}
+        risk_pts = events.get("risk", [])
+        opp_pts = events.get("opportunity", [])
+        if risk_pts:
+            fig.add_trace(go.Scatter(
+                x=[d for d, _ in risk_pts], y=[v for _, v in risk_pts],
+                mode="markers", name="Risk event (trim)",
+                marker={"color": "#c1121f", "size": 9, "symbol": "triangle-down",
+                        "line": {"color": "white", "width": 1}},
+                hovertemplate="Risk climax %{x|%Y-%m} · score %{y:.0f}<extra></extra>"),
+                row=2, col=1)
+        if opp_pts:
+            fig.add_trace(go.Scatter(
+                x=[d for d, _ in opp_pts], y=[v for _, v in opp_pts],
+                mode="markers", name="Buying opportunity",
+                marker={"color": "#1a9850", "size": 9, "symbol": "triangle-up",
+                        "line": {"color": "white", "width": 1}},
+                hovertemplate="Accumulation zone %{x|%Y-%m} · score %{y:.0f}<extra></extra>"),
+                row=2, col=1)
+
     fig.update_layout(height=660, hovermode="x unified", showlegend=True,
                       margin={"t": 50, "b": 30, "l": 62, "r": 62},
                       legend=dict(orientation="h", y=1.05, x=0),
@@ -454,8 +547,9 @@ def backtest_panel(scores: pd.Series, params: dict):
 def historical_comparison(scores: pd.Series, state: dict):
     """Overlay the live index history with the canonical bubble episodes and a
     'Compared with historical bubbles' summary table."""
-    st.subheader("🕰️ Compared with Historical Bubbles")
+    st.subheader("🕰️ Compared with Historical Bubbles & Buying Windows")
     bm = pipe.historical_benchmarks(scores)
+    opp = pipe.opportunity_benchmarks(scores)
     today = state.get("score", np.nan)
     hist_pct = state.get("hist_pct", np.nan)
 
@@ -468,27 +562,39 @@ def historical_comparison(scores: pd.Series, state: dict):
         st.markdown(f"<div class='status-note' style='margin-bottom:8px'>{vs}</div>",
                     unsafe_allow_html=True)
 
-    # table: episode | date | score
-    rows = "".join(
-        f'<tr><td style="padding:4px 10px">{label}</td>'
+    # table: episode | date | score  (risk climaxes AND accumulation troughs)
+    risk_rows = "".join(
+        f'<tr><td style="padding:4px 10px">🔴 {label}</td>'
         f'<td style="padding:4px 10px;text-align:right">{d["date"]}</td>'
-        f'<td style="padding:4px 10px;text-align:right;font-weight:700">{d["score"]:.0f}</td></tr>'
+        f'<td style="padding:4px 10px;text-align:right;font-weight:700;color:#c1121f">{d["score"]:.0f}</td></tr>'
         for label, d in [("Dot-com 2000", bm.get("dotcom_2000", {})),
                          ("GFC 2007", bm.get("gfc_2007", {})),
                          ("COVID pre-2020", bm.get("covid_pre", {})),
-                         ("2021 liquidity", bm.get("bubble_2021", {})),
-                         ("Current", {"date": pd.Timestamp(state.get("as_of")).strftime("%Y-%m")
-                                      if state.get("as_of") else "—",
-                                      "score": today})]
+                         ("2021 liquidity", bm.get("bubble_2021", {}))]
         if d)
+    opp_rows = "".join(
+        f'<tr><td style="padding:4px 10px">🟢 {label}</td>'
+        f'<td style="padding:4px 10px;text-align:right">{d["date"]}</td>'
+        f'<td style="padding:4px 10px;text-align:right;font-weight:700;color:#1a9850">{d["score"]:.0f}</td></tr>'
+        for label, d in [("Dot-com trough 2002", opp.get("dotcom_trough_2002", {})),
+                         ("GFC trough 2009", opp.get("gfc_trough_2009", {})),
+                         ("COVID trough 2020", opp.get("covid_trough_2020", {})),
+                         ("2022 bear trough (big buy)", opp.get("bear_trough_2022", {}))]
+        if d)
+    cur_row = (
+        f'<tr><td style="padding:4px 10px">📍 Current</td>'
+        f'<td style="padding:4px 10px;text-align:right">'
+        f'{pd.Timestamp(state.get("as_of")).strftime("%Y-%m") if state.get("as_of") else "—"}</td>'
+        f'<td style="padding:4px 10px;text-align:right;font-weight:700">{today:.0f}</td></tr>'
+        if pd.notna(today) else "")
     st.markdown(f"""
     <div class="status-card" style="margin-bottom:10px">
-      <div class="status-head">Index at canonical episodes</div>
+      <div class="status-head">Index at canonical episodes — risk climaxes 🔴 vs accumulation windows 🟢</div>
       <table style="width:100%;font-size:13px;color:#0f172a">
         <tr><th style="text-align:left;padding:2px 10px">Episode</th>
         <th style="text-align:right;padding:2px 10px">Date</th>
         <th style="text-align:right;padding:2px 10px">Score</th></tr>
-        {rows}
+        {risk_rows}{opp_rows}{cur_row}
       </table>
     </div>
     """, unsafe_allow_html=True)
@@ -504,9 +610,14 @@ def historical_comparison(scores: pd.Series, state: dict):
             fig.add_hline(y=d["score"], line_dash="dot", line_color="#94a3b8",
                           annotation_text=f"{label} ≈ {d['score']:.0f}",
                           annotation_position="right")
+        for label, d in opp.items():
+            fig.add_hline(y=d["score"], line_dash="dot", line_color="#1a9850",
+                          annotation_text=f"{label} ≈ {d['score']:.0f}",
+                          annotation_position="right")
         # V2 risk bands as background
         fig.add_hrect(y0=75, y1=100, fillcolor="rgba(239,68,68,0.08)", line_width=0)
         fig.add_hrect(y0=60, y1=75, fillcolor="rgba(245,158,11,0.07)", line_width=0)
+        fig.add_hrect(y0=0, y1=40, fillcolor="rgba(26,152,80,0.08)", line_width=0)
     fig.update_layout(height=380, hovermode="x unified",
                       yaxis_title="Bubble Index", yaxis_range=[0, 100],
                       margin={"t": 20, "b": 30, "l": 55, "r": 55},
@@ -520,8 +631,10 @@ def main():
     st.caption("Professional 5-module macro framework · Valuation 30% · Sentiment 20% "
                "· Leverage 20% · Structure 15% · Macro 15% · every indicator is a "
                "trailing-historical PERCENTILE (0-100) · weighted blend → historical "
-               "affine calibration (dot-com peak ≈ 97, GFC trough ≈ 12) → stability "
-               "filter (EMA + ≤1.5 pt/day clamp) · free/open data (FRED, yfinance/Stooq)")
+               "affine calibration (dot-com peak ≈ 97, GFC trough ≈ 12) → K-line "
+               "stability filter (slow-EMA trend + small bounded oscillation + "
+               "stress-aware daily clamp) · cache-first, crash-proof loading · "
+               "free/open data (FRED, yfinance/Stooq)")
 
     # ---- Sidebar: refresh controls ---------------------------------------
     refresh = st.sidebar.checkbox("Force refresh live data", value=False)
@@ -552,10 +665,16 @@ def main():
                   high_mult=high_mult, derisk_threshold=derisk_threshold,
                   derisk_cash=derisk_cash, cash_yield=cash_yield)
 
-    # ---- Single network pass ---------------------------------------------
-    with st.spinner("正在并发拉取最新宏观数据中，预计耗时 3 秒..."):
-        scores, meta = load_scores(refresh=refresh, tail_boost=tail_boost)
-        state = pipe.get_latest_state(refresh=False, tail_boost=tail_boost)
+    # ---- Single data pass (cache-first; the pipeline never raises, but keep
+    #      a last-resort guard so the page can never hard-crash) -------------
+    with st.spinner("加载气泡指数中（本地缓存优先，必要时增量更新）..."):
+        try:
+            scores, meta = load_scores(refresh=refresh, tail_boost=tail_boost)
+            state = pipe.get_latest_state(refresh=False, tail_boost=tail_boost)
+        except Exception as exc:
+            st.error("数据加载遇到问题（已触发保护，页面未中断）。请稍后重试或点击 "
+                     f"“Force refresh live data”。详情：{exc!r}")
+            st.stop()
 
     src = meta.get("source", "unknown")
     src_label = {"live": "Real-time", "cache": "Cached", "synthetic": "Synthetic"}.get(src, src)
@@ -574,6 +693,14 @@ def main():
         st.markdown('</div>', unsafe_allow_html=True)
     with c2:
         status_card(state, meta, src_label, tail_boost)
+
+    # ---- Actionable guidance (zone -> posture, anchored to past events) ---
+    try:
+        _daily_for_guidance = load_daily_scores(refresh=False,
+                                                tail_boost=tail_boost)
+    except Exception:
+        _daily_for_guidance = pd.Series(dtype=float)
+    guidance_panel(state, _daily_for_guidance)
 
     # ---- Module radar + module cards -------------------------------------
     st.subheader("Five Risk Modules (current)")
@@ -597,8 +724,11 @@ def main():
         horizontal=True,
         help="All = full 2000-present macro cycle; 3-Year = zoomed 2023-07-31 → "
              "today window with a fixed 0-100 score axis.")
-    daily = load_daily_scores(refresh=False, tail_boost=tail_boost)
-    spx, ndx = load_prices()
+    daily = _daily_for_guidance
+    try:
+        spx, ndx = load_prices()
+    except Exception:
+        spx, ndx = None, None
     st.plotly_chart(history_fig(daily if not daily.empty else scores, spx, ndx,
                                 log_scale=log_scale, view=view),
                     use_container_width=True)
