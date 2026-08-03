@@ -425,30 +425,40 @@ def run_backtest(scores: Optional[pd.Series], spy_df: Optional[pd.Series],
     ]
     metrics_df = pd.DataFrame(rows)
 
-    # ---- Chart: equity curves (row 1, dual axis) + strategy cash reserve (row 2)
-    # Row 2 lets you SEE the recycle-mode stockpile/drawdown cycle; in multiplier
-    # mode the cash balance is essentially zero (all dollars go to SPY each month).
-    fig = make_subplots(
-        rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.14,
-        row_heights=[0.68, 0.32],
-        subplot_titles=("Portfolio Value (Strategy vs Benchmark)",
-                        "Strategy Cash Reserve ($)"),
-        specs=[[{"secondary_y": True}], [{}]],
-    )
+    # ---- Chart ----
+    # CRITICAL (fixed): an EMPTY subplot makes Plotly default that x-axis to
+    # ~1960, and with shared_xaxes the whole chart gets pulled to 1960 —
+    # a 40-year blank on the left. Only build the cash-reserve row when there
+    # IS a non-trivial reserve (recycle mode); multiplier mode gets a single
+    # row (taller, no empty panel).
+    show_cash = (strat_cash is not None
+                 and strat_cash.abs().sum() > 0)
+    if show_cash:
+        fig = make_subplots(
+            rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.14,
+            row_heights=[0.68, 0.32],
+            subplot_titles=("Portfolio Value (Strategy vs Benchmark)",
+                            "Strategy Cash Reserve ($)"),
+            specs=[[{"secondary_y": True}], [{}]],
+        )
+        eq_row, cash_row = 1, 2
+    else:
+        fig = make_subplots(specs=[[{"secondary_y": True}]])
+        eq_row, cash_row = 1, None
     # NOTE: secondary_y is an add_trace() argument, NOT a go.Scatter property —
     # passing it inside go.Scatter(...) raises "Invalid property" in Plotly's
     # _process_kwargs (this is what crashed the backtest panel on Render).
     fig.add_trace(go.Scatter(x=bench.index, y=bench.values,
                              name="Benchmark (Buy & Hold DCA)",
                              line={"color": "#1f4e79", "width": 2}),
-                  row=1, col=1, secondary_y=False)
+                  row=eq_row, col=1, secondary_y=False)
     fig.add_trace(go.Scatter(x=strat.index, y=strat.values,
                              name="Bubble Risk-Adjusted DCA",
                              line={"color": "#c1121f", "width": 2.5}),
-                  row=1, col=1, secondary_y=False)
+                  row=eq_row, col=1, secondary_y=False)
 
-    # Cash reserve (row 2): filled area, dashed zero line for reference.
-    if strat_cash is not None and strat_cash.abs().sum() > 0:
+    # Cash reserve (row 2, recycle mode only): filled area + zero line.
+    if show_cash:
         fig.add_trace(go.Scatter(x=strat_cash.index, y=strat_cash.values,
                                  name="Strategy cash reserve",
                                  line={"color": "#7c3aed", "width": 1.5,
@@ -456,35 +466,36 @@ def run_backtest(scores: Optional[pd.Series], spy_df: Optional[pd.Series],
                                  fill="tozeroy",
                                  fillcolor="rgba(124,58,237,0.10)",
                                  hovertemplate="Reserve: $%{y:,.0f}<extra></extra>"),
-                      row=2, col=1)
+                      row=cash_row, col=1)
         fig.add_hline(y=0, line_dash="solid", line_color="#e2e8f0",
-                      row=2, col=1)
-        fig.update_yaxes(title_text="Reserve ($)", row=2, col=1,
+                      row=cash_row, col=1)
+        fig.update_yaxes(title_text="Reserve ($)", row=cash_row, col=1,
                          tickformat="$,.0f")
 
-    # V2 risk-band horizontal shading + labels INSIDE the plot (right edge,
-    # anchored to the score axis) — outside labels got clipped/overlapped.
+    # V2 risk-band horizontal shading + labels anchored to the score axis.
+    # IMPORTANT: do NOT pass row/col here — Plotly overrides xref to DATA
+    # coords ('x') when row/col is given, turning x=0.985 into a 1970
+    # millisecond timestamp and dragging the whole x-axis to 1960-1970
+    # (the blank-left bug). With xref='paper' the rect spans the full plot
+    # width and the label sits at the right edge of the plot area.
     band_tints = ["#e8f0fe", "#e6f4ea", "#fef6e0", "#fde7d3", "#fbe2e2"]
     for i, (lo, hi, _color, label) in enumerate(pipe.RISK_BANDS):
         fig.add_shape(type="rect", xref="paper", x0=0, x1=1,
                       yref="y2", y0=lo, y1=hi,
                       fillcolor=band_tints[i], opacity=0.30, line_width=0,
-                      layer="below", row=1, col=1)
-        # label slightly inset (paper-x 0.985), tiny font, no border — won't
-        # collide with the score line or the secondary-y axis.
+                      layer="below")
         fig.add_annotation(xref="paper", x=0.985, yref="y2", y=(lo + hi) / 2,
                            text=label, showarrow=False, xanchor="right",
                            yanchor="middle", xshift=-4,
                            font={"size": 8, "color": "#6b7280"},
-                           bgcolor="rgba(255,255,255,0.0)",
-                           row=1, col=1)
+                           bgcolor="rgba(255,255,255,0.0)")
 
     # Bubble Risk Score context line (right axis) — explains the de-risk calls.
     fig.add_trace(go.Scatter(x=sc.index, y=sc.values,
                              name="Bubble Risk Score",
                              line={"color": "#888888", "width": 1, "dash": "dot"},
                              opacity=0.65),
-                  row=1, col=1, secondary_y=True)
+                  row=eq_row, col=1, secondary_y=True)
 
     if derisk_dates:
         dm = pd.Series([strat.get(d, np.nan) for d in derisk_dates],
@@ -495,7 +506,7 @@ def run_backtest(scores: Optional[pd.Series], spy_df: Optional[pd.Series],
                                      marker={"color": "#e4572e", "size": 7,
                                              "symbol": "triangle-down"},
                                      hovertemplate="De-risk @ %{x|%Y-%m}<extra></extra>"),
-                          row=1, col=1, secondary_y=False)
+                          row=eq_row, col=1, secondary_y=False)
 
     fig.update_layout(height=620, hovermode="x unified",
                       margin={"t": 55, "b": 50, "l": 80, "r": 80},
@@ -508,14 +519,15 @@ def run_backtest(scores: Optional[pd.Series], spy_df: Optional[pd.Series],
     # Shorter, non-overlapping axis titles + side margins so labels breathe.
     # Explicit autorange so the chart auto-stretches to the selected time
     # window (the user asked for auto-rescale after changing the range).
-    fig.update_yaxes(title_text="USD", row=1, col=1, secondary_y=False,
+    fig.update_yaxes(title_text="USD", row=eq_row, col=1, secondary_y=False,
                      title_font=dict(size=11), autorange=True)
-    fig.update_yaxes(title_text="Score", row=1, col=1, secondary_y=True,
+    fig.update_yaxes(title_text="Score", row=eq_row, col=1, secondary_y=True,
                      title_font=dict(size=11), range=[0, 100])
-    fig.update_yaxes(autorange=True, row=2, col=1)
-    fig.update_xaxes(title_text="", row=1, col=1, autorange=True)
-    fig.update_xaxes(title_text="Date", row=2, col=1, autorange=True,
-                     title_font=dict(size=11))
+    if cash_row is not None:
+        fig.update_yaxes(autorange=True, row=cash_row, col=1)
+        fig.update_xaxes(title_text="Date", row=cash_row, col=1, autorange=True,
+                         title_font=dict(size=11))
+    fig.update_xaxes(title_text="", row=eq_row, col=1, autorange=True)
 
     return metrics_df, fig
 
