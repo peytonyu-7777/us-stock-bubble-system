@@ -1042,10 +1042,7 @@ def main():
         parts = []
         dl = daily_for_chart.dropna()
         if not dl.empty:
-            parts.append(f"指数日线 截至 <b>{dl.index[-1].strftime('%Y-%m-%d')}</b>")
-        sc_asof = cinfo.get("score_as_of")
-        if sc_asof is not None:
-            parts.append(f"指数月频读数 <b>{pd.Timestamp(sc_asof).strftime('%Y-%m')}</b>")
+            parts.append(f"Bubble Index 截至 <b>{dl.index[-1].strftime('%Y-%m-%d')}</b>（日度信号）")
         px = spx.dropna() if spx is not None else None
         if px is not None and not px.empty:
             parts.append(f"S&P 500 截至 <b>{px.index[-1].strftime('%Y-%m-%d')}</b>")
@@ -1057,10 +1054,7 @@ def main():
             age = cinfo.get("age_hours")
             age_txt = (f"{age:.1f} 小时前更新" if age is not None else "")
             parts.append(f"缓存 {pd.Timestamp(wa).strftime('%m-%d %H:%M')} ({age_txt})")
-        st.caption(f"🔍 数据时间线: {' · '.join(parts)}。"
-                   "指数为月频宏观信号（估值/保证金等月度数据），日线仅作呈现，"
-                   "水平读数随月度数据更新；价格与指数日线均延伸至最新交易日。",
-                   unsafe_allow_html=True)
+        st.caption(f"🔍 数据时间线: {' · '.join(parts)}", unsafe_allow_html=True)
     except Exception:
         pass
 
