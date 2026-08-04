@@ -949,6 +949,23 @@ def main():
         st.markdown('<div class="gauge-wrap">', unsafe_allow_html=True)
         st.plotly_chart(gauge_fig(state["score"]), use_container_width=True)
         st.markdown('</div>', unsafe_allow_html=True)
+        # Last-updated stamp right under the gauge (仪表盘下方)
+        try:
+            cinfo = pipe.cache_info()
+            wa = cinfo.get("written_at")
+            if wa is not None:
+                t = pd.Timestamp(wa)
+                age = cinfo.get("age_hours")
+                age_txt = (f"（{age:.1f} 小时前自动更新）" if age is not None else "")
+                st.markdown(
+                    f"<div style='font-size:12px;color:#64748b;text-align:center;"
+                    f"margin-top:-6px'>🕐 最近更新: {t.strftime('%Y-%m-%d %H:%M')} "
+                    f"{age_txt}<br>"
+                    f"<span style='font-size:11px;color:#94a3b8'>数据自动增量刷新 "
+                    f"(缓存超 6 小时即更新)</span></div>",
+                    unsafe_allow_html=True)
+        except Exception:
+            pass
     with c2:
         status_card(state, meta, src_label, tail_boost)
 
@@ -1023,9 +1040,12 @@ def main():
     try:
         cinfo = pipe.cache_info()
         parts = []
+        dl = daily_for_chart.dropna()
+        if not dl.empty:
+            parts.append(f"指数日线 截至 <b>{dl.index[-1].strftime('%Y-%m-%d')}</b>")
         sc_asof = cinfo.get("score_as_of")
         if sc_asof is not None:
-            parts.append(f"指数截至 <b>{pd.Timestamp(sc_asof).strftime('%Y-%m-%d')}</b>")
+            parts.append(f"指数月频读数 <b>{pd.Timestamp(sc_asof).strftime('%Y-%m')}</b>")
         px = spx.dropna() if spx is not None else None
         if px is not None and not px.empty:
             parts.append(f"S&P 500 截至 <b>{px.index[-1].strftime('%Y-%m-%d')}</b>")
@@ -1035,9 +1055,12 @@ def main():
         wa = cinfo.get("written_at")
         if wa is not None:
             age = cinfo.get("age_hours")
-            age_txt = (f"{age:.0f} 小时前更新" if age is not None else "")
+            age_txt = (f"{age:.1f} 小时前更新" if age is not None else "")
             parts.append(f"缓存 {pd.Timestamp(wa).strftime('%m-%d %H:%M')} ({age_txt})")
-        st.caption(f"🔍 数据时间线: {' · '.join(parts)}", unsafe_allow_html=True)
+        st.caption(f"🔍 数据时间线: {' · '.join(parts)}。"
+                   "指数为月频宏观信号（估值/保证金等月度数据），日线仅作呈现，"
+                   "水平读数随月度数据更新；价格与指数日线均延伸至最新交易日。",
+                   unsafe_allow_html=True)
     except Exception:
         pass
 
