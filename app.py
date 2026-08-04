@@ -148,8 +148,16 @@ def load_daily_scores(refresh: bool, tail_boost: bool):
 
 @st.cache_data(ttl=3600)
 def load_prices():
-    spx = pipe.get_price_series("^GSPC", start=pipe.LIVE_START)
-    ndx = pipe.get_price_series("^IXIC", start=pipe.LIVE_START)
+    """DAILY price series for the combined chart (cache-first). The daily
+    cache is refreshed incrementally by the pipeline's auto-refresh, so the
+    S&P 500 / Nasdaq lines reach the latest trading day — not the last
+    month-end."""
+    spx = pipe.get_daily_price("^GSPC")
+    ndx = pipe.get_daily_price("^IXIC")
+    if spx is None:
+        spx = pipe.get_price_series("^GSPC", start=pipe.LIVE_START)
+    if ndx is None:
+        ndx = pipe.get_price_series("^IXIC", start=pipe.LIVE_START)
     return spx, ndx
 
 
@@ -786,7 +794,14 @@ def main():
                "cache-first, crash-proof loading · free/open data (FRED, yfinance/Stooq)")
 
     # ---- Sidebar: refresh controls ---------------------------------------
-    refresh = st.sidebar.checkbox("Force refresh live data", value=False)
+    # NOTE: the pipeline AUTO-refreshes whenever the on-disk cache is older
+    # than CACHE_MAX_AGE_HOURS (incremental, bounded, crash-proof) — so data
+    # reaches the latest trading day without user action. This checkbox forces
+    # a refresh even when the cache is fresh.
+    refresh = st.sidebar.checkbox(
+        "Force refresh live data", value=False,
+        help="默认自动：缓存超过 6 小时会在打开页面时自动增量更新到最新交易日。"
+             "勾选此项可绕过缓存强制立即刷新。")
     if st.sidebar.button("Re-run scoring"):
         st.cache_data.clear()
         refresh = True
@@ -1003,6 +1018,28 @@ def main():
     st.plotly_chart(history_fig(daily_for_chart if not daily_for_chart.empty else scores,
                                 spx, ndx, log_scale=False, view="all"),
                     use_container_width=True)
+
+    # ---- Data freshness footer (proves the charts reach the latest day) ----
+    try:
+        cinfo = pipe.cache_info()
+        parts = []
+        sc_asof = cinfo.get("score_as_of")
+        if sc_asof is not None:
+            parts.append(f"指数截至 <b>{pd.Timestamp(sc_asof).strftime('%Y-%m-%d')}</b>")
+        px = spx.dropna() if spx is not None else None
+        if px is not None and not px.empty:
+            parts.append(f"S&P 500 截至 <b>{px.index[-1].strftime('%Y-%m-%d')}</b>")
+        nx = ndx.dropna() if ndx is not None else None
+        if nx is not None and not nx.empty:
+            parts.append(f"Nasdaq 截至 <b>{nx.index[-1].strftime('%Y-%m-%d')}</b>")
+        wa = cinfo.get("written_at")
+        if wa is not None:
+            age = cinfo.get("age_hours")
+            age_txt = (f"{age:.0f} 小时前更新" if age is not None else "")
+            parts.append(f"缓存 {pd.Timestamp(wa).strftime('%m-%d %H:%M')} ({age_txt})")
+        st.caption(f"🔍 数据时间线: {' · '.join(parts)}", unsafe_allow_html=True)
+    except Exception:
+        pass
 
     # ---- Strategy backtest (interactive) --------------------------------
     backtest_panel(scores, params, meta)

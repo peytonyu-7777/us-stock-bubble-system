@@ -146,6 +146,7 @@ FETCH_TIMEOUT = 8         # hard per-request timeout (seconds)
 # the refresh path — the default page load is cache-first and instant.
 FETCH_DEADLINE = 20       # total wall-clock deadline for the whole batch
 INCREMENTAL_DAYS = 30     # on refresh: only re-fetch the last ~30 days
+CACHE_MAX_AGE_HOURS = 6.0 # stale after this -> auto incremental refresh on load
 
 # ===========================================================================
 # V2 BUBBLE INDEX — 5-MODULE ARCHITECTURE
@@ -588,10 +589,11 @@ def _save_hf_cache(df: pd.DataFrame) -> None:
 
 
 def _get_hf_daily() -> dict:
-    """Return a dict of daily Series (keys: 'vix', 'spx') used for the first
-    smoothing layer, with an incremental parquet cache so refreshes only pull
-    the last ~30 days. Non-fatal: missing keys simply fall back to the monthly
-    path inside compute_features_from_raw.
+    """Return a dict of daily Series (keys: 'vix', 'spx', 'ndx') used for the
+    first smoothing layer AND for the daily price lines on the dashboard
+    chart, with an incremental parquet cache so refreshes only pull the last
+    ~30 days. Non-fatal: missing keys simply fall back to the monthly path
+    inside compute_features_from_raw.
 
     Network is bounded by FETCH_TIMEOUT + the global deadline; any failure
     returns whatever subset is available (possibly empty).
@@ -599,7 +601,7 @@ def _get_hf_daily() -> dict:
     cached = _load_hf_cache()
     df = cached if cached is not None else pd.DataFrame()
     out: dict = {}
-    for tag, ticker in (("vix", "^VIX"), ("spx", "^GSPC")):
+    for tag, ticker in (("vix", "^VIX"), ("spx", "^GSPC"), ("ndx", "^IXIC")):
         start = HISTORY_START
         if tag in df.columns and df[tag].notna().any():
             last = df[tag].dropna().index.max()
@@ -616,6 +618,32 @@ def _get_hf_daily() -> dict:
     if not df.empty:
         _save_hf_cache(df)
     return out
+
+
+def get_daily_price(ticker: str) -> Optional[pd.Series]:
+    """DAILY price series for the dashboard chart (S&P 500 / Nasdaq), served
+    from the incremental daily cache (hf_daily.parquet). Falls back to the
+    monthly raw cache when the daily series is unavailable. Never raises.
+    """
+    key = {"^GSPC": "spx", "SPX": "spx", "^IXIC": "ndx", "NDX": "ndx"}.get(
+        ticker, ticker)
+    try:
+        hf = _load_hf_cache()
+        if hf is not None and key in hf.columns:
+            s = hf[key].dropna()
+            if not s.empty:
+                return s
+    except Exception:
+        pass
+    # fall back to the monthly raw cache column
+    raw_key = {"spx": "spx", "ndx": "ixic"}.get(key)
+    if raw_key:
+        raw = _load_raw_cache()
+        if raw is not None and raw_key in raw.columns:
+            s = raw[raw_key].dropna()
+            if not s.empty:
+                return s
+    return None
 
 
 def _fetch_one(spec: Tuple[str, str], start: str,
@@ -1377,10 +1405,41 @@ def _save_cache(raw: pd.DataFrame, feat: pd.DataFrame, score: pd.Series,
         # would be silently misread as Z, producing garbage scores).
         meta = dict(meta)
         meta["feat_format"] = FEAT_FORMAT
+        meta["written_at"] = pd.Timestamp.now().isoformat()
         with open(META_PATH, "w") as f:
             json.dump(meta, f, default=str)
     except Exception:
         pass
+
+
+def cache_info() -> dict:
+    """When was the on-disk score cache last written, and how old is it now?
+    Used by the dashboard to decide an auto-refresh and to surface the data
+    date to the user. Never raises.
+    """
+    info = {"source": None, "written_at": None, "age_hours": None,
+            "score_as_of": None}
+    try:
+        if os.path.exists(META_PATH):
+            meta = json.load(open(META_PATH))
+            info["source"] = meta.get("source")
+            wa = meta.get("written_at")
+            if wa:
+                t = pd.Timestamp(wa)
+                info["written_at"] = t
+                info["age_hours"] = (pd.Timestamp.now() - t).total_seconds() / 3600.0
+    except Exception:
+        pass
+    try:
+        if os.path.exists(CACHE_PATH):
+            s = pd.read_parquet(CACHE_PATH).get("score")
+            if s is not None:
+                s = s.dropna()
+                if not s.empty:
+                    info["score_as_of"] = s.index[-1]
+    except Exception:
+        pass
+    return info
 
 
 # ---------------------------------------------------------------------------
@@ -1513,11 +1572,20 @@ def get_monthly_scores(refresh: bool = False,
 
     `meta['source']` is one of 'live', 'cache', 'synthetic'.
     """
-    # 1) Instant path: serve the baked/on-disk cache without touching network.
+    # 1) Instant path: serve the baked/on-disk cache without touching network —
+    #    BUT only when it is FRESH enough. If the cache is older than
+    #    CACHE_MAX_AGE_HOURS (or has no timestamp — e.g. a legacy build-time
+    #    cache), fall through to the live incremental refresh so the charts
+    #    and backtest always pull the latest trading day. The refresh is
+    #    crash-proof and falls back to this same cache on any failure.
     if not refresh:
         hit = _cached_scores(tail_boost)
         if hit is not None:
-            return hit
+            info = cache_info()
+            age = info.get("age_hours")
+            if age is not None and age < CACHE_MAX_AGE_HOURS:
+                return hit
+            # stale cache: proceed to the live incremental refresh below
 
     # 2) Live path — wrapped so a network/compute failure can NEVER crash the
     #    app (this whole block is what used to propagate the TimeoutError).
