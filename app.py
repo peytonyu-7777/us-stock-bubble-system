@@ -880,6 +880,27 @@ def main():
     elif src == "cache":
         st.info("ℹ️ Showing cached data (set refresh to pull live).")
 
+    # ---- Staleness guard: warn if the score's latest reading is old --------
+    # The 6h auto-refresh keeps data current when the network works. If the
+    # served score is still more than a week stale, surface it clearly so the
+    # user knows the guidance is not based on the latest tape.
+    try:
+        cinfo = pipe.cache_info()
+        sc_asof = cinfo.get("score_as_of")
+        age = cinfo.get("age_hours")
+        if sc_asof is not None:
+            stale_days = (pd.Timestamp.today() - pd.Timestamp(sc_asof)).days
+            if stale_days > 7:
+                st.warning(
+                    f"⚠️ 指数读数已 {stale_days} 天未更新（最新 {pd.Timestamp(sc_asof).strftime('%Y-%m-%d')}）。"
+                    "自动刷新可能因网络受限失败——请点击侧边栏「Re-run scoring」强制刷新，"
+                    "或检查「🔧 数据诊断」里的连通性探测。")
+        elif age is not None and age > 48:
+            st.warning("⚠️ 数据缓存超过 48 小时未写入——自动刷新可能失败，请点击侧边栏"
+                       "「Re-run scoring」或检查连通性。")
+    except Exception:
+        pass
+
     # ---- Data diagnostics (auto-open when in synthetic fallback) ----------
     # Turns the "刷新不出数据" black box into concrete answers: which upstream
     # endpoints are reachable from THIS container, whether FRED_API_KEY is

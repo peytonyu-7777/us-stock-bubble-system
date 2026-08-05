@@ -1719,14 +1719,25 @@ def get_daily_scores(refresh: bool = False,
     monthly = monthly.dropna()
     if monthly.empty:
         return monthly
-    end = pd.Timestamp.today().normalize()
-    daily_idx = pd.date_range(monthly.index.min(), end, freq="D")
-    daily = monthly.reindex(daily_idx, method="ffill")
 
     # load the daily vol-regime signals for the stress-aware clamp
     hf = _get_hf_daily()
     vix_d = hf.get("vix") if hf else None
     spx_d = hf.get("spx") if hf else None
+
+    # Cap the daily index at the LATEST market-data date (last daily price
+    # close), NOT at the calendar 'today' — otherwise the red index line pokes
+    # one or more calendar days past the price lines with a flat value (no new
+    # information). Fall back to today only if no daily prices are available.
+    end = pd.Timestamp.today().normalize()
+    for _s in (vix_d, spx_d):
+        if _s is not None and not _s.empty:
+            cand = _s.index[-1].normalize()
+            if cand < end:
+                end = cand
+    daily_idx = pd.date_range(monthly.index.min(), end, freq="D")
+    daily = monthly.reindex(daily_idx, method="ffill")
+
     # monthly BAA10Y for the credit-jump stress test
     baa = None
     if os.path.exists(CACHE_PATH):
