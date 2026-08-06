@@ -246,7 +246,12 @@ CALIB_Z_GAIN = 28.0
 # never an over-smoothed flat line.
 TREND_SPAN = 75              # slow EMA on the daily series (≈ one quarter)
 OSC_SPAN = 8                 # fast EMA -> short-term component
-OSC_GAIN = 0.45              # fraction of (fast - trend) kept as visible wiggle
+OSC_GAIN = 0.0               # DISABLED: the regime overlay (get_daily_scores)
+                             # already provides short-term variation. The OSC
+                             # term on top created a day-to-day sawtooth
+                             # instead of a recognisable regime trend. Set
+                             # back to 0.45 to restore the old K-line wiggle
+                             # (small visible OSC around the slow trend).
 OSC_MAX = 3.5                # hard cap on the short-term oscillation (points)
 # 0.6 pts/day: a 3-pt monthly step is absorbed over ~a week (calm stair-step
 # instead of a jump); was 1.2 which let the line drift ~6 pts/week.
@@ -1754,13 +1759,39 @@ def get_daily_scores(refresh: bool = False,
     # extension, robust-z'd, mapped to 0-100, and blend it into the anchor.
     # The headline score (gauge) stays on the validated monthly macro; this
     # overlay only affects the displayed daily series so the chart can react.
+    # Regime is itself smoothed (15d EMA before Φ) so it doesn't add raw
+    # day-to-day noise; a daily-change clamp (BLEND_DAILY_CLAMP) below
+    # guarantees the displayed line can't sawtooth regardless of inputs.
     regime = compute_daily_regime(hf) if hf is not None else None
     if regime is not None and not regime.empty:
         common = daily_anchor.index.intersection(regime.index)
         if not common.empty:
             blended = (DAILY_ANCHOR_WEIGHT * daily_anchor.loc[common]
                        + (1 - DAILY_ANCHOR_WEIGHT) * regime.loc[common])
-            daily_anchor.loc[common] = blended
+            # Hard daily-change clamp on the WHOLE daily index series (blended where
+    # common, pure stability_filter otherwise). Iterating over the full
+    # array -- not just the common slice -- catches transitions where the
+    # blend ends and the index falls back to the macro-only stability_filter
+    # value (otherwise those edges produce unsmoothed sawtooth jumps).
+    # Multi-week moves still accumulate because each day's clamped delta is
+    # at most BLEND_DAILY_CLAMP.
+    limit = BLEND_DAILY_CLAMP
+    arr = daily_anchor.to_numpy(dtype=float).copy()
+    prev_valid = np.nan
+    for i in range(len(arr)):
+        v = arr[i]
+        if np.isnan(v):
+            continue
+        if np.isnan(prev_valid):
+            prev_valid = v                # seed the first valid value
+            continue
+        d = v - prev_valid
+        if d > limit:
+            arr[i] = prev_valid + limit
+        elif d < -limit:
+            arr[i] = prev_valid - limit
+        prev_valid = arr[i]
+    daily_anchor[:] = arr
     return daily_anchor.dropna()
 
 
@@ -1771,21 +1802,31 @@ def get_daily_scores(refresh: bool = False,
 # SPX-correlated chart.
 DAILY_ANCHOR_WEIGHT = 0.70
 
+# Final hard clamp on |day-over-day Δ| of the blended displayed daily index.
+# Trend still accumulates over weeks/months (the clamp is cumulative-friendly:
+# a 0.5-pt daily move compounds to ~10pts over a month), but no single day
+# can produce a sawtooth spike. Tuned so a typical regime day-over-day move
+# (smoothed 15d) is allowed, but month-end anchor steps and any input glitch
+# are squashed.
+BLEND_DAILY_CLAMP = 1.2
+
 
 def compute_daily_regime(hf: dict = None) -> pd.Series:
     """Daily 'market regime' 0-100 score from pure price/vix inputs.
 
-    Three signals, each robust-z'd over a 252-day (≈1y) trailing window so
+    Three signals, each robust-z'd over a 252-day ( (1y) trailing window so
     the regime can swing with the tape while staying bounded:
       - SPX 20-day return (momentum / risk-on)
       - VIX level INVERTED (high VIX = fear = risk dropping)
       - SPX distance above its 200-day moving average (extension / froth)
-    Equal-weighted average z → Φ(z) → 0-100. Clip [1, 99]. Falls back to
-    an empty Series if no daily data; callers must handle that.
+    Equal-weighted average z -> short-EMA smoothed -> Φ(z) -> 0-100. The
+    short EMA (5d) is what prevents the regime from zigzagging day to day
+    when blended into the daily index. Clip [1, 99]. Falls back to an empty
+    Series if no daily data; callers must handle that.
 
     This is the daily overlay blended into the displayed daily index so the
     chart tracks market moves. It does NOT replace the validated monthly
-    composite — the headline gauge and the backtest keep using the macro
+    composite -- the headline gauge and the backtest keep using the macro
     signal. The blend lives only in get_daily_scores.
     """
     if hf is None:
@@ -1811,8 +1852,14 @@ def compute_daily_regime(hf: dict = None) -> pd.Series:
     combined = ((mom_z.reindex(common).fillna(0)
                 + vix_z.reindex(common).fillna(0)
                 + ext_z.reindex(common).fillna(0)) / 3.0)
+    # Short-EMA smoothing BEFORE Φ-mapping: kills the day-to-day jitter so the
+    # blended daily index has a recognisable regime trend (week-to-week) rather
+    # than a per-day sawtooth. 15d span (~7d half-life) gives the regime time
+    # to settle into its new level after each move while still reacting to
+    # multi-day trends within a session or two.
+    combined_sm = combined.ewm(span=15, min_periods=1).mean()
     # robust-z -> 0-100 via standard normal CDF
-    regime = (100.0 * _norm_cdf_arr(combined.to_numpy())).clip(1, 99)
+    regime = (100.0 * _norm_cdf_arr(combined_sm.to_numpy())).clip(1, 99)
     return pd.Series(regime, index=common)
 
 
