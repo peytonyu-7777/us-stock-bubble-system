@@ -1720,7 +1720,7 @@ def get_daily_scores(refresh: bool = False,
     if monthly.empty:
         return monthly
 
-    # load the daily vol-regime signals for the stress-aware clamp
+    # load the daily vol-regime signals for the stress-aware clamp + regime
     hf = _get_hf_daily()
     vix_d = hf.get("vix") if hf else None
     spx_d = hf.get("spx") if hf else None
@@ -1745,8 +1745,75 @@ def get_daily_scores(refresh: bool = False,
             baa = pd.read_parquet(CACHE_PATH)["baa10y"]
         except Exception:
             baa = None
-    daily = stability_filter(daily, vix=vix_d, spx=spx_d, baa=baa)
-    return daily.dropna()
+    daily_anchor = stability_filter(daily, vix=vix_d, spx=spx_d, baa=baa)
+
+    # --- Daily market-regime overlay --------------------------------------
+    # The pure monthly anchor is too smooth to track day-to-day market moves
+    # (CAPE / MGDTE / EMV are monthly or lag — they can't see today's tape).
+    # Add a DAILY regime composite from SPX momentum + VIX + SPX-vs-200d-MA
+    # extension, robust-z'd, mapped to 0-100, and blend it into the anchor.
+    # The headline score (gauge) stays on the validated monthly macro; this
+    # overlay only affects the displayed daily series so the chart can react.
+    regime = compute_daily_regime(hf) if hf is not None else None
+    if regime is not None and not regime.empty:
+        common = daily_anchor.index.intersection(regime.index)
+        if not common.empty:
+            blended = (DAILY_ANCHOR_WEIGHT * daily_anchor.loc[common]
+                       + (1 - DAILY_ANCHOR_WEIGHT) * regime.loc[common])
+            daily_anchor.loc[common] = blended
+    return daily_anchor.dropna()
+
+
+# Daily regime overlay weight: macro anchor 0.70, daily market regime 0.30.
+# Tuned so the displayed daily index stays anchored to the macro reality
+# (the validated monthly composite) while the daily overlay reacts to the
+# tape. Push closer to 1.0 for a calmer chart, closer to 0 for a more
+# SPX-correlated chart.
+DAILY_ANCHOR_WEIGHT = 0.70
+
+
+def compute_daily_regime(hf: dict = None) -> pd.Series:
+    """Daily 'market regime' 0-100 score from pure price/vix inputs.
+
+    Three signals, each robust-z'd over a 252-day (≈1y) trailing window so
+    the regime can swing with the tape while staying bounded:
+      - SPX 20-day return (momentum / risk-on)
+      - VIX level INVERTED (high VIX = fear = risk dropping)
+      - SPX distance above its 200-day moving average (extension / froth)
+    Equal-weighted average z → Φ(z) → 0-100. Clip [1, 99]. Falls back to
+    an empty Series if no daily data; callers must handle that.
+
+    This is the daily overlay blended into the displayed daily index so the
+    chart tracks market moves. It does NOT replace the validated monthly
+    composite — the headline gauge and the backtest keep using the macro
+    signal. The blend lives only in get_daily_scores.
+    """
+    if hf is None:
+        hf = _get_hf_daily()
+    if not hf:
+        return pd.Series(dtype=float)
+    spx = hf.get("spx")
+    vix = hf.get("vix")
+    if spx is None or spx.empty or vix is None or vix.empty:
+        return pd.Series(dtype=float)
+
+    mom_20 = spx.pct_change(20)
+    mom_z = rolling_robust_z(mom_20, window=252, min_periods=60)
+    vix_z = -rolling_robust_z(vix, window=252, min_periods=60)   # inverted
+    ma200 = spx.rolling(200, min_periods=60).mean()
+    ext = spx / ma200 - 1.0
+    ext_z = rolling_robust_z(ext, window=252, min_periods=60)
+
+    common = mom_z.index.intersection(vix_z.index).intersection(ext_z.index)
+    common = common[~common.duplicated(keep="first")]
+    if common.empty:
+        return pd.Series(dtype=float)
+    combined = ((mom_z.reindex(common).fillna(0)
+                + vix_z.reindex(common).fillna(0)
+                + ext_z.reindex(common).fillna(0)) / 3.0)
+    # robust-z -> 0-100 via standard normal CDF
+    regime = (100.0 * _norm_cdf_arr(combined.to_numpy())).clip(1, 99)
+    return pd.Series(regime, index=common)
 
 
 def risk_level(score: float) -> str:
