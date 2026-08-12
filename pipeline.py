@@ -139,12 +139,15 @@ WINDOW_MONTHS = 240       # 20 years for the trailing robust-Z window
 # 8s per request: FRED/Stooq from a cold Render container (fresh DNS+TLS,
 # shared egress IP, possible rate-limit backoff) can take 4-6s each — 5s was
 # tight enough to contribute to the all-failed -> synthetic fallback.
-FETCH_TIMEOUT = 8         # hard per-request timeout (seconds)
+FETCH_TIMEOUT = 15        # hard per-request timeout (seconds); 15s lets a slow
+                         # egress (Render -> FRED can hit 8-12s) succeed
+                         # instead of timing out at 6s. The probe on Render
+                         # showed FRED keyless CSV returning at ~6.1s.
 # Total wall-clock deadline for the whole batch. 19 series / 8 workers = 3
-# waves; worst case 3 x 8s = 24s, bounded here at 20s (stragglers are
+# waves; worst case 3 x 15s = 45s, bounded here at 30s (stragglers are
 # cancelled and treated as missing, never raise). This bound only applies to
 # the refresh path — the default page load is cache-first and instant.
-FETCH_DEADLINE = 20       # total wall-clock deadline for the whole batch
+FETCH_DEADLINE = 30       # total wall-clock deadline for the whole batch
 INCREMENTAL_DAYS = 30     # on refresh: only re-fetch the last ~30 days
 CACHE_MAX_AGE_HOURS = 6.0 # stale after this -> auto incremental refresh on load
 
@@ -355,18 +358,30 @@ def _run_with_timeout(fn: Callable[[], object], timeout: float, default=None):
     return box.get("v", default)
 
 
-def _http_get(url: str, timeout: int = FETCH_TIMEOUT) -> Optional[str]:
-    """Keyless HTTP GET with a browser UA (Stooq / FRED block empty UAs)."""
-    try:
-        hdr = {"User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                              "AppleWebKit/537.36 (KHTML, like Gecko) "
-                              "Chrome/120.0 Safari/537.36")}
-        r = requests.get(url, headers=hdr, timeout=timeout)
-        r.raise_for_status()
-        return r.text
-    except Exception as exc:
-        print(f"[http] {url[:78]}... failed: {exc}")
-        return None
+def _http_get(url: str, timeout: int = FETCH_TIMEOUT,
+              attempts: int = 3) -> Optional[str]:
+    """Keyless HTTP GET with a browser UA (Stooq / FRED block empty UAs).
+
+    Retries up to `attempts` times with linear back-off (1s, 2s, ...) on
+    any exception -- Render's egress often has a few-second cold-start
+    hiccup that a single 8s timeout kills, but a retry catches.
+    """
+    hdr = {"User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                          "AppleWebKit/537.36 (KHTML, like Gecko) "
+                          "Chrome/120.0 Safari/537.36")}
+    last_exc = None
+    for i in range(attempts):
+        try:
+            r = requests.get(url, headers=hdr, timeout=timeout)
+            r.raise_for_status()
+            return r.text
+        except Exception as exc:
+            last_exc = exc
+            if i < attempts - 1:
+                import time as _t
+                _t.sleep(1 + i)        # 1s, 2s back-off
+    print(f"[http] {url[:78]}... failed after {attempts} tries: {last_exc}")
+    return None
 
 
 def _fred_csv(series_id: str, start: str = HISTORY_START,
@@ -499,20 +514,16 @@ def _fetch_price(ticker: str, start: str = HISTORY_START,
                  timeout: int = FETCH_TIMEOUT) -> Optional[pd.Series]:
     """Monthly-close price with a three-layer anti-fragile chain.
 
-    Order: [FRED (for FRED_PRICE_PRIMARY tickers)] -> yfinance -> Stooq ->
-    FRED (fallback). Yahoo frequently 429s cloud IPs; Stooq sits behind a JS
-    proof-of-work wall; FRED (SP500 / NASDAQCOM / VIXCLS) is the stable,
-    keyless-capable backbone that keeps prices REAL when both fail.
+    Order: yfinance -> Stooq -> FRED. yfinance is the new first choice:
+    FRED egress from Render is frequently blocked / rate-limited (the
+    connectivity probe shows CSV timeouts at ~6s, ZIP-on-error from the
+    API endpoint); yfinance uses its own CDN endpoints (query1/query2
+    finance.yahoo.com) which DO work from Render. FRED becomes the
+    fallback for completeness.
     """
     fred_id = FRED_PRICE_MAP.get(ticker)
 
-    # Layer 0: FRED-primary tickers (Nasdaq Composite, VIX) — most reliable.
-    if fred_id and ticker in FRED_PRICE_PRIMARY:
-        s = _fred_csv(fred_id, start=start, timeout=timeout)
-        if s is not None and not s.empty:
-            return s
-
-    # Layer 1: yfinance (deep history, but datacenter-hostile).
+    # Layer 1: yfinance (Render-friendly, deep history, but can 429).
     try:
         import yfinance as yf
         df = yf.download(ticker, start=start, auto_adjust=True, actions=False,
@@ -528,18 +539,20 @@ def _fetch_price(ticker: str, start: str = HISTORY_START,
     except Exception as exc:  # pragma: no cover - network dependent
         print(f"[yfinance] {ticker} failed: {exc}")
 
-    # Layer 2: Stooq (often behind a JS anti-bot wall — usually fails headless).
+    # Layer 2: FRED (Nasdaq / VIX primary source on a clear egress;
+    # SPY / GSPC only here if yfinance failed).
+    if fred_id:
+        s = _fred_csv(fred_id, start=start, timeout=timeout)
+        if s is not None and not s.empty:
+            return s
+
+    # Layer 3: Stooq (often behind a JS anti-bot wall — usually fails headless).
     st = _STOOQ_MAP.get(ticker)
     if st:
         s = _stooq_daily(st, start=start)
         if s is not None and not s.empty:
             return s
 
-    # Layer 3: FRED fallback (SP500 for SPY/^GSPC is price-only, no dividends —
-    # acceptable for charts and for the benchmark-vs-strategy comparison,
-    # which uses the SAME series on both sides).
-    if fred_id:
-        return _fred_csv(fred_id, start=start, timeout=timeout)
     return None
 
 
@@ -1065,6 +1078,21 @@ def fetch_all_raw(incremental: bool) -> Tuple[pd.DataFrame, dict]:
     else:
         start = HISTORY_START
 
+    # FRED availability gate: a single quick probe (3s) at the start. If FRED
+    # is blocked / rate-limited (Render cold-start egress commonly has this),
+    # skip every FRED CSV call this round instead of burning 15s*3retries*14series
+    # waiting for each one to time out. Falls back to the build-time-baked
+    # cache for monthly features; daily prices still go through yfinance.
+    fred_ok = True
+    try:
+        probe = _fred_csv("VIXCLS", start=today.strftime("%Y-%m-%d"),
+                          timeout=3, monthly=True)
+        fred_ok = probe is not None and not probe.empty
+    except Exception:
+        fred_ok = False
+    if not fred_ok:
+        print("[fetch] FRED probe failed; falling back to cache for FRED series")
+
     results: dict = {}
     # ZERO-CRASH + NON-BLOCKING design:
     #  * Do NOT use `with ThreadPoolExecutor(...)` — its __exit__ runs
@@ -1076,8 +1104,13 @@ def fetch_all_raw(incremental: bool) -> Tuple[pd.DataFrame, dict]:
     #    `except TimeoutError` silently let it escape and crash Streamlit.
     #    Catch FuturesTimeoutError explicitly (a tuple also covers 3.11+).
     ex = ThreadPoolExecutor(max_workers=8)
-    future_to_key = {ex.submit(_fetch_one, spec, start): key
-                     for key, spec in RAW_SPECS.items()}
+    future_to_key = {}
+    for key, spec in RAW_SPECS.items():
+        kind, sid = spec
+        if not fred_ok and kind == "fred":
+            # skip FRED fetches entirely -- use whatever's in the cache
+            continue
+        future_to_key[ex.submit(_fetch_one, spec, start)] = key
     try:
         for fut in as_completed(list(future_to_key.keys()),
                                 timeout=FETCH_DEADLINE):
