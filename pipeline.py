@@ -1616,6 +1616,19 @@ def get_monthly_scores(refresh: bool = False,
           f"{latest.date() if latest is not None else 'n/a'}"
           f"  (missing: {missing or '-'})")
 
+    # Always refresh the DAILY hf cache as a separate post-step. Inside
+    # compute_features_from_raw the hf call shares the same executor
+    # time budget as the monthly FRED fetches; if the monthly path
+    # succeeded but a few daily fetches hit the per-request timeout (very
+    # common with yfinance 429s on Render), hf_daily.parquet can stay
+    # several days behind the monthly cache. Force a final hf refresh
+    # here so the daily price lines reach the latest trading day on
+    # every page load that triggered a live refresh.
+    try:
+        _get_hf_daily()
+    except Exception as exc:
+        print(f"[hf-daily] post-refresh failed: {exc!r}")
+
     # All-fail extreme case: prefer REAL cached history over synthetic.
     if latest is None or available_count == 0:
         hit = _cached_scores(tail_boost)
@@ -1795,12 +1808,13 @@ def get_daily_scores(refresh: bool = False,
     return daily_anchor.dropna()
 
 
-# Daily regime overlay weight: macro anchor 0.70, daily market regime 0.30.
+# Daily regime overlay weight: macro anchor 0.60, daily market regime 0.40.
 # Tuned so the displayed daily index stays anchored to the macro reality
 # (the validated monthly composite) while the daily overlay reacts to the
-# tape. Push closer to 1.0 for a calmer chart, closer to 0 for a more
+# tape with enough weight to track multi-week rallies instead of lagging.
+# Push closer to 1.0 for a calmer chart, closer to 0 for a more
 # SPX-correlated chart.
-DAILY_ANCHOR_WEIGHT = 0.70
+DAILY_ANCHOR_WEIGHT = 0.60
 
 # Final hard clamp on |day-over-day Δ| of the blended displayed daily index.
 # Trend still accumulates over weeks/months (the clamp is cumulative-friendly:
@@ -1814,15 +1828,16 @@ BLEND_DAILY_CLAMP = 1.2
 def compute_daily_regime(hf: dict = None) -> pd.Series:
     """Daily 'market regime' 0-100 score from pure price/vix inputs.
 
-    Three signals, each robust-z'd over a 252-day ( (1y) trailing window so
-    the regime can swing with the tape while staying bounded:
-      - SPX 20-day return (momentum / risk-on)
+    Three signals, each robust-z'd over a 252-day ( (1y) trailing window:
+      - SPX 10-day return (reacts to biweekly tape; 20d was too slow,
+        lagged the rally by weeks)
       - VIX level INVERTED (high VIX = fear = risk dropping)
       - SPX distance above its 200-day moving average (extension / froth)
-    Equal-weighted average z -> short-EMA smoothed -> Φ(z) -> 0-100. The
-    short EMA (5d) is what prevents the regime from zigzagging day to day
-    when blended into the daily index. Clip [1, 99]. Falls back to an empty
-    Series if no daily data; callers must handle that.
+    Equal-weighted average z -> short-EMA smoothed (10d span, half-life
+    ~5d) -> Φ(z) -> 0-100. The 10d smoothing preserves multi-day trend
+    recognition while damping day-to-day noise; faster than the previous
+    15d so the chart keeps up with momentum shifts within a week rather
+    than two. Clip [1, 99]. Falls back to an empty Series if no daily data.
 
     This is the daily overlay blended into the displayed daily index so the
     chart tracks market moves. It does NOT replace the validated monthly
@@ -1838,8 +1853,11 @@ def compute_daily_regime(hf: dict = None) -> pd.Series:
     if spx is None or spx.empty or vix is None or vix.empty:
         return pd.Series(dtype=float)
 
-    mom_20 = spx.pct_change(20)
-    mom_z = rolling_robust_z(mom_20, window=252, min_periods=60)
+    # 10d return (was 20d) -- the 20d signal lagged real rallies by 2-3
+    # weeks (the user explicitly noted this). 10d reacts to a fortnight
+    # of tape which is a more natural decision cycle for an investor.
+    mom_10 = spx.pct_change(10)
+    mom_z = rolling_robust_z(mom_10, window=252, min_periods=60)
     vix_z = -rolling_robust_z(vix, window=252, min_periods=60)   # inverted
     ma200 = spx.rolling(200, min_periods=60).mean()
     ext = spx / ma200 - 1.0
@@ -1852,12 +1870,7 @@ def compute_daily_regime(hf: dict = None) -> pd.Series:
     combined = ((mom_z.reindex(common).fillna(0)
                 + vix_z.reindex(common).fillna(0)
                 + ext_z.reindex(common).fillna(0)) / 3.0)
-    # Short-EMA smoothing BEFORE Φ-mapping: kills the day-to-day jitter so the
-    # blended daily index has a recognisable regime trend (week-to-week) rather
-    # than a per-day sawtooth. 15d span (~7d half-life) gives the regime time
-    # to settle into its new level after each move while still reacting to
-    # multi-day trends within a session or two.
-    combined_sm = combined.ewm(span=15, min_periods=1).mean()
+    combined_sm = combined.ewm(span=10, min_periods=1).mean()
     # robust-z -> 0-100 via standard normal CDF
     regime = (100.0 * _norm_cdf_arr(combined_sm.to_numpy())).clip(1, 99)
     return pd.Series(regime, index=common)
