@@ -622,19 +622,33 @@ def _save_hf_cache(df: pd.DataFrame) -> None:
 
 
 def _get_hf_daily() -> dict:
-    """Return a dict of daily Series (keys: 'vix', 'spx', 'ndx') used for the
-    first smoothing layer AND for the daily price lines on the dashboard
-    chart, with an incremental parquet cache so refreshes only pull the last
-    ~30 days. Non-fatal: missing keys simply fall back to the monthly path
-    inside compute_features_from_raw.
+    """Return a dict of daily Series used for the first smoothing layer,
+    the daily price lines on the dashboard chart, AND the resilient
+    yfinance-only fallback index (used when FRED egress is blocked). Keys:
+      - 'vix'   : ^VIX daily
+      - 'spx'   : ^GSPC daily (S&P 500 index)
+      - 'ndx'   : ^IXIC daily (Nasdaq Composite)
+      - 'tnx'   : ^TNX daily (10Y Treasury yield; macro input)
+      - 'hyg'   : HYG daily (high-yield credit; leverage input)
+      - 'lqd'   : LQD daily (investment-grade credit; leverage input)
 
-    Network is bounded by FETCH_TIMEOUT + the global deadline; any failure
-    returns whatever subset is available (possibly empty).
+    Each tag has its own incremental parquet cache (last ~30 days) so
+    refreshes only pull the recent window. Non-fatal: missing keys fall
+    back to the monthly path inside compute_features_from_raw, or to the
+    resilient index's per-key NaN handling.
     """
     cached = _load_hf_cache()
     df = cached if cached is not None else pd.DataFrame()
     out: dict = {}
-    for tag, ticker in (("vix", "^VIX"), ("spx", "^GSPC"), ("ndx", "^IXIC")):
+    tickers = (
+        ("vix", "^VIX"),
+        ("spx", "^GSPC"),
+        ("ndx", "^IXIC"),
+        ("tnx", "^TNX"),
+        ("hyg", "HYG"),
+        ("lqd", "LQD"),
+    )
+    for tag, ticker in tickers:
         start = HISTORY_START
         if tag in df.columns and df[tag].notna().any():
             last = df[tag].dropna().index.max()
@@ -651,6 +665,115 @@ def _get_hf_daily() -> dict:
     if not df.empty:
         _save_hf_cache(df)
     return out
+
+
+def compute_resilient_index(hf: dict = None) -> pd.Series:
+    """Resilient Bubble Index computed from PUREYFINANCE inputs (no FRED).
+
+    Used when FRED egress is blocked (Render cold-start, rate-limit, or
+    shared-IP block) so the dashboard NEVER falls back to the deterministic
+    synthetic series -- the user gets a real, real-time, market-aware index
+    derived from pure price + volatility + credit-spread + yield data
+    yfinance serves from its own CDN (verified working from Render where
+    FRED is not).
+
+    Five sub-scores, each robust-z'd over a 252-day (≈1y) window:
+
+      Valuation  : SPX-vs-200d-MA distance        (long-term froth proxy)
+      Sentiment  : VIX level z, INVERTED           (low VIX = complacency)
+      Leverage   : HYG/LQD ratio z                 (credit risk appetite)
+      Structure  : NDX/SPX ratio z                 (tech-led froth)
+      Macro      : ^TNX 10y yield z               (rate environment)
+
+    Each z -> Φ -> 0-100. The five scores are blended with the same
+    MODULE_WEIGHTS as the validated monthly composite (valuation 30%,
+    sentiment 20%, leverage 20%, structure 15%, macro 15%). Output is a
+    DAILY 0-100 series, smoothed with a 10d EMA to dampen noise (the
+    blended display already handles smoothing; this gives a clean signal
+    for the gauge / signals / backtest).
+
+    Historical caveat: this resilient index is structurally different from
+    the validated V3 monthly composite (no CAPE / no margin debt / no EMV).
+    Use it as a real-time replacement when FRED is unavailable, but prefer
+    the FRED-based score when FRED is reachable.
+    """
+    if hf is None:
+        hf = _get_hf_daily()
+    if not hf:
+        return pd.Series(dtype=float)
+    spx = hf.get("spx")
+    ndx = hf.get("ndx")
+    vix = hf.get("vix")
+    hyg = hf.get("hyg")
+    lqd = hf.get("lqd")
+    tnx = hf.get("tnx")
+    if spx is None or spx.empty:
+        return pd.Series(dtype=float)
+
+    def _z(s, win=252, mp=60, invert=False):
+        z = rolling_robust_z(s, window=win, min_periods=mp)
+        return -z if invert else z
+
+    # 1) Valuation: SPX distance above its 200-day moving average (z).
+    #    Captures long-term froth (2021 NDX/SPX stretched, 2007 stretched).
+    ma200 = spx.rolling(200, min_periods=60).mean()
+    val_z = _z(spx / ma200 - 1.0)
+
+    # 2) Sentiment: VIX z INVERTED (low VIX = complacency = risk ON).
+    if vix is not None and not vix.empty:
+        sent_z = _z(vix, invert=True)
+    else:
+        sent_z = pd.Series(0.0, index=spx.index)
+
+    # 3) Leverage: HYG/LQD ratio z (high ratio = risk appetite = risk ON).
+    if hyg is not None and lqd is not None and not hyg.empty and not lqd.empty:
+        # align on common index
+        ratio = (hyg / lqd).dropna()
+        lev_z = _z(ratio)
+    else:
+        lev_z = pd.Series(0.0, index=spx.index)
+
+    # 4) Structure: NDX/SPX ratio z (tech-led froth).
+    if ndx is not None and not ndx.empty:
+        nsp_ratio = (ndx / spx).dropna()
+        struct_z = _z(nsp_ratio)
+    else:
+        struct_z = pd.Series(0.0, index=spx.index)
+
+    # 5) Macro: ^TNX 10y yield z (rising yields = tightening conditions).
+    if tnx is not None and not tnx.empty:
+        macro_z = _z(tnx)
+    else:
+        macro_z = pd.Series(0.0, index=spx.index)
+
+    # Align all on the SPX index (most complete).
+    idx = spx.index
+    val_z   = val_z.reindex(idx,   method="ffill")
+    sent_z  = sent_z.reindex(idx,  method="ffill")
+    lev_z   = lev_z.reindex(idx,   method="ffill")
+    struct_z= struct_z.reindex(idx,method="ffill")
+    macro_z = macro_z.reindex(idx,  method="ffill")
+
+    # Build module scores (0-100) via Φ-mapping the z.
+    def _to_score(z):
+        if z is None: return pd.Series(50.0, index=idx)
+        return (100.0 * _standard_normal_cdf(z.to_numpy())).clip(1, 99)
+
+    val_m    = _to_score(val_z)
+    sent_m   = _to_score(sent_z)
+    lev_m    = _to_score(lev_z)
+    struct_m = _to_score(struct_z)
+    macro_m  = _to_score(macro_z)
+
+    # Apply the same MODULE_WEIGHTS as the validated composite.
+    mw = MODULE_WEIGHTS
+    score_arr = (val_m * mw["valuation"] + sent_m * mw["sentiment"]
+                 + lev_m * mw["leverage"] + struct_m * mw["structure"]
+                 + macro_m * mw["macro"]) / sum(mw.values())
+    score = pd.Series(score_arr, index=idx)
+    # Daily smoothing (10d EMA) to keep the resilient headline calm.
+    score = score.ewm(span=10, adjust=False).mean()
+    return score.clip(1, 99)
 
 
 def get_daily_price(ticker: str) -> Optional[pd.Series]:

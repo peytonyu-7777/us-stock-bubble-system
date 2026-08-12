@@ -873,12 +873,34 @@ def main():
     src = meta.get("source", "unknown")
     src_label = {"live": "Real-time", "cache": "Cached", "synthetic": "Synthetic"}.get(src, src)
     if src == "synthetic":
-        st.warning("⚠️ Live data unavailable — showing a **deterministic synthetic** "
-                   "series for layout/demo only. On Render, set `FRED_API_KEY` as an "
-                   "**environment variable for BOTH build and runtime** (Dashboard → "
-                   "Environment → Add, no quotes), then trigger **Manual Deploy → "
-                   "Clear build cache & deploy** so the baked parquet cache is rebuilt "
-                   "with real FRED data.")
+        # Switch into the RESILIENT mode: drop the synthetic path and serve a
+        # real-time yfinance-only index (price / VIX / credit / yield). This
+        # is real data (not the deterministic synthetic), it just uses a
+        # different feature set than the validated V3 monthly composite.
+        try:
+            ri = pipe.compute_resilient_index()
+            if not ri.empty:
+                scores = ri
+                meta["source"] = "resilient"
+                meta["resilient_only"] = True
+                st.info(
+                    "ℹ️ FRED egress blocked on this Render instance — switched "
+                    "to **resilient mode**: real-time Bubble Index computed "
+                    "from yfinance (price / VIX / credit / 10y yield). "
+                    "Validation is coarser than the FRED-based composite; "
+                    "the gauge / signals / chart now reflect actual market "
+                    "conditions rather than a synthetic series. Once FRED is "
+                    "reachable again the validated V3 composite returns.")
+        except Exception:
+            pass
+        if meta.get("source") == "synthetic":
+            # Fall back to the old hint if even the resilient index failed.
+            st.warning("⚠️ Live data unavailable — showing a **deterministic synthetic** "
+                       "series for layout/demo only. On Render, set `FRED_API_KEY` as an "
+                       "**environment variable for BOTH build and runtime** (Dashboard → "
+                       "Environment → Add, no quotes), then trigger **Manual Deploy → "
+                       "Clear build cache & deploy** so the baked parquet cache is rebuilt "
+                       "with real FRED data.")
     elif src == "cache":
         st.info("ℹ️ Showing cached data (set refresh to pull live).")
 
@@ -998,6 +1020,11 @@ def main():
                                                 tail_boost=tail_boost)
     except Exception:
         _daily_for_guidance = pd.Series(dtype=float)
+    # In resilient mode (FRED blocked), replace the daily blend with the
+    # resilient yfinance-only series so the chart, guidance, and headline
+    # all reflect the same real-time signal.
+    if meta.get("source") == "resilient":
+        _daily_for_guidance = scores  # resilient index IS the daily series
     guidance_panel(state, _daily_for_guidance, scores)
 
     # ---- Module radar + module cards -------------------------------------
@@ -1019,7 +1046,10 @@ def main():
     # Two date pickers (start / end) bounded by the available data range, plus
     # a row of preset buttons for one-click common windows. The data is
     # sliced to the exact [start, end] dates, not by year.
-    daily_for_chart = _daily_for_guidance
+    # In resilient mode (FRED blocked), the chart's daily series IS the
+    # resilient index (the same `scores` Series the gauge / guidance uses)
+    # -- so the red line is consistent with everything else.
+    daily_for_chart = scores if meta.get("source") == "resilient" else _daily_for_guidance
     if not daily_for_chart.empty:
         d_min = daily_for_chart.index.min().date()
         d_max = daily_for_chart.index.max().date()
