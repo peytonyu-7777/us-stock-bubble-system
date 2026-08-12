@@ -629,9 +629,41 @@ def get_daily_price(ticker: str) -> Optional[pd.Series]:
     """DAILY price series for the dashboard chart (S&P 500 / Nasdaq), served
     from the incremental daily cache (hf_daily.parquet). Falls back to the
     monthly raw cache when the daily series is unavailable. Never raises.
+
+    Self-healing: if the on-disk hf cache is missing the requested ticker
+    OR its last date is more than 2 trading days behind, force a fresh
+    _get_hf_daily() (in a non-blocking try/except) so the chart always has
+    the latest data even when the user lands on a freshly-woken Render
+    instance that just rebuilt the monthly cache.
     """
     key = {"^GSPC": "spx", "SPX": "spx", "^IXIC": "ndx", "NDX": "ndx"}.get(
         ticker, ticker)
+
+    hf = None
+    try:
+        hf = _load_hf_cache()
+    except Exception:
+        hf = None
+
+    needs_refresh = True
+    if hf is not None and key in hf.columns:
+        s = hf[key].dropna()
+        if not s.empty:
+            last = s.index.max()
+            today = pd.Timestamp.today().normalize()
+            # 2-day window: a fresh cache can lag the most-recent trading day
+            # (weekends, post-close windows) but never 2+ calendar days.
+            if today - last.normalize() <= pd.Timedelta(days=2):
+                return s
+            # otherwise fall through to refresh
+
+    # Trigger a fresh hf fetch if needed. Crash-proof: any error returns
+    # whatever was already in the cache (or None).
+    try:
+        _get_hf_daily()
+    except Exception as exc:
+        print(f"[daily-price] refresh {ticker} failed: {exc!r}")
+
     try:
         hf = _load_hf_cache()
         if hf is not None and key in hf.columns:
@@ -643,11 +675,14 @@ def get_daily_price(ticker: str) -> Optional[pd.Series]:
     # fall back to the monthly raw cache column
     raw_key = {"spx": "spx", "ndx": "ixic"}.get(key)
     if raw_key:
-        raw = _load_raw_cache()
-        if raw is not None and raw_key in raw.columns:
-            s = raw[raw_key].dropna()
-            if not s.empty:
-                return s
+        try:
+            raw = _load_raw_cache()
+            if raw is not None and raw_key in raw.columns:
+                s = raw[raw_key].dropna()
+                if not s.empty:
+                    return s
+        except Exception:
+            pass
     return None
 
 

@@ -576,7 +576,9 @@ def history_fig(scores: pd.Series, spx, ndx, log_scale: bool = True,
     )
     fig.update_xaxes(showgrid=False, showline=True, linecolor="#e2e8f0",
                      ticks="outside", row=1, col=1,
-                     autorange=True)
+                     autorange=True,
+                     dtick="M1", tickformat="%Y-%m",
+                     hoverformat="%Y-%m-%d")
     fig.update_yaxes(showgrid=False, range=[0, 100],
                      title_text="Bubble Index (0-100)",
                      row=1, col=1, secondary_y=False, title_font=dict(size=11))
@@ -1013,46 +1015,80 @@ def main():
     # ---- Combined chart: Bubble Index + rebased S&P 500 / Nasdaq ------------
     st.subheader("Bubble Index vs Market (S&P 500 / Nasdaq rebased to 100)")
 
-    # --- User-selectable year range (controls the combined chart) ----------
+    # --- User-selectable DATE range (controls the combined chart) ----------
+    # Two date pickers (start / end) bounded by the available data range, plus
+    # a row of preset buttons for one-click common windows. The data is
+    # sliced to the exact [start, end] dates, not by year.
     daily_for_chart = _daily_for_guidance
     if not daily_for_chart.empty:
-        years = sorted({int(d.year) for d in daily_for_chart.index})
-        if years:
-            c1, c2, c3 = st.columns([1, 1, 1.2])
-            chart_start = c1.select_slider(
-                "Chart start year", options=years,
-                value=st.session_state.get("chart_start", min(years)),
-                key="chart_start_widget",
-                help="图表起始年份")
-            chart_end = c2.select_slider(
-                "Chart end year", options=years,
-                value=st.session_state.get("chart_end", max(years)),
-                key="chart_end_widget",
-                help="图表结束年份")
-            if chart_start > chart_end:
-                chart_start, chart_end = chart_end, chart_start
-            st.session_state["chart_start"] = chart_start
-            st.session_state["chart_end"] = chart_end
-            daily_for_chart = daily_for_chart.loc[
-                (daily_for_chart.index.year >= chart_start)
-                & (daily_for_chart.index.year <= chart_end)]
-            c3.markdown(
-                f"<div style='font-size:12px;color:#475569;padding-top:1.6rem'>"
-                f"📅 显示区间: <b>{chart_start}–{chart_end}</b> "
-                f"({len(daily_for_chart)} 个交易日)</div>",
-                unsafe_allow_html=True)
+        d_min = daily_for_chart.index.min().date()
+        d_max = daily_for_chart.index.max().date()
+
+        # Preset range buttons (one-click: rewrite the session_state dates
+        # and rerun). 'key' must be unique; we mutate session_state and ask
+        # Streamlit to re-run.
+        def _apply_preset(days_back):
+            from datetime import timedelta
+            end = d_max
+            start = max(d_min, end - timedelta(days=days_back))
+            st.session_state["chart_start_date"] = start
+            st.session_state["chart_end_date"] = end
+
+        presets = st.columns([1, 1, 1, 1, 1, 1.5])
+        if presets[0].button("1M", use_container_width=True):
+            _apply_preset(31); st.rerun()
+        if presets[1].button("3M", use_container_width=True):
+            _apply_preset(93); st.rerun()
+        if presets[2].button("6M", use_container_width=True):
+            _apply_preset(186); st.rerun()
+        if presets[3].button("1Y", use_container_width=True):
+            _apply_preset(365); st.rerun()
+        if presets[4].button("2Y", use_container_width=True):
+            _apply_preset(730); st.rerun()
+        if presets[5].button("📆 全部 (All)", use_container_width=True):
+            st.session_state["chart_start_date"] = d_min
+            st.session_state["chart_end_date"] = d_max
+            st.rerun()
+
+        c1, c2, c3 = st.columns([1, 1, 1.2])
+        default_start = st.session_state.get("chart_start_date", max(d_min, d_max - pd.Timedelta(days=365*2)))
+        default_end   = st.session_state.get("chart_end_date", d_max)
+        chart_start = c1.date_input(
+            "📅 开始日期", value=default_start,
+            min_value=d_min, max_value=d_max,
+            key="chart_start_date",
+            help="图表起始日期（精确到日）。")
+        chart_end = c2.date_input(
+            "📅 结束日期", value=default_end,
+            min_value=d_min, max_value=d_max,
+            key="chart_end_date",
+            help="图表结束日期（精确到日）。")
+        if chart_start > chart_end:
+            st.warning("开始日期需 ≤ 结束日期——已自动交换。")
+            chart_start, chart_end = chart_end, chart_start
+
+        # Slice the DAILY index to the exact date range
+        daily_for_chart = daily_for_chart.loc[
+            (daily_for_chart.index.date >= chart_start)
+            & (daily_for_chart.index.date <= chart_end)]
+        n_days = len(daily_for_chart)
+        c3.markdown(
+            f"<div style='font-size:12px;color:#475569;padding-top:1.6rem'>"
+            f"📅 显示区间: <b>{chart_start} → {chart_end}</b> "
+            f"({n_days} 个交易日)</div>",
+            unsafe_allow_html=True)
 
     try:
         spx, ndx = load_prices()
     except Exception:
         spx, ndx = None, None
-    # Slice price series to the same range so the rebase start aligns
+    # Slice price series to the same exact dates so the rebase start aligns
     if not daily_for_chart.empty and spx is not None and not spx.empty:
-        spx = spx.loc[(spx.index.year >= int(daily_for_chart.index[0].year))
-                     & (spx.index.year <= int(daily_for_chart.index[-1].year))]
+        spx = spx.loc[(spx.index.date >= chart_start)
+                     & (spx.index.date <= chart_end)]
     if not daily_for_chart.empty and ndx is not None and not ndx.empty:
-        ndx = ndx.loc[(ndx.index.year >= int(daily_for_chart.index[0].year))
-                     & (ndx.index.year <= int(daily_for_chart.index[-1].year))]
+        ndx = ndx.loc[(ndx.index.date >= chart_start)
+                     & (ndx.index.date <= chart_end)]
     st.plotly_chart(history_fig(daily_for_chart if not daily_for_chart.empty else scores,
                                 spx, ndx, log_scale=False, view="all"),
                     use_container_width=True)
