@@ -149,7 +149,15 @@ FETCH_TIMEOUT = 15        # hard per-request timeout (seconds); 15s lets a slow
 # the refresh path — the default page load is cache-first and instant.
 FETCH_DEADLINE = 30       # total wall-clock deadline for the whole batch
 INCREMENTAL_DAYS = 30     # on refresh: only re-fetch the last ~30 days
-CACHE_MAX_AGE_HOURS = 6.0 # stale after this -> auto incremental refresh on load
+# FRED throttle: refresh at most once per FRED_REFRESH_HOURS. FRED is the
+# most comprehensive source but rate-limits aggressive polling (Render's
+# shared egress IP makes this worse); the monthly macro features (CAPE,
+# MGDTE, EMVMACROBUS, GDP, M2SL...) only update on a monthly/quarterly
+# cadence anyway, so a 24h refresh interval is plenty and keeps FRED happy.
+# Daily PRICES are served by yfinance via get_daily_price's self-healing
+# path (does NOT consume FRED quota).
+CACHE_MAX_AGE_HOURS = 24.0 # stale after this -> auto incremental refresh on load
+FRED_REFRESH_HOURS = 24.0  # FRED series refreshed at most this often
 
 # ===========================================================================
 # V2 BUBBLE INDEX — 5-MODULE ARCHITECTURE
@@ -514,16 +522,25 @@ def _fetch_price(ticker: str, start: str = HISTORY_START,
                  timeout: int = FETCH_TIMEOUT) -> Optional[pd.Series]:
     """Monthly-close price with a three-layer anti-fragile chain.
 
-    Order: yfinance -> Stooq -> FRED. yfinance is the new first choice:
-    FRED egress from Render is frequently blocked / rate-limited (the
-    connectivity probe shows CSV timeouts at ~6s, ZIP-on-error from the
-    API endpoint); yfinance uses its own CDN endpoints (query1/query2
-    finance.yahoo.com) which DO work from Render. FRED becomes the
-    fallback for completeness.
+    Order: [FRED for FRED_PRICE_PRIMARY tickers] -> yfinance -> Stooq ->
+    FRED (fallback).
+
+    FRED is the authoritative source for Nasdaq Composite / VIX (FRED_PRICE_
+    PRIMARY) — its series are the most complete and are the user's preferred
+    authority. FRED calls are throttled by the 24h refresh gate + probe gate
+    in fetch_all_raw, so this preference costs at most one FRED hit per day.
+    For everything else (^GSPC, SPY, QQQ) yfinance goes first (deep history
+    incl. dividends); FRED remains as the final fallback.
     """
     fred_id = FRED_PRICE_MAP.get(ticker)
 
-    # Layer 1: yfinance (Render-friendly, deep history, but can 429).
+    # Layer 0: FRED-primary tickers (Nasdaq Composite, VIX) — authoritative.
+    if fred_id and ticker in FRED_PRICE_PRIMARY:
+        s = _fred_csv(fred_id, start=start, timeout=timeout)
+        if s is not None and not s.empty:
+            return s
+
+    # Layer 1: yfinance (deep history, but datacenter-hostile / can 429).
     try:
         import yfinance as yf
         df = yf.download(ticker, start=start, auto_adjust=True, actions=False,
@@ -539,20 +556,18 @@ def _fetch_price(ticker: str, start: str = HISTORY_START,
     except Exception as exc:  # pragma: no cover - network dependent
         print(f"[yfinance] {ticker} failed: {exc}")
 
-    # Layer 2: FRED (Nasdaq / VIX primary source on a clear egress;
-    # SPY / GSPC only here if yfinance failed).
-    if fred_id:
-        s = _fred_csv(fred_id, start=start, timeout=timeout)
-        if s is not None and not s.empty:
-            return s
-
-    # Layer 3: Stooq (often behind a JS anti-bot wall — usually fails headless).
+    # Layer 2: Stooq (often behind a JS anti-bot wall — usually fails headless).
     st = _STOOQ_MAP.get(ticker)
     if st:
         s = _stooq_daily(st, start=start)
         if s is not None and not s.empty:
             return s
 
+    # Layer 3: FRED fallback (SP500 / NASDAQCOM / VIXCLS — price-only, no
+    # dividends; fine for charts and the benchmark-vs-strategy comparison
+    # which uses the SAME series on both sides).
+    if fred_id:
+        return _fred_csv(fred_id, start=start, timeout=timeout)
     return None
 
 
