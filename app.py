@@ -790,9 +790,9 @@ def main():
     st.caption("5-module macro framework · Valuation 30% · Sentiment 20% "
                "· Leverage 20% · Structure 15% · Macro 15% · every indicator is a "
                "trailing robust-Z score (20y MAD, no look-ahead) → weighted module "
-               "blend → fixed-gain calibration (0-100) → K-line stability filter "
-               "(slow-EMA trend + small bounded oscillation + stress-aware daily "
-               "clamp) · confirmation-style buy/sell signals grounded in history · "
+               "blend → fixed-gain calibration (0-100) → canonical daily index "
+               "(50% monthly macro anchor + 50% daily price/VIX regime, stress-aware "
+               "daily clamp) · confirmation-style buy/sell signals grounded in history · "
                "cache-first, crash-proof loading · free/open data (FRED, yfinance/Stooq)")
 
     # ---- Sidebar: refresh controls ---------------------------------------
