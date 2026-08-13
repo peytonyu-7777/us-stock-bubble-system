@@ -49,6 +49,9 @@ venv python: C:\Users\yuyipeng\.workbuddy\binaries\python\envs\bubble\Scripts\py
              hf_daily.parquet        （日线 vix/spx/ndx/tnx/hyg/lqd）
 Git 仓库   : https://github.com/peytonyu-7777/us-stock-bubble-system.git
               （local branch: main → origin/main 自动触发 Render 部署）
+部署 runtime: Python3 native（非 Docker）—— 见 §3.1，Docker egress 被 FRED/Stooq
+              屏蔽，Python3 runtime 的 egress IP 池不在黑名单（用户同账户的
+              Liquidly_dashboard_cloud 用 Python3 runtime 一直能访问 FRED）
 ```
 
 ### 2.2 上传 / 部署方式（改完代码如何上线）
@@ -83,7 +86,7 @@ curl -s https://us-stock-bubble-system.onrender.com/_stcore/health   # 期望 20
 
 ## 3. 当前最重要的问题（接手必读）
 
-### 3.1 问题 A：Render 数据中心屏蔽了 FRED（核心瓶颈）
+### 3.1 问题 A：Render Docker runtime 屏蔽了 FRED（核心瓶颈，已根治）
 
 **症状**：页面诊断面板（🔧 数据诊断 → 连通性探测）显示：
 
@@ -92,6 +95,22 @@ curl -s https://us-stock-bubble-system.onrender.com/_stcore/health   # 期望 20
 | FRED 无密钥 CSV | ❌ 超时/屏蔽（~6-21s） |
 | FRED API（带 key） | ❌ 返回错误 ZIP 包（PK 开头） |
 | Stooq 日线 | ❌ 返回 HTML（反爬墙） |
+| **yfinance chart API**（query1.finance.yahoo.com） | ✅ **可用**（~1.6s） |
+
+**根因（已查明）**：Render 的 **Docker runtime 和 native Python3 runtime 走的是不同的 egress IP 池**。FRED/Stooq 对 Docker 的 IP 段做了限流/封禁，而 Python3 native 的 IP 段不被拦。用户同账户的 `Liquidly_dashboard_cloud` 服务用 Python3 runtime 一直能正常访问 FRED——这是关键对照。
+
+**根治方案（2026-08-13 commit `ac91162`）**：`render.yaml` 把 `runtime: docker` 改为 `runtime: python`，新增 `buildCommand` 在构建时跑 `pipeline.warm_cache()` 把 FRED 数据烘焙进 slug，`startCommand` 启动 streamlit。Dockerfile 不再被引用，但保留在仓库里以备回退。
+
+**部署后验证清单**：
+- [ ] Render 控制台 Services 列表里 us-stock-bubble-monitor 的 Runtime 列变成 Python（不再是 Docker）
+- [ ] 诊断面板 FRED 探测恢复 ✅（FRED 无密钥 CSV + FRED API 都应 ✅）
+- [ ] `meta.source` 回到 `live`（不再是 resilient / synthetic）
+- [ ] 估值模块用上真 CAPE/Buffett，杠杆模块用上真 FINRA MGDTE，指数质量回到 V3 验证版
+
+如果切到 Python3 runtime 后**仍然**显示 FRED ❌，说明 Render 把 Python3 IP 池也加入了黑名单（概率很低）——届时再迁到 HuggingFace Spaces（参考 §9.2）。
+
+**原"已实施的应对"（Docker 时代）**：
+1. **resilient 模式**（`523bf83`）：检测到 `source == "synthetic"` 时自动切换到 yfinance-only 实时指数。Python3 时代如果 FRED 通了，resilient 不再被触发（逻辑只在 source==synthetic 时触发）。
 | **yfinance chart API**（query1.finance.yahoo.com） | ✅ **可用**（~1.6s） |
 
 **影响**：月度宏观特征（CAPE、MGDTE 保证金、EMVMACROBUS、GDP、M2SL、WALCL 等）**只有 FRED 有**——FRED 挂了，V3 复合分全部失效 → 曾长期降级到合成数据（页面出现黄色 synthetic 警告）。
