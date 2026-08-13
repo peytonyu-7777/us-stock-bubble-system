@@ -1,15 +1,32 @@
 # render.yaml — one-click deploy on Render.com (Free tier)
-# 1. Push this repo to GitHub.
-# 2. render.com -> New -> Blueprint -> connect the repo.
-# 3. Add the env var FRED_API_KEY (optional but recommended) in the dashboard.
+# 1) Push this repo to GitHub.
+# 2) render.com -> New -> Blueprint -> connect the repo.
+# 3) Add the env var FRED_API_KEY (optional but recommended) in the dashboard
+#    AS BOTH a build and a runtime env var (Dashboard -> Environment -> Add;
+#    the Python3 runtime below exposes build-time env vars to buildCommand).
+#
+# NOTE on runtime choice: the project originally used the Docker runtime, but
+# Render's Docker egress IP pool is blocked / throttled by FRED (api and CSV
+# endpoints both fail; Stooq is walled too) — which left the dashboard stuck
+# in the resilient fallback. Switching to the native Python3 runtime uses a
+# DIFFERENT egress IP pool that reaches FRED normally (verified against the
+# sibling Liquidly_dashboard_cloud service in the same Oregon region, same
+# env, same FRED key). Dockerfile is no longer referenced but is kept in the
+# repo in case we ever need to revert.
 
 services:
   - type: web
     name: us-stock-bubble-monitor
-    runtime: docker
-    dockerfilePath: ./Dockerfile
+    runtime: python        # was `docker` — see note. Egress IP pool unblocks FRED.
     plan: free
     healthCheckPath: /
+    # Render's Python runtime auto-detects deps from requirements.txt.
+    # buildCommand runs at build time and persists its filesystem changes into
+    # the deployed slug, so a successful warm_cache() bakes real FRED data
+    # into the service. The `|| echo` keeps the build green even if the FRED
+    # network is briefly flaky (the app falls back to a runtime fetch).
+    buildCommand: "python -c 'import pipeline as p; p.warm_cache()' || echo 'warm_cache skipped, will fetch at runtime'"
+    startCommand: "streamlit run app.py --server.port=$PORT --server.address=0.0.0.0 --server.headless=true"
     envVars:
       - key: FRED_API_KEY
         sync: false          # set this manually in the Render dashboard (recommended)
