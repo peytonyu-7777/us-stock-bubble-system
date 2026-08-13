@@ -111,6 +111,15 @@ year) so you can study how the strategy performs over any sub-period
   normally, ≤ 6 pts under a *stress flag*: VIX > 40 *or* a 21-day S&P drop <
   −15% *or* a BAA10Y month-over-month jump > 0.5) lets genuine risk events break
   out fast. All steps are causal (no look-ahead).
+* **Daily market-regime overlay (tracks the tape).** The headline daily index =
+  **50% monthly macro anchor + 50% daily price/VIX regime** (SPX 10-day return,
+  VIX-inverted, SPX-vs-200d-MA, each robust-z'd over 1y and Φ-mapped to 0-100),
+  then passed through a single daily-change clamp (≤ 1.5 pts/day). This is the
+  **canonical index** — the gauge, status card, guidance, historical comparison
+  and chart all read the same series, so they never disagree and the index
+  reacts to the tape within days instead of lagging by a month. The monthly
+  macro composite (V3) remains the basis for the backtest, confirmation signals
+  and module drivers.
 * **Event detection + guidance.** Local peaks ≥ 75 are flagged as risk climaxes
   (trim); local troughs ≤ 35 as accumulation windows (buy) — the deep-fear zone
   has historically marked the strongest forward 12–24m returns (2002-09,

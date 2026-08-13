@@ -93,6 +93,7 @@ from __future__ import annotations
 import os
 import json
 import math
+import time
 import threading
 import warnings
 from concurrent.futures import (ThreadPoolExecutor, as_completed,
@@ -616,9 +617,9 @@ def _load_hf_cache() -> Optional[pd.DataFrame]:
 
 def _save_hf_cache(df: pd.DataFrame) -> None:
     try:
-        df.to_parquet(HF_DAILY_PATH)
-    except Exception:
-        pass
+        _atomic_write_parquet(df, HF_DAILY_PATH)
+    except Exception as exc:
+        print(f"[hf-cache] write failed: {exc!r}")
 
 
 def _get_hf_daily() -> dict:
@@ -637,6 +638,11 @@ def _get_hf_daily() -> dict:
     back to the monthly path inside compute_features_from_raw, or to the
     resilient index's per-key NaN handling.
     """
+    return _memo("hf_daily", _get_hf_daily_uncached)
+
+
+def _get_hf_daily_uncached() -> dict:
+    """Uncached body of _get_hf_daily (memoized above)."""
     cached = _load_hf_cache()
     df = cached if cached is not None else pd.DataFrame()
     out: dict = {}
@@ -1177,6 +1183,47 @@ def status_of(score: float) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Reliability layer — in-process memo + atomic cache I/O
+# ---------------------------------------------------------------------------
+# Streamlit runs each script in its own thread, so two widgets (load_scores +
+# load_daily_scores) can trigger get_monthly_scores/_get_hf_daily TWICE in a
+# single page load — a full duplicate network batch. A short in-process memo
+# dedupes those calls. Atomic writes (temp file + os.replace) guarantee a
+# concurrent writer / crash never leaves a half-written, corrupt parquet.
+_IO_LOCK = threading.Lock()          # guards read-modify-write cache sections
+_MEMO: dict = {}
+_MEMO_TTL = 60.0                     # seconds; long enough to span one page load
+
+
+def _memo(key, producer):
+    """Return the cached result for ``key`` if produced < _MEMO_TTL s ago,
+    else run ``producer()`` and cache it. Never raises from the memo itself."""
+    now = time.time()
+    hit = _MEMO.get(key)
+    if hit is not None and (now - hit[0]) < _MEMO_TTL:
+        return hit[1]
+    val = producer()
+    _MEMO[key] = (now, val)
+    return val
+
+
+def _atomic_write_parquet(df: pd.DataFrame, path: str) -> None:
+    """Write a DataFrame to ``path`` via a temp file + atomic rename so a
+    crash or concurrent writer can never leave a corrupt cache file."""
+    tmp = path + ".tmp"
+    try:
+        df.to_parquet(tmp)
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except Exception:
+            pass
+        raise
+
+
+# ---------------------------------------------------------------------------
 # Concurrent raw fetch + incremental cache
 # ---------------------------------------------------------------------------
 def _load_raw_cache() -> Optional[pd.DataFrame]:
@@ -1193,6 +1240,30 @@ def _load_raw_cache() -> Optional[pd.DataFrame]:
         return df[raw_cols].copy()
     except Exception:
         return None
+
+
+_FRED_PROBE_CACHE = {"at": 0.0, "ok": True}
+_FRED_PROBE_TTL = 300.0     # cache the FRED availability probe for 5 minutes
+
+
+def _fred_available(timeout: int = 3) -> bool:
+    """Is FRED reachable right now? A single 3s probe, memoized for 5 minutes
+    so repeated refreshes don't re-hit FRED (which is rate-limit sensitive on
+    Render's shared egress). Never raises."""
+    now = time.time()
+    if now - _FRED_PROBE_CACHE["at"] < _FRED_PROBE_TTL:
+        return _FRED_PROBE_CACHE["ok"]
+    ok = True
+    try:
+        today = pd.Timestamp.today()
+        probe = _fred_csv("VIXCLS", start=today.strftime("%Y-%m-%d"),
+                          timeout=timeout, monthly=True)
+        ok = probe is not None and not probe.empty
+    except Exception:
+        ok = False
+    _FRED_PROBE_CACHE["at"] = now
+    _FRED_PROBE_CACHE["ok"] = ok
+    return ok
 
 
 def fetch_all_raw(incremental: bool) -> Tuple[pd.DataFrame, dict]:
@@ -1216,18 +1287,13 @@ def fetch_all_raw(incremental: bool) -> Tuple[pd.DataFrame, dict]:
     else:
         start = HISTORY_START
 
-    # FRED availability gate: a single quick probe (3s) at the start. If FRED
-    # is blocked / rate-limited (Render cold-start egress commonly has this),
-    # skip every FRED CSV call this round instead of burning 15s*3retries*14series
-    # waiting for each one to time out. Falls back to the build-time-baked
-    # cache for monthly features; daily prices still go through yfinance.
-    fred_ok = True
-    try:
-        probe = _fred_csv("VIXCLS", start=today.strftime("%Y-%m-%d"),
-                          timeout=3, monthly=True)
-        fred_ok = probe is not None and not probe.empty
-    except Exception:
-        fred_ok = False
+    # FRED availability gate: a single quick probe (3s, memoized 5 min) at the
+    # start. If FRED is blocked / rate-limited (Render cold-start egress
+    # commonly has this), skip every FRED CSV call this round instead of
+    # burning 15s*3retries*14series waiting for each one to time out. Falls
+    # back to the build-time-baked cache for monthly features; daily prices
+    # still go through yfinance.
+    fred_ok = _fred_available(timeout=3)
     if not fred_ok:
         print("[fetch] FRED probe failed; falling back to cache for FRED series")
 
@@ -1271,24 +1337,29 @@ def fetch_all_raw(incremental: bool) -> Tuple[pd.DataFrame, dict]:
         # FETCH_TIMEOUT, so the process is never held hostage by the network.
         ex.shutdown(wait=False, cancel_futures=True)
 
-    # Merge into the cached history (fresh tail wins on overlap).
+    # Merge into the cached history (fresh tail wins on overlap). Re-read the
+    # cache UNDER THE LOCK so a concurrent refresh in another thread can't
+    # cause a lost update; the atomic write in _save_cache guarantees the file
+    # is never left half-written.
     full_idx = pd.date_range(HISTORY_START, today, freq="ME")
-    if cached is not None:
-        raw = cached.reindex(full_idx).copy()
-    else:
-        raw = pd.DataFrame(index=full_idx)
-
-    for key, s in results.items():
-        if s is None:
-            continue
-        s = s[s.index >= pd.Timestamp(HISTORY_START)]
-        s = s[~s.index.duplicated(keep="last")]
-        if key in raw.columns and raw[key].notna().any():
-            raw[key] = s.combine_first(raw[key]).reindex(full_idx)
+    with _IO_LOCK:
+        cached = _load_raw_cache()
+        if cached is not None:
+            raw = cached.reindex(full_idx).copy()
         else:
-            raw[key] = s.reindex(full_idx)
+            raw = pd.DataFrame(index=full_idx)
 
-    raw = raw.ffill(limit=6)
+        for key, s in results.items():
+            if s is None:
+                continue
+            s = s[s.index >= pd.Timestamp(HISTORY_START)]
+            s = s[~s.index.duplicated(keep="last")]
+            if key in raw.columns and raw[key].notna().any():
+                raw[key] = s.combine_first(raw[key]).reindex(full_idx)
+            else:
+                raw[key] = s.reindex(full_idx)
+
+        raw = raw.ffill(limit=6)
     for key in RAW_SPECS:
         fmeta[key] = "Y" if (key in raw.columns and raw[key].notna().any()) else "N"
     fmeta["_live"] = sum(1 for v in fmeta.values() if v == "Y")
@@ -1607,9 +1678,9 @@ def _save_cache(raw: pd.DataFrame, feat: pd.DataFrame, score: pd.Series,
         for c in feat.columns:
             out[f"feat_{c}"] = feat[c]
         out["score"] = score
-        out.to_parquet(CACHE_PATH)
-    except Exception:
-        pass
+        _atomic_write_parquet(out, CACHE_PATH)
+    except Exception as exc:
+        print(f"[cache] write failed: {exc!r}")
     try:
         # Cache-format marker: feat_* columns are ROBUST Z-SCORES (V3). Readers
         # must reject caches without this marker (they hold V2 percentiles and
@@ -1771,6 +1842,20 @@ def _synthetic_result() -> Tuple[pd.Series, dict]:
 
 def get_monthly_scores(refresh: bool = False,
                         tail_boost: Optional[bool] = None) -> Tuple[pd.Series, dict]:
+    """Memoized wrapper over the monthly scoring path.
+
+    Within a single page load both `load_scores()` and `load_daily_scores()`
+    can request a refresh, which used to trigger get_monthly_scores twice and
+    thus TWO full network batches. The in-process memo dedupes those calls so
+    the expensive fetch runs once. See _get_monthly_scores_impl.
+    """
+    return _memo(("monthly", bool(refresh), tail_boost),
+                 lambda: _get_monthly_scores_impl(refresh, tail_boost))
+
+
+def _get_monthly_scores_impl(refresh: bool = False,
+                             tail_boost: Optional[bool] = None
+                             ) -> Tuple[pd.Series, dict]:
     """
     Returns (monthly_score_series, meta). NEVER raises — the dashboard must
     always render, even with zero network.
@@ -1927,17 +2012,29 @@ def stability_filter(score: pd.Series, vix: pd.Series = None,
 
 def get_daily_scores(refresh: bool = False,
                       tail_boost: Optional[bool] = None) -> pd.Series:
-    """Daily, stability-filtered Bubble Risk Score for charting.
+    """Memoized wrapper over the daily index (the canonical headline series).
 
-    The composite is computed MONTHLY (the percentile normalization needs a
+    Dedupes the repeated daily computation within one page load; see
+    _get_daily_scores_impl.
+    """
+    return _memo(("daily", bool(refresh), tail_boost),
+                 lambda: _get_daily_scores_impl(refresh, tail_boost))
+
+
+def _get_daily_scores_impl(refresh: bool = False,
+                           tail_boost: Optional[bool] = None) -> pd.Series:
+    """Daily Bubble Risk Score = slow monthly macro anchor + fast daily regime.
+
+    The composite is computed MONTHLY (the rolling normalization needs a
     long trailing window). We up-sample it onto a daily calendar — forward
-    filling the most recent month-end reading to every day — then run it through
-    the K-line style stability layer: a slow-EMA trend + a small bounded
-    oscillation + a stress-aware daily clamp (<= DAILY_CLAMP pts unless
-    genuinely stressed). The result is a calm macro wave with a gentle
-    short-term wiggle that cannot whipsaw.
+    filling the most recent month-end reading to every day — run it through
+    the K-line style stability layer (slow-EMA trend + stress-aware daily
+    clamp), then blend in a daily price/VIX market regime so the index tracks
+    the tape instead of lagging it. Returns an empty Series if no monthly
+    scores are available.
 
-    Returns an empty Series if no monthly scores are available.
+    This is the canonical daily index: the gauge, guidance and chart all read
+    this series, so they can never disagree.
     """
     monthly, _ = get_monthly_scores(refresh=refresh, tail_boost=tail_boost)
     monthly = monthly.dropna()
@@ -1971,31 +2068,35 @@ def get_daily_scores(refresh: bool = False,
             baa = None
     daily_anchor = stability_filter(daily, vix=vix_d, spx=spx_d, baa=baa)
 
-    # --- Daily market-regime overlay --------------------------------------
+    # --- Daily market-regime overlay (the FAST component) -----------------
     # The pure monthly anchor is too smooth to track day-to-day market moves
     # (CAPE / MGDTE / EMV are monthly or lag — they can't see today's tape).
-    # Add a DAILY regime composite from SPX momentum + VIX + SPX-vs-200d-MA
-    # extension, robust-z'd, mapped to 0-100, and blend it into the anchor.
-    # The headline score (gauge) stays on the validated monthly macro; this
-    # overlay only affects the displayed daily series so the chart can react.
-    # Regime is itself smoothed (15d EMA before Φ) so it doesn't add raw
-    # day-to-day noise; a daily-change clamp (BLEND_DAILY_CLAMP) below
-    # guarantees the displayed line can't sawtooth regardless of inputs.
+    # Blend in a DAILY regime composite from SPX momentum + VIX + SPX-vs-200dMA
+    # extension so the displayed index reacts to the tape instead of lagging
+    # it by a month. The blend is then passed through a single daily-change
+    # clamp (BLEND_DAILY_CLAMP) so it stays smooth while tracking multi-week
+    # moves.
+    #
+    # NOTE: this is the canonical daily index — the same series the gauge,
+    # guidance and chart all read (single source of truth). The monthly macro
+    # composite remains available separately for the validated long-cycle
+    # backtest / signals.
+    blended = daily_anchor.copy()
     regime = compute_daily_regime(hf) if hf is not None else None
     if regime is not None and not regime.empty:
         common = daily_anchor.index.intersection(regime.index)
         if not common.empty:
-            blended = (DAILY_ANCHOR_WEIGHT * daily_anchor.loc[common]
-                       + (1 - DAILY_ANCHOR_WEIGHT) * regime.loc[common])
-            # Hard daily-change clamp on the WHOLE daily index series (blended where
-    # common, pure stability_filter otherwise). Iterating over the full
-    # array -- not just the common slice -- catches transitions where the
-    # blend ends and the index falls back to the macro-only stability_filter
-    # value (otherwise those edges produce unsmoothed sawtooth jumps).
-    # Multi-week moves still accumulate because each day's clamped delta is
-    # at most BLEND_DAILY_CLAMP.
+            blended.loc[common] = (
+                DAILY_ANCHOR_WEIGHT * daily_anchor.loc[common]
+                + (1.0 - DAILY_ANCHOR_WEIGHT) * regime.loc[common])
+
+    # Hard daily-change clamp on the WHOLE blended series. Iterating over the
+    # full array -- not just the blend-overlap slice -- catches transitions
+    # where the blend ends and the index falls back to the macro-only anchor
+    # (otherwise those edges produce unsmoothed jumps). Multi-week moves still
+    # accumulate because each day's clamped delta is at most BLEND_DAILY_CLAMP.
     limit = BLEND_DAILY_CLAMP
-    arr = daily_anchor.to_numpy(dtype=float).copy()
+    arr = blended.to_numpy(dtype=float).copy()
     prev_valid = np.nan
     for i in range(len(arr)):
         v = arr[i]
@@ -2010,45 +2111,55 @@ def get_daily_scores(refresh: bool = False,
         elif d < -limit:
             arr[i] = prev_valid - limit
         prev_valid = arr[i]
-    daily_anchor[:] = arr
-    return daily_anchor.dropna()
+    return pd.Series(arr, index=blended.index).dropna()
 
 
-# Daily regime overlay weight: macro anchor 0.60, daily market regime 0.40.
+# Daily regime overlay weight: macro anchor 0.50, daily market regime 0.50.
 # Tuned so the displayed daily index stays anchored to the macro reality
 # (the validated monthly composite) while the daily overlay reacts to the
 # tape with enough weight to track multi-week rallies instead of lagging.
+# (Raised from 0.60/0.40 to 0.50/0.50 to reduce the price-lag the user flagged;
+# the regime is itself a smoothed price/VIX composite, not a raw SPX mirror.)
 # Push closer to 1.0 for a calmer chart, closer to 0 for a more
 # SPX-correlated chart.
-DAILY_ANCHOR_WEIGHT = 0.60
+DAILY_ANCHOR_WEIGHT = 0.50
 
 # Final hard clamp on |day-over-day Δ| of the blended displayed daily index.
 # Trend still accumulates over weeks/months (the clamp is cumulative-friendly:
-# a 0.5-pt daily move compounds to ~10pts over a month), but no single day
-# can produce a sawtooth spike. Tuned so a typical regime day-over-day move
-# (smoothed 15d) is allowed, but month-end anchor steps and any input glitch
-# are squashed.
-BLEND_DAILY_CLAMP = 1.2
+# a 1.5-pt daily move compounds to ~30pts over a month), but no single day
+# can produce a sawtooth spike. Raised from 1.2 to 1.5 so the index tracks
+# real multi-day moves faster while still squashing single-day glitches.
+BLEND_DAILY_CLAMP = 1.5
+
+# --- Daily-regime responsiveness knobs (the FAST component) -----------------
+# The regime is the price/VIX overlay that keeps the daily index tracking the
+# tape. The bug that made the index lag was that this overlay was computed but
+# NEVER applied (see _get_daily_scores_impl) — fixing that already restores
+# real market responsiveness. These windows keep the regime a clean
+# "medium-fast" signal: short enough to react to a fortnight of tape, but with
+# an EMA long enough to absorb single-day VIX/momentum spikes (a raw 5d/6d
+# combo made the regime swing 30+ pts/day and the index whipsaw).
+REGIME_MOM_WINDOW = 10     # SPX return window (trading days)
+REGIME_EMA_SPAN = 10       # EMA half-life ~7d (damps single-day VIX noise)
 
 
 def compute_daily_regime(hf: dict = None) -> pd.Series:
     """Daily 'market regime' 0-100 score from pure price/vix inputs.
 
-    Three signals, each robust-z'd over a 252-day ( (1y) trailing window:
-      - SPX 10-day return (reacts to biweekly tape; 20d was too slow,
-        lagged the rally by weeks)
+    Three signals, each robust-z'd over a 252-day (~1y) trailing window:
+      - SPX 10-day return (reacts to a fortnight of tape; 20d lagged rallies
+        by 2-3 weeks)
       - VIX level INVERTED (high VIX = fear = risk dropping)
       - SPX distance above its 200-day moving average (extension / froth)
     Equal-weighted average z -> short-EMA smoothed (10d span, half-life
-    ~5d) -> Φ(z) -> 0-100. The 10d smoothing preserves multi-day trend
-    recognition while damping day-to-day noise; faster than the previous
-    15d so the chart keeps up with momentum shifts within a week rather
-    than two. Clip [1, 99]. Falls back to an empty Series if no daily data.
+    ~7d) -> Φ(z) -> 0-100. The EMA preserves multi-day trend recognition while
+    damping single-day VIX/momentum spikes. Clip [1, 99]. Falls back to an
+    empty Series if no daily data.
 
-    This is the daily overlay blended into the displayed daily index so the
-    chart tracks market moves. It does NOT replace the validated monthly
-    composite -- the headline gauge and the backtest keep using the macro
-    signal. The blend lives only in get_daily_scores.
+    This is the FAST daily overlay blended into the displayed daily index so
+    the chart tracks market moves. It does NOT replace the validated monthly
+    composite -- the long-cycle anchor lives in get_monthly_scores and the
+    blend lives only in get_daily_scores.
     """
     if hf is None:
         hf = _get_hf_daily()
@@ -2059,11 +2170,10 @@ def compute_daily_regime(hf: dict = None) -> pd.Series:
     if spx is None or spx.empty or vix is None or vix.empty:
         return pd.Series(dtype=float)
 
-    # 10d return (was 20d) -- the 20d signal lagged real rallies by 2-3
-    # weeks (the user explicitly noted this). 10d reacts to a fortnight
-    # of tape which is a more natural decision cycle for an investor.
-    mom_10 = spx.pct_change(10)
-    mom_z = rolling_robust_z(mom_10, window=252, min_periods=60)
+    # 10d return (was 20d): the 20d signal lagged real rallies by 2-3 weeks.
+    # 10d reacts to a fortnight of tape — a natural decision cycle.
+    mom = spx.pct_change(REGIME_MOM_WINDOW)
+    mom_z = rolling_robust_z(mom, window=252, min_periods=60)
     vix_z = -rolling_robust_z(vix, window=252, min_periods=60)   # inverted
     ma200 = spx.rolling(200, min_periods=60).mean()
     ext = spx / ma200 - 1.0
@@ -2076,7 +2186,7 @@ def compute_daily_regime(hf: dict = None) -> pd.Series:
     combined = ((mom_z.reindex(common).fillna(0)
                 + vix_z.reindex(common).fillna(0)
                 + ext_z.reindex(common).fillna(0)) / 3.0)
-    combined_sm = combined.ewm(span=10, min_periods=1).mean()
+    combined_sm = combined.ewm(span=REGIME_EMA_SPAN, min_periods=1).mean()
     # robust-z -> 0-100 via standard normal CDF
     regime = (100.0 * _norm_cdf_arr(combined_sm.to_numpy())).clip(1, 99)
     return pd.Series(regime, index=common)

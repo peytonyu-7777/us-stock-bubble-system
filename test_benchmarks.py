@@ -77,6 +77,27 @@ def main() -> int:
         print(f"  (normal-regime clamp = {pipe.DAILY_CLAMP}; relaxed to "
               f"{pipe.STRESS_CLAMP} under stress)")
 
+    # 5. REGRESSION: the daily regime overlay must actually be APPLIED to the
+    #    daily index. (A past bug computed `blended` = anchor + regime but then
+    #    discarded it and returned the pure monthly anchor — the index lagged
+    #    price by a month. This check fails if that regression returns.)
+    daily_reg = pipe.get_daily_scores(refresh=False).dropna()
+    if not daily_reg.empty:
+        mm = scores.reindex(daily_reg.index, method="ffill")
+        common = daily_reg.index.intersection(mm.index)
+        gap = (daily_reg.loc[common] - mm.loc[common]).abs()
+        tail = gap[gap.index >= pd.Timestamp("2024-01-01")]
+        if not tail.empty:
+            mean_gap = float(tail.mean())
+            max_gap = float(tail.max())
+            print(f"\n-- Daily regime overlay (regression guard) --")
+            print(f"  mean |daily − monthly-anchor| (2024→) = {mean_gap:.2f} pts")
+            print(f"  max  |daily − monthly-anchor| (2024→) = {max_gap:.2f} pts")
+            # The overlay must move the daily index vs the flat monthly anchor.
+            # A mean gap < ~1pt means the regime is being discarded again.
+            print(f"  {'PASS' if mean_gap >= 1.0 else 'FAIL'} "
+                  f"(regime overlay active: mean gap ≥ 1.0 pts)")
+
     print("\n" + "=" * 64)
     print("SUMMARY")
     print(f"  boundary [1,99]               : {'PASS' if bound_ok else 'FAIL'}")

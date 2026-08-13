@@ -904,6 +904,29 @@ def main():
     elif src == "cache":
         st.info("ℹ️ Showing cached data (set refresh to pull live).")
 
+    # ---- Canonical DAILY index (single source of truth for display) --------
+    # The gauge, status card and guidance all read this DAILY series — the same
+    # red line the chart shows — so the headline number can never disagree with
+    # the chart. In resilient mode `scores` already IS the daily series. The
+    # monthly macro composite stays the basis for the backtest / signals /
+    # module drivers (its natural monthly cadence).
+    daily = scores if meta.get("source") == "resilient" else None
+    if daily is None:
+        try:
+            daily = load_daily_scores(refresh=False, tail_boost=tail_boost)
+        except Exception:
+            daily = pd.Series(dtype=float)
+    if daily is not None and not daily.dropna().empty:
+        dvals = daily.dropna()
+        dscore = float(dvals.iloc[-1])
+        state["score"] = dscore
+        state["status"] = pipe.risk_level(dscore)
+        state["as_of"] = dvals.index[-1]
+        try:
+            state["hist_pct"] = float((dvals <= dscore).mean() * 100.0)
+        except Exception:
+            pass
+
     # ---- Staleness guard: warn if the score's latest reading is old --------
     # The 6h auto-refresh keeps data current when the network works. If the
     # served score is still more than a week stale, surface it clearly so the
@@ -1015,17 +1038,10 @@ def main():
         status_card(state, meta, src_label, tail_boost)
 
     # ---- Actionable guidance (zone -> posture, anchored to past events) ---
-    try:
-        _daily_for_guidance = load_daily_scores(refresh=False,
-                                                tail_boost=tail_boost)
-    except Exception:
-        _daily_for_guidance = pd.Series(dtype=float)
-    # In resilient mode (FRED blocked), replace the daily blend with the
-    # resilient yfinance-only series so the chart, guidance, and headline
-    # all reflect the same real-time signal.
-    if meta.get("source") == "resilient":
-        _daily_for_guidance = scores  # resilient index IS the daily series
-    guidance_panel(state, _daily_for_guidance, scores)
+    # Uses the SAME canonical daily index computed above (gauge/status/chart
+    # all agree), with the monthly macro composite passed for the validated
+    # confirmation signals.
+    guidance_panel(state, daily, scores)
 
     # ---- Module radar + module cards -------------------------------------
     st.subheader("Five Risk Modules (current)")
@@ -1037,7 +1053,9 @@ def main():
         drivers_panel(state)
 
     # ---- Historical comparison ------------------------------------------
-    historical_comparison(scores, state)
+    # Compare the CURRENT canonical (daily) index against the same daily series
+    # at canonical episodes, so the "vs history" reading is fully self-consistent.
+    historical_comparison(daily, state)
 
     # ---- Combined chart: Bubble Index + rebased S&P 500 / Nasdaq ------------
     st.subheader("Bubble Index vs Market (S&P 500 / Nasdaq rebased to 100)")
@@ -1046,10 +1064,9 @@ def main():
     # Two date pickers (start / end) bounded by the available data range, plus
     # a row of preset buttons for one-click common windows. The data is
     # sliced to the exact [start, end] dates, not by year.
-    # In resilient mode (FRED blocked), the chart's daily series IS the
-    # resilient index (the same `scores` Series the gauge / guidance uses)
-    # -- so the red line is consistent with everything else.
-    daily_for_chart = scores if meta.get("source") == "resilient" else _daily_for_guidance
+    # `daily` is the canonical index (resilient series in resilient mode, the
+    # blended daily index otherwise) — the same series the gauge reads.
+    daily_for_chart = daily
     if not daily_for_chart.empty:
         d_min = daily_for_chart.index.min().date()
         d_max = daily_for_chart.index.max().date()
